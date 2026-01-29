@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+"""Test if config validators work correctly"""
+
+import sys
+from openviking.utils.config.agfs_config import AGFSConfig
+from openviking.utils.config.vectordb_config import VectorDBBackendConfig
+from openviking.utils.config.embedding_config import EmbeddingModelConfig, EmbeddingConfig
+from openviking.utils.config.vlm_config import VLMConfig
+
+def test_agfs_validation():
+    """Test AGFS config validation"""
+    print("=" * 60)
+    print("Test AGFS config validation")
+    print("=" * 60)
+
+    # Test 1: local backend missing path (should use default)
+    print("\n1. Test local backend (use default path)...")
+    try:
+        config = AGFSConfig(backend="local")
+        print(f"   Pass (path={config.path})")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+    # Test 2: invalid backend
+    print("\n2. Test invalid backend...")
+    try:
+        config = AGFSConfig(backend="invalid")
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 3: S3 backend missing required fields
+    print("\n3. Test S3 backend missing required fields...")
+    try:
+        config = AGFSConfig(backend="s3")
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 4: S3 backend complete config
+    print("\n4. Test S3 backend complete config...")
+    try:
+        config = AGFSConfig(
+            backend="s3",
+            s3_bucket="my-bucket",
+            s3_region="us-west-1",
+            s3_access_key="fake-access-key-for-testing",
+            s3_secret_key="fake-secret-key-for-testing-12345"
+        )
+        print(f"   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+def test_vectordb_validation():
+    """Test VectorDB config validation"""
+    print("\n" + "=" * 60)
+    print("Test VectorDB config validation")
+    print("=" * 60)
+
+    # Test 1: local backend missing path
+    print("\n1. Test local backend missing path...")
+    try:
+        config = VectorDBBackendConfig(backend="local", path=None)
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 2: http backend missing url
+    print("\n2. Test http backend missing url...")
+    try:
+        config = VectorDBBackendConfig(backend="http", url=None)
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 3: volcengine backend complete config
+    print("\n3. Test volcengine backend complete config...")
+    try:
+        config = VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine={
+                "ak": "test_ak",
+                "sk": "test_sk",
+                "region": "cn-beijing"
+            }
+        )
+        print(f"   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+def test_embedding_validation():
+    """Test Embedding config validation"""
+    print("\n" + "=" * 60)
+    print("Test Embedding config validation")
+    print("=" * 60)
+
+    # Test 1: no embedder config
+    print("\n1. Test no embedder config...")
+    try:
+        config = EmbeddingConfig()
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 2: OpenAI backend missing api_key
+    print("\n2. Test OpenAI backend missing api_key...")
+    try:
+        config = EmbeddingConfig(
+            dense=EmbeddingModelConfig(
+                backend="openai",
+                model="text-embedding-3-small"
+            )
+        )
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 3: OpenAI backend complete config
+    print("\n3. Test OpenAI backend complete config...")
+    try:
+        config = EmbeddingConfig(
+            dense=EmbeddingModelConfig(
+                backend="openai",
+                model="text-embedding-3-small",
+                api_key="fake-api-key-for-testing",
+                dimension=1536
+            )
+        )
+        print(f"   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+def test_vlm_validation():
+    """Test VLM config validation"""
+    print("\n" + "=" * 60)
+    print("Test VLM config validation")
+    print("=" * 60)
+
+    # Test 1: VLM not configured (optional)
+    print("\n1. Test VLM not configured (optional)...")
+    try:
+        config = VLMConfig()
+        print(f"   Pass (VLM is optional)")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+    # Test 2: VLM partial config (has model but no api_key)
+    print("\n2. Test VLM partial config...")
+    try:
+        config = VLMConfig(model="gpt-4")
+        print(f"   Should fail but passed")
+    except ValueError as e:
+        print(f"   Correctly raised exception: {e}")
+
+    # Test 3: VLM complete config
+    print("\n3. Test VLM complete config...")
+    try:
+        config = VLMConfig(
+            model="gpt-4",
+            api_key="fake-api-key-for-testing",
+            backend="openai"
+        )
+        print(f"   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+if __name__ == "__main__":
+    print("\nStarting config validator tests...\n")
+
+    try:
+        test_agfs_validation()
+        test_vectordb_validation()
+        test_embedding_validation()
+        test_vlm_validation()
+
+        print("\n" + "=" * 60)
+        print("All tests completed!")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\nUnexpected error during tests: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

@@ -1,0 +1,74 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, Field, model_validator
+
+class VolcengineConfig(BaseModel):
+    """Configuration for Volcengine VikingDB."""
+    ak: Optional[str] = Field(default=None, description="Volcengine Access Key")
+    sk: Optional[str] = Field(default=None, description="Volcengine Secret Key")
+    region: Optional[str] = Field(
+        default=None, description="Volcengine region (e.g., 'cn-beijing')"
+    )
+    host: Optional[str] = Field(default=None, description="Volcengine VikingDB host (optional)")
+
+class VectorDBBackendConfig(BaseModel):
+    """
+    Configuration for VectorDB backend.
+
+    This configuration class consolidates all settings related to the VectorDB backend,
+    including type, connection details, and backend-specific parameters.
+    """
+    backend: str = Field(
+        default="local",
+        description="VectorDB backend type: 'local' (file-based), 'http' (remote service), or 'volcengine' (VikingDB)",
+    )
+
+    name: Optional[str] = Field(default="context", description="Collection name for VectorDB")
+
+    path: Optional[str] = Field(default="./data", description="Local storage path for 'local' type")
+
+    url: Optional[str] = Field(
+        default=None,
+        description="Remote service URL for 'http' type (e.g., 'http://localhost:5000')",
+    )
+
+    distance_metric: str = Field(
+        default="cosine",
+        description="Distance metric for vector similarity search (e.g., 'cosine', 'l2', 'ip')",
+    )
+
+    vector_dim: int = Field(
+        default=0,
+        description="Dimension of vector embeddings",
+    )
+
+    volcengine: Optional[VolcengineConfig] = Field(
+        default_factory=lambda: VolcengineConfig(),
+        description="Volcengine VikingDB configuration for 'volcengine' type",
+    )
+
+    @model_validator(mode='after')
+    def validate_config(self):
+        """Validate configuration completeness and consistency"""
+        if self.backend not in ["local", "http", "volcengine"]:
+            raise ValueError(
+                f"Invalid VectorDB backend: '{self.backend}'. Must be one of: 'local', 'http', 'volcengine'"
+            )
+
+        if self.backend == "local":
+            if not self.path:
+                raise ValueError("VectorDB local backend requires 'path' to be set")
+
+        elif self.backend == "http":
+            if not self.url:
+                raise ValueError("VectorDB http backend requires 'url' to be set")
+
+        elif self.backend == "volcengine":
+            if not self.volcengine or not self.volcengine.ak or not self.volcengine.sk:
+                raise ValueError("VectorDB volcengine backend requires 'ak' and 'sk' to be set")
+            if not self.volcengine.region:
+                raise ValueError("VectorDB volcengine backend requires 'region' to be set")
+
+        return self

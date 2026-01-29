@@ -1,0 +1,175 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+"""
+Synchronous OpenViking client implementation.
+"""
+
+import asyncio
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openviking.retrieve import QueryResult
+    from openviking.session import Session
+
+from openviking.async_client import AsyncOpenViking
+
+
+class SyncOpenViking:
+    """
+    SyncOpenViking main client class (Synchronous).
+    Wraps AsyncOpenViking with synchronous methods.
+    """
+
+    def __init__(self, **kwargs):
+        self._async_client = AsyncOpenViking(**kwargs)
+        self._initialized = False
+
+    def initialize(self) -> None:
+        """Initialize OpenViking storage and indexes."""
+        asyncio.run(self._async_client.initialize())
+        self._initialized = True
+
+    def session(self, session_id: Optional[str] = None) -> "Session":
+        """Create new session or load existing session."""
+        return self._async_client.session(session_id)
+
+    def add_resource(
+        self,
+        path: str,
+        target: Optional[str] = None,
+        reason: str = "",
+        instruction: str = "",
+        wait: bool = False,
+        timeout: float = None,
+    ) -> Dict[str, Any]:
+        """Add resource to OpenViking (resources scope only)"""
+        return asyncio.run(
+            self._async_client.add_resource(path, target, reason, instruction, wait, timeout)
+        )
+
+    def add_skill(
+        self,
+        data: Any,
+        wait: bool = False,
+        timeout: float = None,
+    ) -> Dict[str, Any]:
+        """Add skill to OpenViking."""
+        return asyncio.run(self._async_client.add_skill(data, wait=wait, timeout=timeout))
+
+    def search(
+        self,
+        query: str,
+        target_uri: str = "",
+        session: Optional["Session"] = None,
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        filter: Optional[Dict] = None,
+    ):
+        """Execute complex retrieval (intent analysis, hierarchical retrieval)."""
+        return asyncio.run(self._async_client.search(query, target_uri, session, limit, score_threshold, filter))
+
+    def find(self, query: str, target_uri: str = "", limit: int = 10, score_threshold: Optional[float] = None):
+        """Quick retrieval"""
+        return asyncio.run(self._async_client.find(query, target_uri, limit, score_threshold))
+
+    def abstract(self, uri: str) -> str:
+        """Read L0 abstract"""
+        return asyncio.run(self._async_client.abstract(uri))
+
+    def overview(self, uri: str) -> str:
+        """Read L1 overview"""
+        return asyncio.run(self._async_client.overview(uri))
+
+    def read(self, uri: str) -> str:
+        """Read file"""
+        return asyncio.run(self._async_client.read(uri))
+
+    def ls(self, uri: str, **kwargs) -> List[Any]:
+        """
+        List directory contents.
+
+        Args:
+            uri: Viking URI
+            simple: Return only relative path list (bool, default: False)
+            recursive: List all subdirectories recursively (bool, default: False)
+        """
+        return asyncio.run(self._async_client.ls(uri, **kwargs))
+
+    def link(self, from_uri: str, uris: Any, reason: str = "") -> None:
+        """Create relation"""
+        return asyncio.run(self._async_client.link(from_uri, uris, reason))
+
+    def unlink(self, from_uri: str, uri: str) -> None:
+        """Delete relation"""
+        return asyncio.run(self._async_client.unlink(from_uri, uri))
+
+    def export_ovpack(self, uri: str, to: str) -> str:
+        """Export .ovpack file"""
+        return asyncio.run(self._async_client.export_ovpack(uri, to))
+
+    def import_ovpack(
+        self, file_path: str, target: str, force: bool = False, vectorize: bool = True
+    ) -> str:
+        """Import .ovpack file (triggers vectorization by default)"""
+        return asyncio.run(self._async_client.import_ovpack(file_path, target, force, vectorize))
+
+    def close(self) -> None:
+        """Close OpenViking and release resources."""
+        return asyncio.run(self._async_client.close())
+
+    def relations(self, uri: str) -> List[Dict[str, Any]]:
+        """Get relations"""
+        return asyncio.run(self._async_client.relations(uri))
+
+    def rm(self, uri: str, recursive: bool = False) -> None:
+        """Delete resource"""
+        return asyncio.run(self._async_client.rm(uri, recursive))
+
+    def wait_processed(self, timeout: float = None) -> None:
+        """Wait for all async operations to complete"""
+        return asyncio.run(self._async_client.wait_processed(timeout))
+
+    def grep(self, uri: str, pattern: str, case_insensitive: bool = False) -> Dict:
+        """Content search"""
+        return asyncio.run(self._async_client.grep(uri, pattern, case_insensitive))
+
+    def glob(self, pattern: str, uri: str = "viking://") -> Dict:
+        """File pattern matching"""
+        return asyncio.run(self._async_client.glob(pattern, uri))
+
+    def mv(self, from_uri: str, to_uri: str) -> None:
+        """Move resource"""
+        return asyncio.run(self._async_client.mv(from_uri, to_uri))
+    
+    def tree(self, uri: str) -> Dict:
+        """Get directory tree"""
+        return asyncio.run(self._async_client.tree(uri))
+
+    def stat(self, uri: str) -> Dict:
+        """Get resource status"""
+        return asyncio.run(self._async_client.stat(uri))
+
+    def mkdir(self, uri: str) -> None:
+        """Create directory"""
+        return asyncio.run(self._async_client.mkdir(uri))
+
+    @property
+    def observers(self):
+        return self._async_client.observers
+
+    @property
+    def viking_fs(self):
+        return self._async_client.viking_fs
+
+    @property
+    def _vikingdb_manager(self):
+        return self._async_client._vikingdb_manager
+
+    @property
+    def _session_compressor(self):
+        return self._async_client._session_compressor
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset singleton (for testing)."""
+        return asyncio.run(AsyncOpenViking.reset())
