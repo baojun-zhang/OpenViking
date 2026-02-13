@@ -180,9 +180,7 @@ class VolcengineCollection(ICollection):
             ):
                 pass
             else:
-                raise Exception(
-                    f"Failed to create index: {response.status_code} {response.text}"
-                )
+                raise Exception(f"Failed to create index: {response.status_code} {response.text}")
 
     def has_index(self, index_name: str):
         indexes = self.list_indexes()
