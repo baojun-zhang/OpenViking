@@ -12,7 +12,8 @@ OpenViking 使用 JSON 配置文件（`ov.conf`）进行设置。配置文件支
     "vectordb": {
       "name": "context",
       "backend": "local",
-      "path": "./data"
+      "path": "./data",
+      "project_name": "default"
     },
     "agfs": {
       "port": 1833,
@@ -394,7 +395,8 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
     "vectordb": {
       "backend": "local|remote",
       "path": "string",
-      "url": "string"
+      "url": "string",
+      "project_name": "string"
     }
   },
   "server": {

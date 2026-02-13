@@ -27,6 +27,9 @@ def get_or_create_volcengine_collection(config: Dict[str, Any], meta_data: Dict[
     Args:
         config: Configuration dictionary containing AK, SK, Region.
         meta_data: Collection metadata.
+
+    Returns:
+        VolcengineCollection instance
     """
     # Extract configuration
     ak = config.get("AK")
@@ -60,6 +63,9 @@ def get_or_create_volcengine_collection(config: Dict[str, Any], meta_data: Dict[
         raise e
 
     return VolcengineCollection(ak, sk, region, host, meta_data)
+
+    # Return VolcengineCollection instance
+    return VolcengineCollection(ak=ak, sk=sk, region=region, host=host, meta_data=meta_data)
 
 
 class VolcengineCollection(ICollection):
@@ -175,7 +181,7 @@ class VolcengineCollection(ICollection):
                 pass
             else:
                 raise Exception(
-                    f"Failed to create collection: {response.status_code} {response.text}"
+                    f"Failed to create index: {response.status_code} {response.text}"
                 )
 
     def has_index(self, index_name: str):

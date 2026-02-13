@@ -4,6 +4,8 @@ from typing import Dict, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from openviking.storage.vectordb.utils.constants import DEFAULT_PROJECT_NAME
+
 COLLECTION_NAME = "context"
 
 
@@ -48,6 +50,8 @@ class VectorDBBackendConfig(BaseModel):
         default=None,
         description="Remote service URL for 'http' type (e.g., 'http://localhost:5000')",
     )
+
+    project_name: Optional[str] = Field(default=DEFAULT_PROJECT_NAME, description="project name")
 
     distance_metric: str = Field(
         default="cosine",
