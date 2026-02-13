@@ -10,7 +10,7 @@
       "name": "context",
       "backend": "local",
       "path": "./data",
-      "project_name": "default",
+      "project": "default",
       "volcengine": {
         "region": "cn-beijing",
         "ak": null,

@@ -36,6 +36,9 @@ class VikingVectorIndexBackend(VikingDBInterface):
 
     # Default project and index names
     DEFAULT_INDEX_NAME = "default"
+    DEFAULT_LOCAL_PROJECT_NAME = "vectordb"
+
+
 
     def __init__(
         self,
@@ -146,7 +149,7 @@ class VikingVectorIndexBackend(VikingDBInterface):
                 get_or_create_local_project,
             )
 
-            project_path = Path(config.path) / config.project_name if config.path else ""
+            project_path = Path(config.path) / self.DEFAULT_LOCAL_PROJECT_NAME if config.path else ""
             self.project = get_or_create_local_project(path=str(project_path))
             logger.info(f"VikingDB backend initialized with local storage: {project_path}")
         else:

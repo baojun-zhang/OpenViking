@@ -51,7 +51,9 @@ class VectorDBBackendConfig(BaseModel):
         description="Remote service URL for 'http' type (e.g., 'http://localhost:5000')",
     )
 
-    project_name: Optional[str] = Field(default=DEFAULT_PROJECT_NAME, description="project name")
+    project_name: Optional[str] = Field(
+        default=DEFAULT_PROJECT_NAME, description="project name", alias="project"
+    )
 
     distance_metric: str = Field(
         default="cosine",
