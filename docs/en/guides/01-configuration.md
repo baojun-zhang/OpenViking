@@ -308,18 +308,129 @@ Storage backend configuration.
 ```json
 {
   "storage": {
+    "workspace": "./data",
     "agfs": {
+      "port": 1833,
+      "log_level": "warn",
       "backend": "local",
-      "path": "./data",
-      "timeout": 30.0
+      "timeout": 10,
+      "retry_times": 3,
+      "s3": {
+        "bucket": null,
+        "region": null,
+        "access_key": null,
+        "secret_key": null,
+        "endpoint": null,
+        "prefix": "",
+        "use_ssl": true
+      }
     },
     "vectordb": {
+      "name": "context",
       "backend": "local",
-      "path": "./data"
+      "project": "default",
+      "volcengine": {
+        "region": "cn-beijing",
+        "ak": null,
+        "sk": null
+      }
     }
   }
 }
 ```
+
+**Root Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `workspace` | str | Local data storage path (primary), overrides `agfs.path` and `vectordb.path` | "./data" |
+| `params` | dict | Additional storage-specific parameters | {} |
+
+**agfs Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `path` | str | [Deprecated, use workspace] AGFS data storage path | null |
+| `port` | int | AGFS service port | 1833 |
+| `log_level` | str | AGFS log level | "warn" |
+| `url` | str | AGFS service URL for service mode | "http://localhost:1833" |
+| `backend` | str | AGFS storage backend: 'local' 's3' 'memory' | "local" |
+| `timeout` | int | AGFS request timeout (seconds) | 10 |
+| `retry_times` | int | AGFS retry times on failure | 3 |
+| `use_ssl` | bool | Enable/Disable SSL (HTTPS) for AGFS service | true |
+| `s3` | object | S3 backend configuration (when backend is 's3') | - |
+
+**agfs.s3 Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `bucket` | str | S3 bucket name | null |
+| `region` | str | AWS region where the bucket is located (e.g., us-east-1, cn-beijing) | null |
+| `access_key` | str | S3 access key ID | null |
+| `secret_key` | str | S3 secret access key | null |
+| `endpoint` | str | Custom S3 endpoint URL | null |
+| `prefix` | str | Optional key prefix for namespace isolation | "" |
+| `use_ssl` | bool | Enable/Disable SSL (HTTPS) for S3 connections | true |
+| `use_path_style` | bool | true for PathStyle (MinIO), false for VirtualHostStyle (TOS) | true |
+
+<details>
+<summary><b>Volcengine TOS</b></summary>
+
+```json
+{
+ "agfs": {
+      "port": 8080,
+      "log_level": "warn",
+      "path": "/local",
+      "backend": "s3",
+      "url": "http://localhost:8080",
+      "timeout": 10,
+      "retry_times": 3,
+      "s3": {
+        "bucket": "ov-bucket",
+        "endpoint": "http://tos-s3-cn-beijing.volces.com",
+        "region": "cn-beijing",
+        "access_key": "your-access-key",
+        "secret_key": "your-secret-key",
+        "prefix": "",
+        "use_ssl": false,
+        "use_path_style": false
+      }
+  }
+}
+```
+</details>
+
+**vectordb Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (VikingDB), or 'vikingdb' (private deployment) | "local" |
+| `name` | str | Collection name for VectorDB | "context" |
+| `path` | str | [Deprecated, use workspace] Local storage path for 'local' type | null |
+| `url` | str | Remote service URL for 'http' type (e.g., 'http://localhost:5000') | null |
+| `project_name` | str | Project name (alias project) | "default" |
+| `distance_metric` | str | Distance metric for vector similarity search (e.g., 'cosine', 'l2', 'ip') | "cosine" |
+| `dimension` | int | Dimension of vector embeddings | 0 |
+| `sparse_weight` | float | Sparse weight for hybrid vector search | 0.0 |
+| `volcengine` | object | VikingDB configuration for 'volcengine' type | - |
+| `vikingdb` | object | Private deployment configuration for 'vikingdb' type | - |
+
+**vectordb.volcengine Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `ak` | str | Volcengine access key | null |
+| `sk` | str | Volcengine secret key | null |
+| `region` | str | Volcengine region (e.g., 'cn-beijing') | null |
+| `host` | str | Volcengine VikingDB host (optional) | null |
+
+**vectordb.vikingdb Configuration**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `host` | str | VikingDB service host | null |
+| `headers` | dict | Custom headers for requests | {} |
 
 ## Config Files
 
@@ -420,17 +531,47 @@ For startup and deployment details see [Deployment](./03-deployment.md), for aut
     "model": "string"
   },
   "storage": {
+    "workspace": "string",
+    "params": {},
     "agfs": {
-      "backend": "local|remote",
+      "backend": "local|s3|memory",
       "path": "string",
+      "port": 1833,
+      "log_level": "warn",
       "url": "string",
-      "timeout": 30.0
+      "timeout": 10,
+      "retry_times": 3,
+      "use_ssl": true,
+      "s3": {
+        "bucket": "string",
+        "region": "string",
+        "access_key": "string",
+        "secret_key": "string",
+        "endpoint": "string",
+        "prefix": "string",
+        "use_ssl": true,
+        "use_path_style": true
+      }
     },
     "vectordb": {
-      "backend": "local|remote",
+      "backend": "local|http|volcengine|vikingdb",
+      "name": "string",
       "path": "string",
       "url": "string",
-      "project": "string"
+      "project": "string",
+      "distance_metric": "string",
+      "dimension": 0,
+      "sparse_weight": 0.0,
+      "volcengine": {
+        "ak": "string",
+        "sk": "string",
+        "region": "string",
+        "host": "string"
+      },
+      "vikingdb": {
+        "host": "string",
+        "headers": {}
+      }
     }
   },
   "server": {
