@@ -379,6 +379,11 @@ enum Commands {
     },
     /// Show CLI version
     Version,
+    /// Cryptographic key management commands
+    Crypto {
+        #[command(subcommand)]
+        action: commands::crypto::CryptoCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -633,6 +638,7 @@ async fn main() {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Commands::Crypto { action } => commands::crypto::handle_crypto(action).await,
         Commands::Read { uri } => handle_read(uri, ctx).await,
         Commands::Abstract { uri } => handle_abstract(uri, ctx).await,
         Commands::Overview { uri } => handle_overview(uri, ctx).await,

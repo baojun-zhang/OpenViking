@@ -30,6 +30,7 @@ from .parser_config import (
     TextConfig,
     VideoConfig,
 )
+from .encryption_config import EncryptionConfig
 from .rerank_config import RerankConfig
 from .storage_config import StorageConfig
 from .vlm_config import VLMConfig
@@ -56,6 +57,11 @@ class OpenVikingConfig(BaseModel):
 
     rerank: RerankConfig = Field(
         default_factory=lambda: RerankConfig(), description="Rerank configuration"
+    )
+
+    # Encryption configuration
+    encryption: EncryptionConfig = Field(
+        default_factory=lambda: EncryptionConfig(), description="Encryption configuration"
     )
 
     # Parser configurations
