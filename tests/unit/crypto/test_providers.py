@@ -4,11 +4,12 @@
 Unit tests for KeyProvider implementations.
 """
 
-import pytest
-from openviking.crypto.providers import LocalFileProvider
-from openviking.crypto.exceptions import AuthenticationFailedError
-import tempfile
 import os
+import tempfile
+
+import pytest
+
+from openviking.crypto.providers import LocalFileProvider
 
 
 @pytest.fixture

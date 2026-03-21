@@ -349,7 +349,7 @@ async def test_persistence_with_encryption_enabled(manager_service):
     stored_hash2 = _get_stored_hash(mgr2, acct, "alice")
 
     print(f"\n{'=' * 80}")
-    print(f"[持久化验证 - 重新加载后]")
+    print("[持久化验证 - 重新加载后]")
     print(f"重新加载后存储的 Argon2id 哈希值: {stored_hash2}")
     print(f"哈希值一致: {stored_hash1 == stored_hash2}")
     print(f"{'=' * 80}\n")

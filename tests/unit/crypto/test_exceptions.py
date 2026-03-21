@@ -4,16 +4,15 @@
 Unit tests for crypto exception classes.
 """
 
-import pytest
 
 from openviking.crypto.exceptions import (
+    AuthenticationFailedError,
+    ConfigError,
+    CorruptedCiphertextError,
     EncryptionError,
     InvalidMagicError,
-    CorruptedCiphertextError,
-    AuthenticationFailedError,
     KeyMismatchError,
     KeyNotFoundError,
-    ConfigError,
     KMSError,
 )
 

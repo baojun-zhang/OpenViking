@@ -5,6 +5,7 @@ Unit tests for crypto configuration.
 """
 
 import pytest
+
 from openviking.crypto.config import bootstrap_encryption
 
 
@@ -20,8 +21,8 @@ async def test_bootstrap_encryption_disabled():
 async def test_bootstrap_encryption_local_file(tmp_path):
     """Test bootstrap_encryption with local file provider."""
     # Create temporary key file with hex format and correct permissions
-    import secrets
     import os
+    import secrets
 
     key_file = tmp_path / "master.key"
     # Generate valid 32-byte key in hex format

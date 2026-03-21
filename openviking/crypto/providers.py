@@ -17,10 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from openviking.crypto.exceptions import (
-    ConfigError,
-    KeyMismatchError,
-    KeyNotFoundError,
     AuthenticationFailedError,
+    ConfigError,
 )
 from openviking_cli.utils.logger import get_logger
 
@@ -394,12 +392,13 @@ class VolcengineKMSProvider(RootKeyProvider):
         """
         if not self._kms_client:
             try:
-                from volcengine.ApiInfo import ApiInfo
-                from volcengine.Credentials import Credentials
-                from volcengine.base.Service import Service
-                from volcengine.ServiceInfo import ServiceInfo
-                import json
                 import base64
+                import json
+
+                from volcengine.ApiInfo import ApiInfo
+                from volcengine.base.Service import Service
+                from volcengine.Credentials import Credentials
+                from volcengine.ServiceInfo import ServiceInfo
             except ImportError:
                 raise ConfigError(
                     "volcengine is required for Volcengine KMS. "

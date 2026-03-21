@@ -11,8 +11,8 @@ from typing import Any, Optional
 
 from openviking.agfs_manager import AGFSManager
 from openviking.core.directories import DirectoryInitializer
-from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.crypto.config import bootstrap_encryption
+from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.server.identity import RequestContext, Role
 from openviking.service.debug_service import DebugService
 from openviking.service.fs_service import FSService

@@ -11,7 +11,7 @@ Implements Envelope Encryption pattern:
 
 import secrets
 import struct
-from typing import Any, Optional, Tuple
+from typing import Tuple
 
 from openviking.crypto.exceptions import (
     AuthenticationFailedError,

@@ -10,11 +10,10 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from argon2 import PasswordHasher
-from argon2.exceptions import Argon2Error, VerifyMismatchError
+from argon2.exceptions import VerifyMismatchError
 
-from openviking.pyagfs import AGFSClient
-from openviking.storage.viking_fs import VikingFS
 from openviking.server.identity import ResolvedIdentity, Role
+from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import (
     AlreadyExistsError,
     NotFoundError,

@@ -17,6 +17,7 @@ from .consts import (
     SYSTEM_CONFIG_DIR,
 )
 from .embedding_config import EmbeddingConfig
+from .encryption_config import EncryptionConfig
 from .log_config import LogConfig
 from .parser_config import (
     AudioConfig,
@@ -30,7 +31,6 @@ from .parser_config import (
     TextConfig,
     VideoConfig,
 )
-from .encryption_config import EncryptionConfig
 from .rerank_config import RerankConfig
 from .storage_config import StorageConfig
 from .vlm_config import VLMConfig

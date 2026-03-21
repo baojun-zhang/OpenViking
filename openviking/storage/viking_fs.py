@@ -14,7 +14,6 @@ Responsibilities:
 
 import asyncio
 import contextvars
-import fnmatch
 import hashlib
 import json
 import re
@@ -1753,7 +1752,6 @@ class VikingFS:
         self._ensure_access(from_uri, ctx)
         self._ensure_access(to_uri, ctx)
         from_path = self._uri_to_path(from_uri, ctx=ctx)
-        to_path = self._uri_to_path(to_uri, ctx=ctx)
 
         content_bytes = await self.read_file_bytes(from_uri, ctx=ctx)
         await self.write_file(to_uri, content_bytes, ctx=ctx)

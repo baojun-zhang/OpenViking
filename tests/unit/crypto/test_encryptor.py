@@ -4,13 +4,14 @@
 Unit tests for FileEncryptor.
 """
 
-import pytest
-from openviking.crypto.encryptor import FileEncryptor
-from openviking.crypto.providers import LocalFileProvider
-from openviking.crypto.exceptions import AuthenticationFailedError
-import tempfile
 import os
 import secrets
+import tempfile
+
+import pytest
+
+from openviking.crypto.encryptor import FileEncryptor
+from openviking.crypto.providers import LocalFileProvider
 
 
 @pytest.fixture
