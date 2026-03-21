@@ -379,11 +379,6 @@ enum Commands {
     },
     /// Show CLI version
     Version,
-    /// Cryptographic key management commands
-    Crypto {
-        #[command(subcommand)]
-        action: commands::crypto::CryptoCommands,
-    },
 }
 
 #[derive(Subcommand)]
@@ -398,6 +393,11 @@ enum SystemCommands {
     Status,
     /// Quick health check
     Health,
+    /// Cryptographic key management commands
+    Crypto {
+        #[command(subcommand)]
+        action: commands::crypto::CryptoCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -638,7 +638,6 @@ async fn main() {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Commands::Crypto { action } => commands::crypto::handle_crypto(action).await,
         Commands::Read { uri } => handle_read(uri, ctx).await,
         Commands::Abstract { uri } => handle_abstract(uri, ctx).await,
         Commands::Overview { uri } => handle_overview(uri, ctx).await,
@@ -828,6 +827,7 @@ async fn handle_system(cmd: SystemCommands, ctx: CliContext) -> Result<()> {
             commands::system::health(&client, ctx.output_format, ctx.compact).await?;
             Ok(())
         }
+        SystemCommands::Crypto { action } => commands::crypto::handle_crypto(action).await,
     }
 }
 

@@ -431,11 +431,13 @@ class APIKeyManager:
         """List all accounts."""
         result = []
         for account_id, info in self._accounts.items():
-            result.append({
-                "account_id": account_id,
-                "created_at": info.created_at,
-                "user_count": len(info.users),
-            })
+            result.append(
+                {
+                    "account_id": account_id,
+                    "created_at": info.created_at,
+                    "user_count": len(info.users),
+                }
+            )
         return result
 
     def get_users(self, account_id: str) -> list:
@@ -446,10 +448,12 @@ class APIKeyManager:
 
         result = []
         for user_id, user_info in account.users.items():
-            result.append({
-                "user_id": user_id,
-                "role": user_info.get("role", "user"),
-            })
+            result.append(
+                {
+                    "user_id": user_id,
+                    "role": user_info.get("role", "user"),
+                }
+            )
         return result
 
     # ---- internal helpers ----

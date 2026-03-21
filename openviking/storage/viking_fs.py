@@ -518,11 +518,13 @@ class VikingFS:
                         lines = content.split("\n")
                         for line_num, line in enumerate(lines, 1):
                             if compiled_pattern.search(line):
-                                results.append({
-                                    "line": line_num,
-                                    "uri": entry_uri,
-                                    "content": line,
-                                })
+                                results.append(
+                                    {
+                                        "line": line_num,
+                                        "uri": entry_uri,
+                                        "content": line,
+                                    }
+                                )
                                 if node_limit and len(results) >= node_limit:
                                     break
                     except Exception as e:
