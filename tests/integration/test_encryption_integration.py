@@ -1131,7 +1131,7 @@ This is a test skill for verifying encryption functionality.
         expected_lines = test_lines[1:4]
         expected_content = "\n".join(expected_lines)
         # read_file() 会在最后一行后添加换行符，所以需要处理这种情况
-        assert partial_content.rstrip("\n") == expected_content, f"Partial read failed"
+        assert partial_content.rstrip("\n") == expected_content, "Partial read failed"
 
         # Test 3: Read with offset=3, limit=-1 (from line 3 to end)
         from_line_3 = await svc.viking_fs.read_file(test_uri, offset=3, limit=-1, ctx=ctx)
@@ -1179,7 +1179,7 @@ This is a test skill for verifying encryption functionality.
         # Test 2: Read with offset=5, size=10 (bytes 5-14)
         partial_bytes = await svc.viking_fs.read(test_uri, offset=5, size=10, ctx=ctx)
         expected_bytes = test_content[5:15]
-        assert partial_bytes == expected_bytes, f"Partial read failed"
+        assert partial_bytes == expected_bytes, "Partial read failed"
 
         # Test 3: Read with offset=10, size=-1 (from byte 10 to end)
         from_byte_10 = await svc.viking_fs.read(test_uri, offset=10, size=-1, ctx=ctx)

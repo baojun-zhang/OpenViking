@@ -9,10 +9,7 @@ Requires VAULT_TOKEN env var to be set.
 Run: pytest tests/integration/test_vault_encryption_integration.py -v -m integration
 """
 
-import os
 import secrets
-import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -20,15 +17,14 @@ import pytest_asyncio
 
 from openviking import AsyncOpenViking
 from openviking.crypto.config import bootstrap_encryption
-from openviking.crypto.providers import VaultProvider, create_root_key_provider
 from openviking.crypto.encryptor import FileEncryptor
-from openviking.crypto.exceptions import ConfigError, AuthenticationFailedError
-from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+from openviking.crypto.exceptions import AuthenticationFailedError, ConfigError
+from openviking.crypto.providers import VaultProvider, create_root_key_provider
 from openviking.server.api_keys import APIKeyManager
 from openviking.service.core import OpenVikingService
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 from tests.integration.conftest import VAULT_ADDR, VAULT_TOKEN, requires_vault
-
 
 pytestmark = [pytest.mark.integration, requires_vault]
 
@@ -167,7 +163,7 @@ class TestVaultProviderErrors:
             addr="http://127.0.0.1:8200", token="invalid-token", mount_path="transit"
         )
 
-        with pytest.raises(Exception):
+        with pytest.raises(AuthenticationFailedError):
             await provider._get_client()
 
     async def test_invalid_address(self):
@@ -178,7 +174,7 @@ class TestVaultProviderErrors:
             mount_path="transit",
         )
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017
             await provider._get_client()
 
     def test_create_provider_missing_config(self):
@@ -648,20 +644,20 @@ This is a test skill for verifying Vault encryption.
         3. Encryption verification: Check OVE1 header through file system
         4. Postcondition: Delete account
         """
-        import asyncio
         import uuid
+
         from openviking.server.identity import RequestContext, Role
 
         svc = openviking_service_with_vault_encryption["service"]
         api_key_manager = openviking_service_with_vault_encryption["api_key_manager"]
-        test_data_dir = openviking_service_with_vault_encryption["test_data_dir"]
+        openviking_service_with_vault_encryption["test_data_dir"]
 
         # 1. Precondition: Create random account and user
         random_account_id = f"test-account-{uuid.uuid4()}"
         random_user_id = f"test-user-{uuid.uuid4()}"
         print(f"\n=== Creating account: {random_account_id}, user: {random_user_id} ===")
 
-        account_key = await api_key_manager.create_account(random_account_id, random_user_id)
+        await api_key_manager.create_account(random_account_id, random_user_id)
         user = UserIdentifier(random_account_id, random_user_id, random_user_id)
         ctx = RequestContext(user=user, role=Role.ADMIN)
 

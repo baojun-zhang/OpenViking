@@ -203,10 +203,16 @@ class VaultProvider(BaseProvider):
     - File Key encryption: AES-256-GCM (with Account Key)
     """
 
-    ROOT_KEY_NAME = "openviking-root-key"
-    ENCRYPTED_ROOT_KEY_KEY = "openviking-encrypted-root-key"
-
-    def __init__(self, addr: str, token: str, mount_path: str = "transit"):
+    def __init__(
+        self,
+        addr: str,
+        token: str,
+        mount_path: str = "transit",
+        kv_mount_path: str = "secret",
+        kv_version: int = 1,
+        root_key_name: str = "openviking-root-key",
+        encrypted_root_key_key: str = "openviking-encrypted-root-key",
+    ):
         """
         Initialize VaultProvider.
 
@@ -214,10 +220,18 @@ class VaultProvider(BaseProvider):
             addr: Vault server address (e.g., "http://127.0.0.1:8200")
             token: Vault authentication token
             mount_path: Transit secrets engine mount path (default: "transit")
+            kv_mount_path: KV secrets engine mount path (default: "secret")
+            kv_version: KV secrets engine version (1 or 2, default: 1)
+            root_key_name: Transit engine key name (default: "openviking-root-key")
+            encrypted_root_key_key: KV engine key path (default: "openviking-encrypted-root-key")
         """
         self.addr = addr
         self.token = token
         self.mount_path = mount_path
+        self.kv_mount_path = kv_mount_path
+        self.kv_version = kv_version
+        self.root_key_name = root_key_name
+        self.encrypted_root_key_key = encrypted_root_key_key
         self._client = None
         self._root_key: Optional[bytes] = None
 
@@ -301,7 +315,7 @@ class VaultProvider(BaseProvider):
         plaintext_b64 = base64.b64encode(plaintext).decode("utf-8")
         response = await asyncio.to_thread(
             client.secrets.transit.encrypt_data,
-            name=self.ROOT_KEY_NAME,
+            name=self.root_key_name,
             plaintext=plaintext_b64,
             mount_point=self.mount_path,
         )
@@ -324,7 +338,7 @@ class VaultProvider(BaseProvider):
         ciphertext_str = ciphertext.decode("utf-8")
         response = await asyncio.to_thread(
             client.secrets.transit.decrypt_data,
-            name=self.ROOT_KEY_NAME,
+            name=self.root_key_name,
             ciphertext=ciphertext_str,
             mount_point=self.mount_path,
         )
@@ -345,12 +359,21 @@ class VaultProvider(BaseProvider):
 
         try:
             # Try to read encrypted root key from Vault kv
-            response = await asyncio.to_thread(
-                client.secrets.kv.v1.read_secret,
-                path=self.ENCRYPTED_ROOT_KEY_KEY,
-                mount_point="secret",
-            )
-            encrypted_root_key_b64 = response["data"]["encrypted_root_key"]
+            if self.kv_version == 2:
+                response = await asyncio.to_thread(
+                    client.secrets.kv.v2.read_secret_version,
+                    path=self.encrypted_root_key_key,
+                    mount_point=self.kv_mount_path,
+                )
+                encrypted_root_key_b64 = response["data"]["data"]["encrypted_root_key"]
+            else:
+                response = await asyncio.to_thread(
+                    client.secrets.kv.v1.read_secret,
+                    path=self.encrypted_root_key_key,
+                    mount_point=self.kv_mount_path,
+                )
+                encrypted_root_key_b64 = response["data"]["encrypted_root_key"]
+
             encrypted_root_key = base64.b64decode(encrypted_root_key_b64)
             self._root_key = await self._decrypt_with_vault(encrypted_root_key)
             logger.info("Loaded existing root key from Vault")
@@ -363,17 +386,34 @@ class VaultProvider(BaseProvider):
             # Encrypt and store root key in Vault kv
             encrypted_root_key = await self._encrypt_with_vault(self._root_key)
             try:
-                await asyncio.to_thread(
-                    client.secrets.kv.v1.create_or_update_secret,
-                    path=self.ENCRYPTED_ROOT_KEY_KEY,
-                    mount_point="secret",
-                    secret={
-                        "encrypted_root_key": base64.b64encode(encrypted_root_key).decode("utf-8")
-                    },
-                )
+                if self.kv_version == 2:
+                    await asyncio.to_thread(
+                        client.secrets.kv.v2.create_or_update_secret,
+                        path=self.encrypted_root_key_key,
+                        mount_point=self.kv_mount_path,
+                        secret={
+                            "encrypted_root_key": base64.b64encode(encrypted_root_key).decode(
+                                "utf-8"
+                            )
+                        },
+                    )
+                else:
+                    await asyncio.to_thread(
+                        client.secrets.kv.v1.create_or_update_secret,
+                        path=self.encrypted_root_key_key,
+                        mount_point=self.kv_mount_path,
+                        secret={
+                            "encrypted_root_key": base64.b64encode(encrypted_root_key).decode(
+                                "utf-8"
+                            )
+                        },
+                    )
                 logger.info("Created and stored new root key in Vault")
             except Exception as e:
-                logger.warning(f"Failed to store root key in Vault (will use in-memory only): {e}")
+                raise ConfigError(
+                    f"Failed to persist root key to Vault. "
+                    f"Refusing to start with ephemeral key (data loss risk): {e}"
+                )
 
         return self._root_key
 
@@ -419,6 +459,7 @@ class VolcengineKMSProvider(BaseProvider):
         secret_access_key: str,
         key_id: str,
         endpoint: Optional[str] = None,
+        key_file: Optional[str] = None,
     ):
         """
         Initialize Volcengine KMS Provider.
@@ -429,12 +470,17 @@ class VolcengineKMSProvider(BaseProvider):
             secret_access_key: Volcengine Secret Access Key
             key_id: Volcengine KMS Key ID (immutable system-generated identifier)
             endpoint: Custom KMS service endpoint (optional)
+            key_file: Path to encrypted root key file (default: ~/.openviking/openviking-volcengine-root-key.enc)
         """
         self.region = region
         self.access_key_id = access_key_id
         self.secret_access_key = secret_access_key
         self.key_id = key_id
         self.endpoint = endpoint or f"kms.{region}.volcengineapi.com"
+        if key_file:
+            self.key_file = Path(key_file).expanduser()
+        else:
+            self.key_file = Path.home() / ".openviking" / self.ROOT_KEY_FILENAME
         self._kms_client = None
         self._root_key: Optional[bytes] = None
 
@@ -565,21 +611,18 @@ class VolcengineKMSProvider(BaseProvider):
         if self._root_key is not None:
             return self._root_key
 
-        import os
-        from pathlib import Path
-
-        key_file = Path.home() / ".openviking" / self.ROOT_KEY_FILENAME
-
         try:
             # Try to read encrypted root key from file
-            if key_file.exists():
-                with open(key_file, "rb") as f:
+            if self.key_file.exists():
+                with open(self.key_file, "rb") as f:
                     encrypted_root_key = f.read()
                 self._root_key = await self._decrypt_with_kms(encrypted_root_key)
-                logger.info(f"Loaded existing root key from {key_file}")
+                logger.info(f"Loaded existing root key from {self.key_file}")
                 return self._root_key
         except Exception as e:
-            logger.warning(f"Failed to load root key: {e}")
+            raise ConfigError(
+                f"Failed to load existing root key from {self.key_file}. Cannot continue: {e}"
+            )
 
         # Generate new root key
         import secrets
@@ -589,12 +632,15 @@ class VolcengineKMSProvider(BaseProvider):
         # Encrypt and store root key
         try:
             encrypted_root_key = await self._encrypt_with_kms(self._root_key)
-            key_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(key_file, "wb") as f:
+            self.key_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.key_file, "wb") as f:
                 f.write(encrypted_root_key)
-            logger.info(f"Created and stored new root key at {key_file}")
+            logger.info(f"Created and stored new root key at {self.key_file}")
         except Exception as e:
-            logger.warning(f"Failed to store root key (will use in-memory only): {e}")
+            raise ConfigError(
+                f"Failed to persist root key to file. "
+                f"Refusing to start with ephemeral key (data loss risk): {e}"
+            )
 
         return self._root_key
 
@@ -648,10 +694,24 @@ def create_root_key_provider(
         address = vault_config.get("address")
         token = vault_config.get("token")
         mount_point = vault_config.get("mount_point", "transit")
+        kv_mount_point = vault_config.get("kv_mount_point", "secret")
+        kv_version = vault_config.get("kv_version", 1)
+        root_key_name = vault_config.get("root_key_name", "openviking-root-key")
+        encrypted_root_key_key = vault_config.get(
+            "encrypted_root_key_key", "openviking-encrypted-root-key"
+        )
 
         if not address or not token:
             raise ConfigError("vault.address and vault.token are required")
-        return VaultProvider(address, token, mount_point)
+        return VaultProvider(
+            address,
+            token,
+            mount_point,
+            kv_mount_point,
+            kv_version,
+            root_key_name,
+            encrypted_root_key_key,
+        )
 
     elif provider_type == "volcengine_kms":
         volc_config = config.get("volcengine_kms", {})
@@ -659,10 +719,14 @@ def create_root_key_provider(
         access_key = volc_config.get("access_key")
         secret_key = volc_config.get("secret_key")
         key_id = volc_config.get("key_id")
+        endpoint = volc_config.get("endpoint")
+        key_file = volc_config.get("key_file")
 
         if not all([region, access_key, secret_key, key_id]):
             raise ConfigError("volcengine_kms region, access_key, secret_key, key_id are required")
-        return VolcengineKMSProvider(region, access_key, secret_key, key_id)
+        return VolcengineKMSProvider(
+            region, access_key, secret_key, key_id, endpoint=endpoint, key_file=key_file
+        )
 
     else:
         raise ConfigError(f"Unsupported provider type: {provider_type}")

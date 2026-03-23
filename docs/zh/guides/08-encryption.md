@@ -46,6 +46,7 @@ ov system crypto init-key --output ~/.openviking/master.key
 import openviking as ov
 import asyncio
 
+
 async def test():
     client = ov.AsyncOpenViking(path="./data")
     await client.initialize()
@@ -58,6 +59,7 @@ async def test():
     print(f"找到 {len(results)} 个结果")
 
     await client.close()
+
 
 asyncio.run(test())
 ```
@@ -131,10 +133,14 @@ ov system crypto init-key -o ~/.openviking/master.key
 vault secrets enable transit
 ```
 
-2. 创建根密钥：
+2. 启用 KV 引擎（如果尚未启用）：
 
 ```bash
-vault write -f transit/keys/openviking-root
+# KV v2（推荐）
+vault secrets enable -version=2 kv
+
+# 或 KV v1
+vault secrets enable kv
 ```
 
 3. 配置 OpenViking：
@@ -148,11 +154,26 @@ vault write -f transit/keys/openviking-root
       "address": "https://vault.example.com:8200",
       "token": "hvs.xxxxxxxxxxxxxxxxxxxxx",
       "mount_point": "transit",
-      "key_name": "openviking-root"
+      "kv_mount_point": "secret",
+      "kv_version": 1,
+      "root_key_name": "openviking-root-key",
+      "encrypted_root_key_key": "openviking-encrypted-root-key"
     }
   }
 }
 ```
+
+**配置参数说明**：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `address` | Vault 服务器地址 | 必需 |
+| `token` | Vault 认证令牌 | 必需 |
+| `mount_point` | Transit 引擎挂载路径 | `"transit"` |
+| `kv_mount_point` | KV 引擎挂载路径 | `"secret"` |
+| `kv_version` | KV 引擎版本（1 或 2） | `1` |
+| `root_key_name` | Transit 引擎中的密钥名称 | `"openviking-root-key"` |
+| `encrypted_root_key_key` | KV 引擎中存储加密根密钥的路径 | `"openviking-encrypted-root-key"` |
 
 ### Vault 权限建议
 
@@ -196,11 +217,24 @@ path "transit/decrypt/openviking-root" {
       "key_id": "d926aa0d-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
       "region": "cn-beijing",
       "access_key": "AKLTxxxxxxxxxxxxxxxxxx",
-      "secret_key": "Tmpxxxxxxxxxxxxxxxxxxxxxx"
+      "secret_key": "Tmpxxxxxxxxxxxxxxxxxxxxxx",
+      "endpoint": null,
+      "key_file": "~/.openviking/openviking-volcengine-root-key.enc"
     }
   }
 }
 ```
+
+**配置参数说明**：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `key_id` | KMS 密钥 ID | 必需 |
+| `region` | 区域 | 必需 |
+| `access_key` | Access Key | 必需 |
+| `secret_key` | Secret Key | 必需 |
+| `endpoint` | 自定义 KMS 端点（可选） | `null`（使用默认端点） |
+| `key_file` | 加密根密钥本地缓存文件路径 | `"~/.openviking/openviking-volcengine-root-key.enc"` |
 
 ### 权限建议
 
@@ -277,6 +311,7 @@ except Exception as e:
 import openviking as ov
 import asyncio
 
+
 async def migrate():
     client = ov.AsyncOpenViking(path="./data")
     await client.initialize()
@@ -291,6 +326,7 @@ async def migrate():
         await client.add_resource(content, reason="迁移到加密存储")
 
     await client.close()
+
 
 asyncio.run(migrate())
 ```

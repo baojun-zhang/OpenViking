@@ -46,6 +46,7 @@ Edit `~/.openviking/ov.conf`:
 import openviking as ov
 import asyncio
 
+
 async def test():
     client = ov.AsyncOpenViking(path="./data")
     await client.initialize()
@@ -58,6 +59,7 @@ async def test():
     print(f"Found {len(results)} results")
 
     await client.close()
+
 
 asyncio.run(test())
 ```
@@ -131,10 +133,14 @@ ov system crypto init-key -o ~/.openviking/master.key
 vault secrets enable transit
 ```
 
-2. Create root key:
+2. Enable KV engine (if not already enabled):
 
 ```bash
-vault write -f transit/keys/openviking-root
+# KV v2 (recommended)
+vault secrets enable -version=2 kv
+
+# Or KV v1
+vault secrets enable kv
 ```
 
 3. Configure OpenViking:
@@ -148,11 +154,26 @@ vault write -f transit/keys/openviking-root
       "address": "https://vault.example.com:8200",
       "token": "hvs.xxxxxxxxxxxxxxxxxxxxx",
       "mount_point": "transit",
-      "key_name": "openviking-root"
+      "kv_mount_point": "secret",
+      "kv_version": 1,
+      "root_key_name": "openviking-root-key",
+      "encrypted_root_key_key": "openviking-encrypted-root-key"
     }
   }
 }
 ```
+
+**Configuration Parameters**:
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `address` | Vault server address | Required |
+| `token` | Vault authentication token | Required |
+| `mount_point` | Transit engine mount path | `"transit"` |
+| `kv_mount_point` | KV engine mount path | `"secret"` |
+| `kv_version` | KV engine version (1 or 2) | `1` |
+| `root_key_name` | Key name in Transit engine | `"openviking-root-key"` |
+| `encrypted_root_key_key` | Path to store encrypted root key in KV engine | `"openviking-encrypted-root-key"` |
 
 ### Vault Permission Recommendations
 
@@ -196,11 +217,24 @@ path "transit/decrypt/openviking-root" {
       "key_id": "d926aa0d-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
       "region": "cn-beijing",
       "access_key": "AKLTxxxxxxxxxxxxxxxxxx",
-      "secret_key": "Tmpxxxxxxxxxxxxxxxxxxxxxx"
+      "secret_key": "Tmpxxxxxxxxxxxxxxxxxxxxxx",
+      "endpoint": null,
+      "key_file": "~/.openviking/openviking-volcengine-root-key.enc"
     }
   }
 }
 ```
+
+**Configuration Parameters**:
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `key_id` | KMS Key ID | Required |
+| `region` | Region | Required |
+| `access_key` | Access Key | Required |
+| `secret_key` | Secret Key | Required |
+| `endpoint` | Custom KMS endpoint (optional) | `null` (use default endpoint) |
+| `key_file` | Local cache file path for encrypted root key | `"~/.openviking/openviking-volcengine-root-key.enc"` |
 
 ### Permission Recommendations
 
@@ -277,6 +311,7 @@ except Exception as e:
 import openviking as ov
 import asyncio
 
+
 async def migrate():
     client = ov.AsyncOpenViking(path="./data")
     await client.initialize()
@@ -291,6 +326,7 @@ async def migrate():
         await client.add_resource(content, reason="Migrate to encrypted storage")
 
     await client.close()
+
 
 asyncio.run(migrate())
 ```

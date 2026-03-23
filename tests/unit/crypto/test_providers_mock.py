@@ -13,27 +13,21 @@ They use mocking to verify:
 
 import base64
 import os
-import tempfile
 import secrets
 import struct
-from unittest.mock import Mock, patch, MagicMock, AsyncMock
+import tempfile
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from openviking.crypto.encryptor import FileEncryptor
 from openviking.crypto.providers import (
-    LocalFileProvider,
-    VaultProvider,
-    VolcengineKMSProvider,
     PROVIDER_LOCAL,
     PROVIDER_VAULT,
     PROVIDER_VOLCENGINE,
-)
-from openviking.crypto.encryptor import FileEncryptor
-from openviking.crypto.exceptions import (
-    AuthenticationFailedError,
-    CorruptedCiphertextError,
-    InvalidMagicError,
-    KeyMismatchError,
+    LocalFileProvider,
+    VaultProvider,
+    VolcengineKMSProvider,
 )
 
 

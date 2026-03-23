@@ -99,9 +99,12 @@ ov crypto init-key --output ~/.openviking/master.key
     "provider": "vault",
     "vault": {
       "address": "https://vault.example.com:8200",
-      "token": "vault-token-xxx",
+      "token": "hvs.your-vault-token",
       "mount_point": "transit",
-      "key_name": "openviking-root"
+      "kv_mount_point": "secret",
+      "kv_version": 1,
+      "root_key_name": "openviking-root-key",
+      "encrypted_root_key_key": "openviking-encrypted-root-key"
     }
   }
 }
@@ -117,10 +120,12 @@ ov crypto init-key --output ~/.openviking/master.key
     "enabled": true,
     "provider": "volcengine_kms",
     "volcengine_kms": {
-      "key_id": "kms-key-id-xxx",
+      "key_id": "d926aa0d-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
       "region": "cn-beijing",
-      "access_key": "AKLTxxxxxxxx",
-      "secret_key": "Tmpxxxxxxxx"
+      "access_key": "AKLTxxxxxxxxxxxxxxxxxx",
+      "secret_key": "Tmpxxxxxxxxxxxxxxxxxxxxxx",
+      "endpoint": null,
+      "key_file": "~/.openviking/openviking-volcengine-root-key.enc"
     }
   }
 }

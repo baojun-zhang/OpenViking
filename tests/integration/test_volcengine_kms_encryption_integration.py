@@ -10,29 +10,27 @@ Requires VOLCENGINE_ACCESS_KEY, VOLCENGINE_SECRET_KEY, and VOLCENGINE_KMS_KEY_ID
 Run: pytest tests/integration/test_volcengine_kms_encryption_integration.py -v -m integration
 """
 
-import os
-import tempfile
 import secrets
+import tempfile
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
 from openviking import AsyncOpenViking
-from openviking.crypto.providers import VolcengineKMSProvider
 from openviking.crypto.encryptor import FileEncryptor
-from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+from openviking.crypto.providers import VolcengineKMSProvider
 from openviking.server.api_keys import APIKeyManager
 from openviking.service.core import OpenVikingService
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 from tests.integration.conftest import (
     VOLCENGINE_ACCESS_KEY,
-    VOLCENGINE_SECRET_KEY,
     VOLCENGINE_KMS_KEY_ID,
     VOLCENGINE_KMS_REGION,
+    VOLCENGINE_SECRET_KEY,
     requires_volcengine_kms,
 )
-
 
 pytestmark = [pytest.mark.integration, requires_volcengine_kms]
 
@@ -128,7 +126,6 @@ class TestVolcengineKMSProvider:
     async def test_full_roundtrip(self, volcengine_kms_provider):
         """Test complete roundtrip: derive account key, encrypt, decrypt"""
         account_id = "test-account-roundtrip"
-        plaintext = b"Secret data for Volcengine KMS test"
 
         # Derive account key
         account_key = await volcengine_kms_provider.derive_account_key(account_id)
@@ -466,7 +463,7 @@ class TestVikingFSEncryptionWithVolcengineKMS:
 
         account_id = "test-account-volcengine-file"
         admin_user_id = "admin"
-        user_key = await api_key_manager.create_account(account_id, admin_user_id)
+        await api_key_manager.create_account(account_id, admin_user_id)
 
         from openviking.server.identity import RequestContext, Role
 
@@ -482,7 +479,7 @@ class TestVikingFSEncryptionWithVolcengineKMS:
             resource = await svc.resources.add_resource(
                 path=temp_file_path, reason="Test Volcengine KMS encryption", ctx=ctx, wait=True
             )
-            root_uri = resource["root_uri"]
+            resource["root_uri"]
 
             agfs_data_root = test_data_dir / "viking" / "viking"
             resources_dir = agfs_data_root / account_id / "resources"
