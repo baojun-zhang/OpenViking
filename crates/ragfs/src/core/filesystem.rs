@@ -5,9 +5,10 @@
 //! different storage backends.
 
 use async_trait::async_trait;
+use regex::Regex;
 
 use super::errors::Result;
-use super::types::{FileInfo, WriteFlag};
+use super::types::{FileInfo, GrepResult, WriteFlag};
 
 /// Core filesystem abstraction trait
 ///
@@ -159,6 +160,124 @@ pub trait FileSystem: Send + Sync {
     /// true if the path exists, false otherwise
     async fn exists(&self, path: &str) -> bool {
         self.stat(path).await.is_ok()
+    }
+
+    /// Search for a pattern in files using regular expressions
+    ///
+    /// This is the default implementation that recursively searches files
+    /// and matches lines against the provided pattern. Plugins can override
+    /// this method to provide more efficient implementations.
+    ///
+    /// # Arguments
+    /// * `path` - The path to search (file or directory)
+    /// * `pattern` - The regular expression pattern to search for
+    /// * `recursive` - Whether to search recursively in subdirectories
+    /// * `case_insensitive` - Whether to perform case-insensitive matching
+    /// * `node_limit` - Maximum number of matches to return (None means no limit)
+    ///
+    /// # Returns
+    /// A GrepResult containing all matches found
+    ///
+    /// # Errors
+    /// * `Error::NotFound` - If the path doesn't exist
+    /// * `Error::Regex` - If the pattern is invalid
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        recursive: bool,
+        case_insensitive: bool,
+        node_limit: Option<usize>,
+    ) -> Result<GrepResult> {
+        let regex_pattern = if case_insensitive {
+            format!("(?i){}", pattern)
+        } else {
+            pattern.to_string()
+        };
+
+        let re = Regex::new(&regex_pattern).map_err(|e| {
+            super::errors::Error::invalid_operation(format!("Invalid regex pattern: {}", e))
+        })?;
+
+        let mut result = GrepResult::new();
+
+        self.grep_internal(path, path, &re, recursive, node_limit, &mut result)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Internal recursive grep helper
+    async fn grep_internal(
+        &self,
+        base_path: &str,
+        current_path: &str,
+        re: &Regex,
+        recursive: bool,
+        node_limit: Option<usize>,
+        result: &mut GrepResult,
+    ) -> Result<()> {
+        if node_limit.is_some_and(|limit| result.count >= limit) {
+            return Ok(());
+        }
+
+        let stat = self.stat(current_path).await?;
+
+        if stat.is_dir {
+            if !recursive && current_path != base_path {
+                return Ok(());
+            }
+
+            let entries = self.read_dir(current_path).await?;
+
+            for entry in entries {
+                if node_limit.is_some_and(|limit| result.count >= limit) {
+                    break;
+                }
+
+                let entry_path = if current_path == "/" {
+                    format!("/{}", entry.name)
+                } else {
+                    format!("{}/{}", current_path, entry.name)
+                };
+
+                self.grep_internal(base_path, &entry_path, re, recursive, node_limit, result)
+                    .await?;
+            }
+        } else {
+            self.grep_file(current_path, re, node_limit, result).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Grep a single file
+    async fn grep_file(
+        &self,
+        path: &str,
+        re: &Regex,
+        node_limit: Option<usize>,
+        result: &mut GrepResult,
+    ) -> Result<()> {
+        if node_limit.is_some_and(|limit| result.count >= limit) {
+            return Ok(());
+        }
+
+        let content = self.read(path, 0, 0).await?;
+
+        let content_str = String::from_utf8_lossy(&content);
+
+        for (line_num, line) in content_str.lines().enumerate() {
+            if node_limit.is_some_and(|limit| result.count >= limit) {
+                break;
+            }
+
+            if re.is_match(line) {
+                result.add_match(path.to_string(), (line_num + 1) as u64, line.to_string());
+            }
+        }
+
+        Ok(())
     }
 }
 
