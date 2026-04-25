@@ -104,5 +104,3 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 0
-debug = 2
-debug-assertions = true
