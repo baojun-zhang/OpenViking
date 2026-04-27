@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openviking.pyagfs.exceptions import AGFSInvalidOperationError
-from openviking_cli.exceptions import PermissionDeniedError
 from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import PermissionDeniedError
 
 
 def _make_viking_fs() -> VikingFS:
