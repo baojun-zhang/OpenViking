@@ -179,6 +179,19 @@ def load_server_config(config_path: Optional[str] = None) -> ServerConfig:
         data.get("encryption", {}).get("api_key_hashing", {}).get("enabled", False)
     )
 
+    # BREAKING CHANGE: Previously, encryption.enabled=true implicitly enabled API key Argon2id hashing.
+    # Now, you must explicitly configure encryption.api_key_hashing.enabled=true to enable hashing.
+    # When encryption.enabled=true but api_key_hashing.enabled=false (default),
+    # API keys will be stored in plaintext within AES-GCM encrypted files.
+    if encryption_enabled and not api_key_hashing_enabled:
+        logger.info(
+            "API key hashing is disabled while file encryption is enabled. "
+            "Previously, encryption.enabled=true implicitly enabled API key Argon2id hashing. "
+            "Now, API keys will be stored in plaintext within AES-GCM encrypted files. "
+            "To maintain the previous behavior, set encryption.api_key_hashing.enabled=true. "
+            "See documentation for more details."
+        )
+
     try:
         config = ServerConfig.model_validate(server_data)
     except ValidationError as e:

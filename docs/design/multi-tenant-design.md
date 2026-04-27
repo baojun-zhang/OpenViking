@@ -1299,7 +1299,7 @@ def _path_to_uri(self, path: str, account_id: str = "") -> str:
 在 `context_collection()` 的 Fields 列表中新增：
 
 ```python
-({"FieldName": "account_id", "FieldType": "string"},)
+{"FieldName": "account_id", "FieldType": "string"},
 ```
 
 位置放在 `id` 之后、`uri` 之前。
