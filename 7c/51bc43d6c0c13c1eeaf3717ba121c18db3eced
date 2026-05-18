@@ -1,0 +1,63 @@
+crates/ragfs/src/plugins/s3fs/mod.rs
+  2aa9a3b1bda28bb5 345,363 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a0a7a875e2621808e36a5fb","tool_type":"agent","tool_id":"SearchReplace","line_ranges":[{"Single":345},{"Single":363}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7c51bc43d6c0c13c1eeaf3717ba121c18db3eced",
+  "prompts": {
+    "2aa9a3b1bda28bb5": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a06dd635e2621808e369ae3",
+        "model": "DeepSeek-V4-Pro__dev"
+      },
+      "human_author": "zhangbaojun <zhangbaojun.1@bytedance.com>",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {
+    "crates/ragfs/src/plugins/s3fs/mod.rs": [
+      {
+        "hash": "2aa9a3b1bda28bb5",
+        "line_ranges": [
+          {
+            "Single": 345
+          },
+          {
+            "Single": 363
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a0a7a875e2621808e36a5fb",
+            "tool_type": "agent",
+            "tool_id": "SearchReplace",
+            "line_ranges": [
+              {
+                "Single": 345
+              },
+              {
+                "Single": 363
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "2aa9a3b1bda28bb5": {
+      "tool": "trae",
+      "conversation_id": "6a06dd635e2621808e369ae3",
+      "session_id": "6a06dd635e2621808e369ae3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
