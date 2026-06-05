@@ -127,16 +127,22 @@ def _generate_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str, Any]
     s3_config = getattr(agfs_config, "s3", None)
     vikingfs_path = data_path / "viking"
 
+    # Determine encryption config (from global config, not agfs)
+    server_encryption_enabled = False  # default: no encryption
+
+    # Check for multi-write configuration
+    backups_config = getattr(agfs_config, "backups", None)
+    redirects_config = getattr(agfs_config, "redirects", None)
+
+    # Build primary backend plugin config
+    primary_plugin_config: Dict[str, Any] = {}
+
     if backend == "local":
-        config["localfs"] = {
-            "enabled": True,
-            "path": "/local",
-            "config": {
-                "local_dir": str(vikingfs_path),
-            },
+        primary_plugin_config = {
+            "local_dir": str(vikingfs_path),
         }
     elif backend == "s3" and s3_config:
-        s3_plugin_config = {
+        primary_plugin_config = {
             "bucket": s3_config.bucket,
             "region": s3_config.region,
             "access_key_id": s3_config.access_key,
@@ -152,17 +158,112 @@ def _generate_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str, Any]
             "normalize_encoding_chars": s3_config.normalize_encoding_chars,
         }
 
-        config["s3fs"] = {
-            "enabled": True,
-            "path": "/local",
-            "config": s3_plugin_config,
-        }
+    # Build the mount config dict for the primary backend
+    mount_config: Dict[str, Any] = dict(primary_plugin_config)
+
+    # Add multi-write fields if backups are configured
+    if backups_config is not None:
+        # Serialize backups config to dict for FFI JSON passthrough
+        mount_config["backups"] = _serialize_backups_config(backups_config)
+        mount_config["server_encryption_enabled"] = server_encryption_enabled
+        mount_config["primary_encryption_enabled"] = (
+            server_encryption_enabled  # primary follows global
+        )
+
+        # Serialize redirect policies
+        if redirects_config is not None:
+            mount_config["primary_redirects"] = [
+                _serialize_redirect_policy(p) for p in redirects_config
+            ]
+
+    # Determine the plugin type name for the primary backend
+    if backend == "local":
+        plugin_name = "localfs"
+    elif backend == "s3":
+        plugin_name = "s3fs"
     elif backend == "memory":
-        config["memfs"] = {
-            "enabled": True,
-            "path": "/local",
-        }
+        plugin_name = "memfs"
+    else:
+        plugin_name = backend
+
+    config[plugin_name] = {
+        "enabled": True,
+        "path": "/local",
+        "config": mount_config,
+    }
+
     return config
+
+
+def _map_backend_to_plugin_name(backend: str) -> str:
+    """Map user-facing backend name to Rust plugin name."""
+    mapping = {
+        "local": "localfs",
+        "s3": "s3fs",
+        "memory": "memfs",
+    }
+    return mapping.get(backend, backend)
+
+
+def _serialize_backups_config(backups_config: Any) -> Dict[str, Any]:
+    """Serialize BackupsConfig to a dict suitable for JSON passthrough via FFI."""
+    result: Dict[str, Any] = {
+        "sync_type": getattr(backups_config, "sync_type", "async"),
+    }
+    if backups_config.write_ack_count is not None:
+        result["write_ack_count"] = backups_config.write_ack_count
+    if backups_config.write_ack_timeout_ms is not None:
+        result["write_ack_timeout_ms"] = backups_config.write_ack_timeout_ms
+    if backups_config.write_concurrency is not None:
+        result["write_concurrency"] = backups_config.write_concurrency
+
+    items = []
+    for item in backups_config.items:
+        item_dict: Dict[str, Any] = {
+            "name": item.name,
+            "backend": _map_backend_to_plugin_name(item.backend),
+        }
+        # Only include timeout if explicitly set (inherited default is 10)
+        if "timeout" in item.model_fields_set:
+            item_dict["timeout"] = item.timeout
+        if item.encryption is not None:
+            item_dict["encryption"] = {"enabled": item.encryption.enabled}
+        if item.operations is not None:
+            item_dict["operations"] = [
+                {"operation": op.operation, "priority": op.priority} for op in item.operations
+            ]
+        if item.excludes is not None:
+            item_dict["excludes"] = [_serialize_redirect_policy(p) for p in item.excludes]
+
+        # Collect backend-specific params into "params" key for Rust BackendItemConfig
+        # Check the original field names (e.g. "s3") not the mapped plugin names.
+        backend_type = item.backend  # original user-facing name: "local", "s3", "memory"
+        if backend_type == "s3" and "s3" in item.model_fields_set:
+            s3_config = item.s3
+            if s3_config is not None:
+                item_dict["params"] = s3_config.model_dump(exclude_none=True)
+        elif backend_type == "local":
+            # local backend requires local_dir; derive from workspace path if available.
+            # The primary backend gets local_dir from the mount path; backups may need
+            # a separate local_dir. If not explicitly set, fall back to a default.
+            pass  # local_dir is set by the Rust mount logic from the workspace path.
+
+        items.append(item_dict)
+
+    result["items"] = items
+    return result
+
+
+def _serialize_redirect_policy(policy: Any) -> Dict[str, Any]:
+    """Serialize a RedirectPolicyConfig to a dict."""
+    result: Dict[str, Any] = {"type": policy.type}
+    if policy.max_size_mb is not None:
+        result["max_size_mb"] = policy.max_size_mb
+    if policy.extensions is not None:
+        result["extensions"] = policy.extensions
+    if policy.target is not None:
+        result["target"] = policy.target
+    return result
 
 
 def create_agfs_client(config: RagfsBindingConfig) -> Any:
@@ -242,7 +343,11 @@ def mount_agfs_backend(agfs: Any, config: RagfsBindingConfig | Any) -> None:
         except Exception:
             pass
         try:
-            agfs.mount(plugin_name, mount_path, plugin_config.get("config", {}))
+            cfg = plugin_config.get("config", {})
+            logger.debug(
+                f"[RAGFSUtils] Mounting {plugin_name} at {mount_path} with config keys: {list(cfg.keys()) if isinstance(cfg, dict) else type(cfg)}"
+            )
+            agfs.mount(plugin_name, mount_path, cfg)
             logger.debug(f"[RAGFSUtils] Successfully mounted {plugin_name}")
-        except Exception:
-            logger.error(f"[RAGFSUtils] Failed to mount {plugin_name}")
+        except Exception as e:
+            logger.error(f"[RAGFSUtils] Failed to mount {plugin_name}: {e}")

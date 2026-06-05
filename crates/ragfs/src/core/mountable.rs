@@ -6,16 +6,45 @@
 
 use async_trait::async_trait;
 use radix_trie::{Trie, TrieCommon};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::crypto;
+
+use super::encryption_wrapper::EncryptionWrappedFS;
 use super::errors::{Error, Result};
 use super::filesystem::FileSystem;
+use super::multiwrite_wrapper::{BackendEntry, MultiWriteWrappedFS};
 use super::plugin::ServicePlugin;
 use super::stats::{FilesystemStats, StatsCollector};
 use super::stats_wrapper::StatsWrappedFS;
-use super::types::{FileInfo, GrepResult, PluginConfig, TreeEntry, WriteFlag};
+use super::types::{
+    BackendRole, BackendsConfig, ConfigValue, FileInfo, GrepResult,
+    PluginConfig, RedirectPolicy, TreeEntry, WriteFlag,
+};
+
+const SHAPE_MANIFEST_PATH: &str = "/.ragfs_backend_meta.json";
+const SHAPE_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum StorageShape {
+    Plaintext,
+    Encrypted {
+        provider_type: u8,
+        envelope_version: u8,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BackendShapeManifest {
+    version: u32,
+    backend_type: String,
+    shape: StorageShape,
+}
 
 /// Information about a mounted filesystem
 #[derive(Clone)]
@@ -25,6 +54,10 @@ struct MountInfo {
 
     /// The filesystem instance (wrapped with statistics)
     fs: Arc<dyn FileSystem>,
+
+    /// The raw plugin backend before encryption wrapping (for read_raw/write_raw).
+    /// None when encryption is disabled or for multi-write mounts.
+    raw_fs: Option<Arc<dyn FileSystem>>,
 
     /// The statistics collector for this mount
     stats: Arc<StatsCollector>,
@@ -44,15 +77,195 @@ pub struct MountableFS {
 
     /// Plugin registry for creating new filesystem instances
     registry: Arc<RwLock<HashMap<String, Arc<dyn ServicePlugin>>>>,
+
+    /// Global encryption config (root_key + provider_type), shared across all mounts.
+    /// When set, single-backend mounts are wrapped with EncryptionWrappedFS;
+    /// multi-write mounts use it for per-backend encryption decisions.
+    encryption_root_key: RwLock<Option<[u8; 32]>>,
+    encryption_provider_type: RwLock<Option<u8>>,
 }
 
 impl MountableFS {
+    fn expected_shape(encrypted: bool, provider_type: Option<u8>) -> Result<StorageShape> {
+        if encrypted {
+            let provider_type = provider_type.ok_or_else(|| {
+                Error::config("encrypted backend shape requires provider_type")
+            })?;
+            Ok(StorageShape::Encrypted {
+                provider_type,
+                envelope_version: crypto::VERSION,
+            })
+        } else {
+            Ok(StorageShape::Plaintext)
+        }
+    }
+
+    async fn read_shape_manifest(
+        &self,
+        raw_fs: &Arc<dyn FileSystem>,
+    ) -> Result<Option<BackendShapeManifest>> {
+        match raw_fs.read(SHAPE_MANIFEST_PATH, 0, 0).await {
+            Ok(bytes) => {
+                let manifest: BackendShapeManifest = serde_json::from_slice(&bytes)?;
+                Ok(Some(manifest))
+            }
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn write_shape_manifest(
+        &self,
+        raw_fs: &Arc<dyn FileSystem>,
+        backend_type: &str,
+        shape: &StorageShape,
+    ) -> Result<()> {
+        let manifest = BackendShapeManifest {
+            version: SHAPE_MANIFEST_VERSION,
+            backend_type: backend_type.to_string(),
+            shape: shape.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        raw_fs
+            .write(SHAPE_MANIFEST_PATH, &bytes, 0, WriteFlag::Create)
+            .await?;
+        Ok(())
+    }
+
+    async fn detect_legacy_shape(&self, raw_fs: &Arc<dyn FileSystem>) -> Result<Option<StorageShape>> {
+        let entries = raw_fs.tree_directory("/", true, None, None).await?;
+        let mut detected: Option<StorageShape> = None;
+
+        for entry in entries {
+            if entry.info.is_dir {
+                continue;
+            }
+
+            let normalized = normalize_path(&entry.path);
+            if normalized == SHAPE_MANIFEST_PATH {
+                continue;
+            }
+
+            let header = raw_fs.read(&normalized, 0, 6).await?;
+            let current = if crypto::is_encrypted(&header) {
+                if header.len() < 6 {
+                    return Err(Error::config(format!(
+                        "encrypted file '{}' is too short to inspect shape",
+                        normalized
+                    )));
+                }
+                StorageShape::Encrypted {
+                    envelope_version: header[4],
+                    provider_type: header[5],
+                }
+            } else {
+                StorageShape::Plaintext
+            };
+
+            match &detected {
+                None => detected = Some(current),
+                Some(existing) if existing == &current => {}
+                Some(existing) => {
+                    return Err(Error::config(format!(
+                        "backend contains mixed storage shapes: previously {:?}, found {:?} at '{}'",
+                        existing, current, normalized
+                    )));
+                }
+            }
+        }
+
+        Ok(detected)
+    }
+
+    async fn ensure_backend_shape(
+        &self,
+        raw_fs: &Arc<dyn FileSystem>,
+        backend_type: &str,
+        encrypted: bool,
+        provider_type: Option<u8>,
+    ) -> Result<()> {
+        let expected = Self::expected_shape(encrypted, provider_type)?;
+        if let Some(existing) = self.read_shape_manifest(raw_fs).await? {
+            if existing.version != SHAPE_MANIFEST_VERSION {
+                return Err(Error::config(format!(
+                    "unsupported backend shape manifest version {} for backend '{}'",
+                    existing.version, backend_type
+                )));
+            }
+            if existing.shape != expected {
+                return Err(Error::config(format!(
+                    "backend storage shape mismatch for '{}': expected {:?}, found {:?}",
+                    backend_type, expected, existing.shape
+                )));
+            }
+            return Ok(());
+        }
+
+        let detected = self.detect_legacy_shape(raw_fs).await?;
+        match detected {
+            None => self.write_shape_manifest(raw_fs, backend_type, &expected).await,
+            Some(found) if found == expected => {
+                self.write_shape_manifest(raw_fs, backend_type, &found).await
+            }
+            Some(found) => Err(Error::config(format!(
+                "backend storage shape mismatch for '{}': expected {:?}, found {:?}",
+                backend_type, expected, found
+            ))),
+        }
+    }
+
+    /// Try to unwrap a mounted filesystem stack to the underlying multi-write wrapper.
+    fn as_multiwrite(fs: &Arc<dyn FileSystem>) -> Option<&MultiWriteWrappedFS> {
+        let any = fs.as_ref() as &dyn std::any::Any;
+        if let Some(mw) = any.downcast_ref::<MultiWriteWrappedFS>() {
+            return Some(mw);
+        }
+        if let Some(stats) = any.downcast_ref::<StatsWrappedFS>() {
+            return Self::as_multiwrite(stats.inner_fs());
+        }
+        if let Some(enc) = any.downcast_ref::<EncryptionWrappedFS>() {
+            return Self::as_multiwrite(enc.inner_fs());
+        }
+        None
+    }
+
+    /// Query multi-write sync status for a mounted path.
+    pub async fn system_sync_status(&self, path: &str) -> Result<Value> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        let multiwrite = Self::as_multiwrite(&mount_info.fs)
+            .ok_or_else(|| Error::invalid_operation("mounted filesystem is not multi-write"))?;
+        multiwrite.system_sync_status(&rel_path).await
+    }
+
+    /// Manually retry pending multi-write sync operations under a mounted path.
+    pub async fn system_sync_retry(&self, path: &str) -> Result<Value> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        let multiwrite = Self::as_multiwrite(&mount_info.fs)
+            .ok_or_else(|| Error::invalid_operation("mounted filesystem is not multi-write"))?;
+        multiwrite.system_sync_retry(&rel_path).await
+    }
+
     /// Create a new MountableFS
     pub fn new() -> Self {
         Self {
             mounts: Arc::new(RwLock::new(Trie::new())),
             registry: Arc::new(RwLock::new(HashMap::new())),
+            encryption_root_key: RwLock::new(None),
+            encryption_provider_type: RwLock::new(None),
         }
+    }
+
+    /// Set the global encryption configuration for per-mount encryption wrapping.
+    pub async fn set_encryption_config(&self, root_key: Option<[u8; 32]>, provider_type: Option<u8>) {
+        *self.encryption_root_key.write().await = root_key;
+        *self.encryption_provider_type.write().await = provider_type;
+    }
+
+    /// Get the encryption root key and provider type.
+    async fn get_encryption_config(&self) -> (Option<[u8; 32]>, Option<u8>) {
+        let rk = *self.encryption_root_key.read().await;
+        let pt = *self.encryption_provider_type.read().await;
+        (rk, pt)
     }
 
     /// Register a plugin
@@ -99,17 +312,57 @@ impl MountableFS {
         // Validate configuration
         plugin.validate(&config).await?;
 
-        // Initialize filesystem
-        let fs = plugin.initialize(config.clone()).await?;
+        // Branch: multi-write vs single backend
+        let (inner_fs, raw_fs): (Arc<dyn FileSystem>, Option<Arc<dyn FileSystem>>) =
+            match &config.backups {
+                None => {
+                    // Single backend: initialize plugin, optionally wrap with encryption.
+                    // Control plugins (queuefs, serverinfofs) are never encrypted.
+                    let raw = plugin.initialize(config.clone()).await?;
+                    let raw_arc: Arc<dyn FileSystem> = Arc::from(raw);
+                    let is_control_plugin = matches!(
+                        config.name.as_str(),
+                        "queuefs" | "serverinfofs"
+                    );
+                    let (enc_root_key, enc_provider_type) = self.get_encryption_config().await;
+                    if !is_control_plugin {
+                        self.ensure_backend_shape(
+                            &raw_arc,
+                            &config.name,
+                            enc_root_key.is_some() && enc_provider_type.is_some(),
+                            enc_provider_type,
+                        )
+                        .await?;
+                    }
+                    let inner: Arc<dyn FileSystem> = if is_control_plugin {
+                        raw_arc.clone()
+                    } else {
+                        match (enc_root_key, enc_provider_type) {
+                            (Some(rk), Some(pt)) => {
+                                Arc::new(EncryptionWrappedFS::new(raw_arc.clone(), rk, pt))
+                            }
+                            _ => raw_arc.clone(),
+                        }
+                    };
+                    (inner, Some(raw_arc))
+                }
+                Some(bc) => {
+                    // Multi-write: build MultiWriteWrappedFS
+                    let mw = self.build_multi_write_fs(&config, bc).await?;
+                    let arc: Arc<dyn FileSystem> = Arc::new(mw);
+                    (arc, None)
+                }
+            };
 
         // Wrap with statistics
-        let wrapped_fs = StatsWrappedFS::new(fs);
+        let wrapped_fs = StatsWrappedFS::with_arc(inner_fs);
         let stats_collector = wrapped_fs.stats_collector();
 
         // Add to mounts
         let mount_info = MountInfo {
             path: normalized_path.clone(),
             fs: Arc::from(Box::new(wrapped_fs) as Box<dyn FileSystem>),
+            raw_fs,
             stats: stats_collector,
             plugin_name: config.name.clone(),
         };
@@ -118,6 +371,203 @@ impl MountableFS {
         mounts.insert(normalized_path, mount_info);
 
         Ok(())
+    }
+
+    /// Build a MultiWriteWrappedFS from primary + backup configurations.
+    ///
+    /// Steps:
+    /// 1. Initialize primary backend via registry, optionally wrap with EncryptionWrappedFS
+    /// 2. Initialize each backup backend via registry, optionally wrap with EncryptionWrappedFS
+    /// 3. Validate: unique names, primary has no operations, redirect targets exist
+    /// 4. Assemble MultiWriteWrappedFS
+    async fn build_multi_write_fs(
+        &self,
+        config: &PluginConfig,
+        bc: &BackendsConfig,
+    ) -> Result<MultiWriteWrappedFS> {
+        let (enc_root_key, enc_provider_type) = self.get_encryption_config().await;
+        let global_enc_enabled = enc_root_key.is_some() && enc_provider_type.is_some();
+
+        // 1. Initialize primary backend
+        let primary_raw = self.init_backend_plugin(&config.name, &config.params).await?;
+        self.ensure_backend_shape(
+            &primary_raw,
+            &config.name,
+            global_enc_enabled,
+            enc_provider_type,
+        )
+        .await?;
+        let primary_backend: Arc<dyn FileSystem> = if global_enc_enabled {
+            // Primary follows global encryption; primary_encryption_enabled is ignored
+            Arc::new(EncryptionWrappedFS::new(
+                primary_raw,
+                enc_root_key.unwrap(),
+                enc_provider_type.unwrap(),
+            ))
+        } else {
+            primary_raw
+        };
+
+        // 2. Initialize each backup backend
+        let mut backup_entries: Vec<BackendEntry> = Vec::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
+
+        for item in &bc.items {
+            // Validate unique name
+            if !seen_names.insert(item.name.clone()) {
+                return Err(Error::config(format!(
+                    "duplicate backup name '{}'",
+                    item.name
+                )));
+            }
+
+            // Build params for this backup from the item's nested config
+            let backup_params = self.item_params_to_config_values(&item.params)?;
+
+            // Initialize the raw backend
+            let backup_raw = self.init_backend_plugin(&item.backend, &backup_params).await?;
+            let backup_encrypted = global_enc_enabled
+                && item
+                    .encryption
+                    .as_ref()
+                    .map(|e| e.enabled)
+                    .unwrap_or(true);
+            self.ensure_backend_shape(
+                &backup_raw,
+                &item.backend,
+                backup_encrypted,
+                if backup_encrypted {
+                    enc_provider_type
+                } else {
+                    None
+                },
+            )
+            .await?;
+
+            // Optionally wrap with encryption
+            let backup_backend: Arc<dyn FileSystem> = if backup_encrypted {
+                Arc::new(EncryptionWrappedFS::new(
+                    backup_raw,
+                    enc_root_key.unwrap(),
+                    enc_provider_type.unwrap(),
+                ))
+            } else {
+                backup_raw
+            };
+
+            backup_entries.push(BackendEntry {
+                name: item.name.clone(),
+                role: BackendRole::Backup,
+                backend: backup_backend,
+                operations: item.operations.clone().unwrap_or_default(),
+                excludes: item.excludes.clone().unwrap_or_default(),
+            });
+        }
+
+        // 3. Validate redirect targets exist
+        for policy in &config.primary_redirects {
+            let targets = match policy {
+                RedirectPolicy::FileOverSizePolicy { target, .. } => target.as_ref(),
+                RedirectPolicy::FileExtensionPolicy { target, .. } => target.as_ref(),
+            };
+            if let Some(target_names) = targets {
+                for name in target_names {
+                    if !backup_entries.iter().any(|be| &be.name == name) {
+                        return Err(Error::config(format!(
+                            "redirect target '{}' not found in backup entries",
+                            name
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 4. Assemble MultiWriteWrappedFS
+        MultiWriteWrappedFS::with_backends(
+            primary_backend,
+            backup_entries,
+            config.primary_redirects.clone(),
+            &bc.sync_type,
+            bc.write_ack_count,
+            bc.write_ack_timeout_ms,
+            bc.write_concurrency,
+        )
+    }
+
+    /// Initialize a backend plugin by name with the given params.
+    async fn init_backend_plugin(
+        &self,
+        plugin_name: &str,
+        params: &HashMap<String, ConfigValue>,
+    ) -> Result<Arc<dyn FileSystem>> {
+        let plugin = {
+            let registry = self.registry.read().await;
+            registry
+                .get(plugin_name)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::plugin(format!("Plugin '{}' not registered", plugin_name))
+                })?
+        };
+
+        let plugin_config = PluginConfig {
+            name: plugin_name.to_string(),
+            mount_path: String::new(), // Not used for backend initialization
+            params: params.clone(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
+        };
+
+        plugin.validate(&plugin_config).await?;
+        let fs = plugin.initialize(plugin_config).await?;
+        Ok(Arc::from(fs))
+    }
+
+    /// Convert a serde_json::Value (nested dict) into flat HashMap<String, ConfigValue>.
+    /// Returns an empty HashMap when value is Null (backup item with no params).
+    fn item_params_to_config_values(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<HashMap<String, ConfigValue>> {
+        if value.is_null() {
+            return Ok(HashMap::new());
+        }
+        let obj = value.as_object().ok_or_else(|| {
+            Error::config(format!(
+                "backup item params must be a JSON object, got: {:?}",
+                value
+            ))
+        })?;
+        let mut params = HashMap::new();
+        for (k, v) in obj {
+            let cv = match v {
+                serde_json::Value::String(s) => ConfigValue::String(s.clone()),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        ConfigValue::Int(i)
+                    } else {
+                        ConfigValue::String(n.to_string())
+                    }
+                }
+                serde_json::Value::Bool(b) => ConfigValue::Bool(*b),
+                serde_json::Value::Array(arr) => {
+                    let strings: Vec<String> = arr
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    ConfigValue::StringList(strings)
+                }
+                serde_json::Value::Object(_) => ConfigValue::Json(v.clone()),
+                _ => ConfigValue::String(v.to_string()),
+            };
+            params.insert(k.clone(), cv);
+        }
+        Ok(params)
     }
 
     /// Unmount a filesystem at the specified path
@@ -182,6 +632,28 @@ impl MountableFS {
         }
 
         result
+    }
+
+    /// Read raw bytes from the underlying plugin backend, bypassing the encryption layer.
+    ///
+    /// Used by tests to verify ciphertext on disk and by cp/persist for verbatim blob copies.
+    pub async fn read_raw(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        match &mount_info.raw_fs {
+            Some(raw) => raw.read(&rel_path, offset, size).await,
+            None => mount_info.fs.read(&rel_path, offset, size).await,
+        }
+    }
+
+    /// Write raw bytes to the underlying plugin backend, bypassing the encryption layer.
+    ///
+    /// Counterpart to `read_raw` for cp/persist verbatim blob copies.
+    pub async fn write_raw(&self, path: &str, data: &[u8], flags: WriteFlag) -> Result<u64> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+        match &mount_info.raw_fs {
+            Some(raw) => raw.write(&rel_path, data, 0, flags).await,
+            None => mount_info.fs.write(&rel_path, data, 0, flags).await,
+        }
     }
 
     /// Find the mount point for a given path
@@ -413,6 +885,19 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Helper to create a PluginConfig for tests with new fields defaulted.
+    fn test_config(name: &str, mount_path: &str) -> PluginConfig {
+        PluginConfig {
+            name: name.to_string(),
+            mount_path: mount_path.to_string(),
+            params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
+        }
+    }
+
     // Mock filesystem for testing
     struct MockFS {
         name: String,
@@ -586,11 +1071,7 @@ mod tests {
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
         // Mount filesystem
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = test_config("mock", "/mock");
 
         assert!(mfs.mount(config).await.is_ok());
 
@@ -613,11 +1094,7 @@ mod tests {
         let mfs = MountableFS::new();
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = test_config("mock", "/mock");
 
         // First mount should succeed
         assert!(mfs.mount(config.clone()).await.is_ok());
@@ -642,11 +1119,7 @@ mod tests {
         let mfs = MountableFS::new();
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = test_config("mock", "/mock");
 
         mfs.mount(config).await.unwrap();
 
@@ -673,17 +1146,8 @@ mod tests {
         mfs.register_plugin(MockPlugin::new("mock2")).await;
 
         // Mount two filesystems
-        let config1 = PluginConfig {
-            name: "mock1".to_string(),
-            mount_path: "/fs1".to_string(),
-            params: HashMap::new(),
-        };
-
-        let config2 = PluginConfig {
-            name: "mock2".to_string(),
-            mount_path: "/fs2".to_string(),
-            params: HashMap::new(),
-        };
+        let config1 = test_config("mock1", "/fs1");
+        let config2 = test_config("mock2", "/fs2");
 
         mfs.mount(config1).await.unwrap();
         mfs.mount(config2).await.unwrap();
@@ -702,17 +1166,8 @@ mod tests {
         mfs.register_plugin(MockPlugin::new("mock1")).await;
         mfs.register_plugin(MockPlugin::new("mock2")).await;
 
-        let config1 = PluginConfig {
-            name: "mock1".to_string(),
-            mount_path: "/fs1".to_string(),
-            params: HashMap::new(),
-        };
-
-        let config2 = PluginConfig {
-            name: "mock2".to_string(),
-            mount_path: "/fs2".to_string(),
-            params: HashMap::new(),
-        };
+        let config1 = test_config("mock1", "/fs1");
+        let config2 = test_config("mock2", "/fs2");
 
         mfs.mount(config1).await.unwrap();
         mfs.mount(config2).await.unwrap();
@@ -730,11 +1185,7 @@ mod tests {
         let mfs = Arc::new(MountableFS::new());
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = test_config("mock", "/mock");
 
         mfs.mount(config).await.unwrap();
 
@@ -774,11 +1225,7 @@ mod tests {
         for i in 0..5 {
             let mfs_clone = Arc::clone(&mfs);
             let handle = task::spawn(async move {
-                let config = PluginConfig {
-                    name: format!("mock{}", i),
-                    mount_path: format!("/mock{}", i),
-                    params: HashMap::new(),
-                };
+                let config = test_config(&format!("mock{}", i), &format!("/mock{}", i));
                 mfs_clone.mount(config).await
             });
             handles.push(handle);
@@ -819,11 +1266,7 @@ mod tests {
         let mfs = MountableFS::new();
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = test_config("mock", "/mock");
         mfs.mount(config).await.unwrap();
 
         let result = mfs
@@ -875,13 +1318,9 @@ mod tests {
             )],
         );
         mfs.register_plugin(plugin).await;
-        mfs.mount(PluginConfig {
-            name: "rewrite".to_string(),
-            mount_path: "/rewrite".to_string(),
-            params: HashMap::new(),
-        })
-        .await
-        .unwrap();
+        mfs.mount(test_config("rewrite", "/rewrite"))
+            .await
+            .unwrap();
 
         let result = mfs
             .tree_directory("/rewrite/sub", false, None, None)
@@ -900,13 +1339,9 @@ mod tests {
             vec![make_tree_entry("/a/b/c.txt", "a/b/c.txt", "c.txt", false)],
         );
         mfs.register_plugin(plugin).await;
-        mfs.mount(PluginConfig {
-            name: "relpath".to_string(),
-            mount_path: "/local/test_account".to_string(),
-            params: HashMap::new(),
-        })
-        .await
-        .unwrap();
+        mfs.mount(test_config("relpath", "/local/test_account"))
+            .await
+            .unwrap();
 
         let result = mfs
             .tree_directory("/local/test_account/a", false, None, None)

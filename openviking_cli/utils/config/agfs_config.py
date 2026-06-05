@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -145,8 +147,43 @@ class QueueFSConfig(BaseModel):
         return self
 
 
+class BackupOperationConfig(BaseModel):
+    """Per-operation priority config for a backup backend."""
+
+    operation: str = Field(description="Operation type: 'read' | 'write'")
+    priority: int = Field(default=0, description="Priority (smaller = higher priority)")
+
+
+class BackupEncryptionConfig(BaseModel):
+    """Encryption on/off config for a backup backend."""
+
+    enabled: bool = Field(
+        default=True, description="Whether encryption is enabled for this backend"
+    )
+
+
+class RedirectPolicyConfig(BaseModel):
+    """Redirect / exclude policy configuration."""
+
+    type: str = Field(description="Policy type: 'FileOverSizePolicy' | 'FileExtensionPolicy'")
+    max_size_mb: Optional[int] = Field(
+        default=None, description="Max file size in MB (FileOverSizePolicy)"
+    )
+    extensions: Optional[List[str]] = Field(
+        default=None, description="Regex patterns for file extensions (FileExtensionPolicy)"
+    )
+    target: Optional[List[str]] = Field(
+        default=None, description="Target backend names (redirect only)"
+    )
+
+
 class AGFSConfig(BaseModel):
     """Configuration for RAGFS (Rust-based AGFS)."""
+
+    name: str = Field(
+        default="primary",
+        description="Logical backend name, globally unique across primary and all backups",
+    )
 
     path: Optional[str] = Field(
         default=None,
@@ -224,6 +261,14 @@ class AGFSConfig(BaseModel):
     # RAGFS will act as a gateway to the specified S3 bucket.
     s3: S3Config = Field(default_factory=lambda: S3Config(), description="S3 backend configuration")
 
+    # Multi-write configuration
+    backups: Optional[BackupsConfig] = Field(
+        default=None, description="Multi-write backups configuration. None = single backend mode."
+    )
+    redirects: Optional[List[RedirectPolicyConfig]] = Field(
+        default=None, description="Primary redirect policies."
+    )
+
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
@@ -271,4 +316,59 @@ class AGFSConfig(BaseModel):
                     "db_path/queue_db_path will be ignored."
                 )
 
+        # ── Global uniqueness validation ──
+        if self.backups is not None:
+            names_seen: set = {self.name}
+            for item in self.backups.items:
+                if item.name in names_seen:
+                    raise ValueError(
+                        f"Duplicate backend name '{item.name}': all backend names "
+                        f"(primary + backups) must be globally unique"
+                    )
+                names_seen.add(item.name)
+
+            # ── Redirect target validation ──
+            if self.redirects is not None:
+                backup_names = {item.name for item in self.backups.items}
+                for policy in self.redirects:
+                    if policy.target is not None:
+                        for target_name in policy.target:
+                            if target_name not in backup_names:
+                                raise ValueError(
+                                    f"Redirect target '{target_name}' not found in backups. "
+                                    f"Available backups: {sorted(backup_names)}"
+                                )
+
         return self
+
+
+class BackupItemConfig(AGFSConfig):
+    """Single backup backend item configuration. Inherits name/backend/timeout/s3 from AGFSConfig."""
+
+    encryption: Optional[BackupEncryptionConfig] = Field(
+        default=None, description="Per-backend encryption config"
+    )
+    operations: Optional[List[BackupOperationConfig]] = Field(
+        default=None, description="Operations this backup participates in"
+    )
+    excludes: Optional[List[RedirectPolicyConfig]] = Field(
+        default=None, description="Exclude policies"
+    )
+
+    model_config = {"extra": "allow"}
+
+
+class BackupsConfig(BaseModel):
+    """Multi-write backups container configuration."""
+
+    sync_type: str = Field(default="async", description="Sync type: 'sync' | 'async'")
+    write_ack_count: Optional[int] = Field(
+        default=None, description="Minimum backup ack count for sync mode"
+    )
+    write_ack_timeout_ms: Optional[int] = Field(
+        default=None, description="Timeout for waiting backup ack in sync mode (ms)"
+    )
+    write_concurrency: Optional[int] = Field(
+        default=None, description="Max concurrent async writes"
+    )
+    items: List[BackupItemConfig] = Field(description="Backup items")

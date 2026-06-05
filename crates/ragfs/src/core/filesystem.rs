@@ -4,6 +4,7 @@
 //! must implement. This provides a unified interface for file operations across
 //! different storage backends.
 
+use std::any::Any;
 use async_trait::async_trait;
 use regex::Regex;
 
@@ -93,7 +94,7 @@ pub(crate) fn compile_grep_regex(pattern: &str, case_insensitive: bool) -> Resul
 /// All filesystem plugins must implement this trait to provide file operations.
 /// All methods are async to support I/O-bound operations efficiently.
 #[async_trait]
-pub trait FileSystem: Send + Sync {
+pub trait FileSystem: Send + Sync + Any {
     /// Create an empty file at the specified path
     ///
     /// # Arguments

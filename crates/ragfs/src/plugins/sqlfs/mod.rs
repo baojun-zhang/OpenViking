@@ -126,6 +126,10 @@ impl Default for SQLFileSystem {
             name: "sqlfs".to_string(),
             mount_path: "/sqlfs".to_string(),
             params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         };
 
         Self::new(&config).expect("Failed to create default SQLFS")
@@ -712,6 +716,10 @@ mod tests {
             name: "sqlfs".to_string(),
             mount_path: "/sqlfs".to_string(),
             params: std::collections::HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         };
 
         let plugin = SQLFSPlugin::new();

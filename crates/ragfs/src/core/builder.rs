@@ -1,12 +1,14 @@
 //! Standard RAGFS stack builder.
 //!
 //! Centralizes "register all built-in plugins + assemble the wrapper stack" so the binding has a
-//! single construction path. Whether the encryption layer is present is decided *here, at
-//! construction time*, by whether `RagfsConfig::encryption` is set (see §2.4/§2.6 of the design).
+//! single construction path. Encryption is now applied per-backend inside `MountableFS::mount()`
+//! (single backend) or `MountableFS::build_multi_write_fs()` (multi-write), so the global
+//! `EncryptionWrappedFS` wrapper is removed from this builder.
+//!
+//! The top layer is always `StatsWrappedFS` so end-to-end timing (including crypto) is captured.
 
 use std::sync::Arc;
 
-use super::encryption_wrapper::EncryptionWrappedFS;
 use super::filesystem::FileSystem;
 use super::mountable::MountableFS;
 use super::stats_wrapper::StatsWrappedFS;
@@ -23,7 +25,7 @@ use crate::plugins::{
 /// `build_default_stack`'s signature.
 #[derive(Default)]
 pub struct RagfsConfig {
-    /// Encryption section: `None` → plaintext stack; `Some` → wrap an `EncryptionWrappedFS`.
+    /// Encryption section: `None` → plaintext stack; `Some` → per-backend encryption wrapping.
     pub encryption: Option<EncryptionConfig>,
 }
 
@@ -39,29 +41,29 @@ pub struct EncryptionConfig {
 pub struct RagfsStack {
     /// Mount manager (mount/unmount/list/stats/register_plugin live here).
     pub mountable: Arc<MountableFS>,
-    /// Data entry point: `Stats(Encryption(Mountable))` or `Stats(Mountable)`.
+    /// Data entry point: `Stats(Mountable)` — encryption is per-backend inside mount.
     pub top: Arc<dyn FileSystem>,
 }
 
 /// Build the standard RAGFS stack.
 ///
-/// `config.encryption == None` → no encryption layer (plaintext); `Some` → insert
-/// `EncryptionWrappedFS` in the middle. The top is always `StatsWrappedFS` so end-to-end timing
-/// (including crypto) is captured.
+/// Encryption config is forwarded to `MountableFS` so it can wrap individual backends
+/// with `EncryptionWrappedFS` during `mount()`. The top is always `StatsWrappedFS`.
 pub async fn build_default_stack(config: RagfsConfig) -> RagfsStack {
     let mountable = Arc::new(MountableFS::new());
     register_builtin_plugins(&mountable).await;
 
-    let data_fs: Arc<dyn FileSystem> = match config.encryption {
-        Some(enc) => Arc::new(EncryptionWrappedFS::new(
-            mountable.clone() as Arc<dyn FileSystem>,
-            enc.root_key,
-            enc.provider_type,
-        )),
-        None => mountable.clone() as Arc<dyn FileSystem>,
-    };
+    // Forward encryption config to MountableFS for per-backend wrapping.
+    if let Some(enc) = &config.encryption {
+        mountable
+            .set_encryption_config(Some(enc.root_key), Some(enc.provider_type))
+            .await;
+    }
 
-    let top: Arc<dyn FileSystem> = Arc::new(StatsWrappedFS::with_arc(data_fs));
+    // MountableFS is the data entry point; encryption is applied inside mount().
+    let top: Arc<dyn FileSystem> = Arc::new(StatsWrappedFS::with_arc(
+        mountable.clone() as Arc<dyn FileSystem>
+    ));
     RagfsStack { mountable, top }
 }
 
@@ -81,9 +83,11 @@ pub async fn register_builtin_plugins(fs: &MountableFS) {
 mod tests {
     use super::*;
     use crate::core::context::{FsContextInner, FS_CTX};
-    use crate::core::{PluginConfig, WriteFlag};
+    use crate::core::{ConfigValue, PluginConfig, Result, WriteFlag};
     use crate::crypto;
     use std::collections::HashMap;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn enc_config() -> RagfsConfig {
         RagfsConfig {
@@ -101,9 +105,34 @@ mod tests {
                 name: "memfs".to_string(),
                 mount_path: "/mem".to_string(),
                 params: HashMap::new(),
+                backups: None,
+                server_encryption_enabled: false,
+                primary_encryption_enabled: false,
+                primary_redirects: Vec::new(),
             })
             .await
             .unwrap();
+    }
+
+    /// Mount a LocalFS backend backed by a temporary directory.
+    async fn mount_local(stack: &RagfsStack, mount_path: &str, local_dir: &str) -> Result<()> {
+        let mut params = HashMap::new();
+        params.insert(
+            "local_dir".to_string(),
+            ConfigValue::String(local_dir.to_string()),
+        );
+        stack
+            .mountable
+            .mount(PluginConfig {
+                name: "localfs".to_string(),
+                mount_path: mount_path.to_string(),
+                params,
+                backups: None,
+                server_encryption_enabled: false,
+                primary_encryption_enabled: false,
+                primary_redirects: Vec::new(),
+            })
+            .await
     }
 
     #[tokio::test]
@@ -122,8 +151,8 @@ mod tests {
             })
             .await;
 
-        // Underlying mountable holds ciphertext.
-        let raw = stack.mountable.read("/mem/f", 0, 0).await.unwrap();
+        // Read raw bytes from mountable (bypasses encryption layer) to verify ciphertext.
+        let raw = stack.mountable.read_raw("/mem/f", 0, 0).await.unwrap();
         assert!(crypto::is_encrypted(&raw));
     }
 
@@ -138,7 +167,7 @@ mod tests {
             .write("/mem/f", b"hello", 0, WriteFlag::Create)
             .await
             .unwrap();
-        let raw = stack.mountable.read("/mem/f", 0, 0).await.unwrap();
+        let raw = stack.mountable.read_raw("/mem/f", 0, 0).await.unwrap();
         assert_eq!(raw, b"hello", "plaintext stack stores raw bytes");
     }
 
@@ -151,6 +180,10 @@ mod tests {
                 name: "queuefs".to_string(),
                 mount_path: "/queue".to_string(),
                 params: HashMap::new(),
+                backups: None,
+                server_encryption_enabled: false,
+                primary_encryption_enabled: false,
+                primary_redirects: Vec::new(),
             })
             .await
             .unwrap();
@@ -171,5 +204,38 @@ mod tests {
                 assert!(!crypto::is_encrypted(&msg));
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_mount_writes_backend_shape_manifest() {
+        let dir = TempDir::new().unwrap();
+        let stack = build_default_stack(enc_config()).await;
+
+        mount_local(&stack, "/local", dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let manifest = fs::read_to_string(dir.path().join(".ragfs_backend_meta.json")).unwrap();
+        assert!(manifest.contains("\"mode\": \"encrypted\""));
+        assert!(manifest.contains("\"provider_type\": 1"));
+        assert!(manifest.contains("\"envelope_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_mount_rejects_legacy_plaintext_backend_without_manifest() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("legacy.txt"), b"plaintext").unwrap();
+
+        let stack = build_default_stack(enc_config()).await;
+        let err = mount_local(&stack, "/local", dir.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        match err {
+            crate::core::errors::Error::Config(message) => {
+                assert!(message.contains("backend storage shape mismatch"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

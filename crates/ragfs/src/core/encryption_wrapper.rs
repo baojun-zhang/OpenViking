@@ -35,6 +35,11 @@ pub struct EncryptionWrappedFS {
 }
 
 impl EncryptionWrappedFS {
+    /// Get the wrapped filesystem for specialized delegation.
+    pub(crate) fn inner_fs(&self) -> &Arc<dyn FileSystem> {
+        &self.inner
+    }
+
     /// Construct an encryption layer over `inner`. Built only when a root key is configured.
     pub fn new(inner: Arc<dyn FileSystem>, root_key: [u8; 32], provider_type: u8) -> Self {
         Self {
@@ -312,6 +317,10 @@ mod tests {
             name: "memfs".to_string(),
             mount_path: "/mem".to_string(),
             params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         })
         .await
         .unwrap();
@@ -326,6 +335,10 @@ mod tests {
             name: "memfs".to_string(),
             mount_path: mount_path.to_string(),
             params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         })
         .await
         .unwrap();

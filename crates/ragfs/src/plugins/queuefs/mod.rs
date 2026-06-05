@@ -911,6 +911,10 @@ mod tests {
             name: "queuefs".to_string(),
             mount_path: "/queue".to_string(),
             params: std::collections::HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         };
 
         plugin.validate(&config).await.unwrap();

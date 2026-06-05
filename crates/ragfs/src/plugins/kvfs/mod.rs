@@ -543,6 +543,10 @@ mod tests {
             name: "kvfs".to_string(),
             mount_path: "/kvfs".to_string(),
             params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
         };
 
         assert!(plugin.validate(&config).await.is_ok());

@@ -221,7 +221,7 @@ impl ConfigParameter {
 }
 
 /// Plugin configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginConfig {
     /// Plugin name
     pub name: String,
@@ -231,6 +231,22 @@ pub struct PluginConfig {
 
     /// Configuration parameters
     pub params: HashMap<String, ConfigValue>,
+
+    /// Multi-write backups config (None = single backend mode)
+    #[serde(default)]
+    pub backups: Option<BackendsConfig>,
+
+    /// Global encryption enabled (server.encryption.enabled)
+    #[serde(default)]
+    pub server_encryption_enabled: bool,
+
+    /// Primary encryption enabled (follows global, not independently configurable)
+    #[serde(default)]
+    pub primary_encryption_enabled: bool,
+
+    /// Primary redirect policies
+    #[serde(default)]
+    pub primary_redirects: Vec<RedirectPolicy>,
 }
 
 /// Configuration value types
@@ -248,6 +264,9 @@ pub enum ConfigValue {
 
     /// List of strings
     StringList(Vec<String>),
+
+    /// Nested JSON value (for complex config like backups)
+    Json(serde_json::Value),
 }
 
 impl ConfigValue {
@@ -282,6 +301,166 @@ impl ConfigValue {
             _ => None,
         }
     }
+}
+
+// ── Multi-write configuration types ──
+
+/// Multi-write backends container configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendsConfig {
+    /// Sync type: "sync" or "async", default async
+    #[serde(default = "default_sync_type")]
+    pub sync_type: String,
+    /// Minimum backup ack count for sync mode
+    pub write_ack_count: Option<usize>,
+    /// Timeout for waiting backup ack in sync mode (ms)
+    pub write_ack_timeout_ms: Option<u64>,
+    /// Max concurrent async writes
+    pub write_concurrency: Option<usize>,
+    /// Backup items
+    pub items: Vec<BackendItemConfig>,
+}
+
+fn default_sync_type() -> String {
+    "async".to_string()
+}
+
+/// Single backup backend item configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendItemConfig {
+    /// Logical name, globally unique
+    pub name: String,
+    /// Plugin type (local/s3/memfs/kvfs/...)
+    pub backend: String,
+    /// Plugin-specific params (nested JSON)
+    #[serde(default)]
+    pub params: serde_json::Value,
+    /// Timeout in seconds
+    pub timeout: Option<u64>,
+    /// Encryption config for this backup
+    pub encryption: Option<EncryptionConfig>,
+    /// Operations this backup participates in
+    pub operations: Option<Vec<OperationItemConfig>>,
+    /// Exclude policies
+    pub excludes: Option<Vec<RedirectPolicy>>,
+}
+
+/// Per-operation priority config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationItemConfig {
+    /// Operation type: "read" | "write"
+    pub operation: String,
+    /// Priority (smaller = higher priority)
+    pub priority: u32,
+}
+
+/// Encryption on/off config for a backend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionConfig {
+    /// Whether encryption is enabled for this backend
+    pub enabled: bool,
+}
+
+/// Redirect / exclude policy (shared trait)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RedirectPolicy {
+    /// Redirect/exclude files exceeding a size threshold
+    #[serde(rename = "FileOverSizePolicy")]
+    FileOverSizePolicy {
+        /// Max file size in MB
+        max_size_mb: u64,
+        /// Target backend names (redirect only)
+        target: Option<Vec<String>>,
+    },
+    /// Redirect/exclude files matching extension patterns
+    #[serde(rename = "FileExtensionPolicy")]
+    FileExtensionPolicy {
+        /// Regex patterns for file extensions
+        extensions: Vec<String>,
+        /// Target backend names (redirect only)
+        target: Option<Vec<String>>,
+    },
+}
+
+/// Sync log entry for a single file path
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncLogEntry {
+    /// Latest monotonic sequence number
+    pub latest_seq: u64,
+    /// Last operation type
+    pub last_op: String,
+    /// Rename target (only when last_op == "rename")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rename_to: Option<String>,
+    /// File mode (only when last_op == "chmod" or "mkdir")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Per-backend acked sequence numbers
+    pub backends: std::collections::HashMap<String, BackendSyncState>,
+}
+
+/// Per-backend sync state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendSyncState {
+    /// Acknowledged sequence number
+    pub acked_seq: u64,
+}
+
+/// Sync log file content
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncLogMeta {
+    /// File entries keyed by file name (current directory)
+    pub entries: std::collections::HashMap<String, SyncLogEntry>,
+}
+
+/// Redirect metadata file content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedirectMeta {
+    /// Schema version
+    #[serde(default = "default_redirect_version")]
+    pub version: u32,
+    /// Redirect entries keyed by file name
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, RedirectEntry>,
+}
+
+fn default_redirect_version() -> u32 {
+    1
+}
+
+impl Default for RedirectMeta {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Single redirect entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedirectEntry {
+    /// Target backend names
+    pub targets: Vec<String>,
+}
+
+/// Backend role
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendRole {
+    /// Primary backend (authoritative source)
+    Primary,
+    /// Backup backend (replica)
+    Backup,
+}
+
+/// Sync type enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncType {
+    /// Synchronous: wait for backup ack before returning
+    Sync,
+    /// Asynchronous: return after primary write, sync in background
+    Async,
 }
 
 /// Custom serde module for SystemTime

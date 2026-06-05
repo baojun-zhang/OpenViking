@@ -623,7 +623,12 @@ class VikingFS:
     ) -> None:
         """Copy source to destination for mv without deleting source."""
         if is_temp:
-            await self._async_agfs.cp(old_path, new_path, recursive=is_dir)
+            await self._async_agfs.cp(
+                old_path,
+                new_path,
+                recursive=is_dir,
+                fs_ctx={"account_id": self._ctx_or_default(ctx).account_id},
+            )
             return
 
         if is_dir:
@@ -1644,7 +1649,7 @@ class VikingFS:
         safe_parts = [self._shorten_component(p, self._MAX_FILENAME_BYTES) for p in parts]
         return f"/local/{account_id}/{'/'.join(safe_parts)}"
 
-    _INTERNAL_NAMES = {"_system", "tasks", ".path.ovlock"}
+    _INTERNAL_NAMES = {"_system", "tasks", ".path.ovlock", ".sync_log.json", ".redirect.json"}
     _ROOT_PATH = "/local"
 
     async def _ls_entries(
@@ -2321,7 +2326,12 @@ class VikingFS:
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)
         await self._ensure_parent_dirs(dst_path, ctx=ctx)
-        await self._async_agfs.cp(src_path, dst_path, recursive=True)
+        await self._async_agfs.cp(
+            src_path,
+            dst_path,
+            recursive=True,
+            fs_ctx={"account_id": self._ctx_or_default(ctx).account_id},
+        )
 
     async def delete_temp(self, temp_uri: str, ctx: Optional[RequestContext] = None) -> None:
         """Delete temp directory and its contents."""
