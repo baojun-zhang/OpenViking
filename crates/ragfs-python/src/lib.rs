@@ -14,9 +14,9 @@ use std::time::UNIX_EPOCH;
 
 use ragfs::core::builder::EncryptionConfig;
 use ragfs::core::{
-    build_default_stack, BackendsConfig, ConfigValue, FileInfo, FileSystem, FilesystemStats,
-    FsContext, FsContextInner, FsOperation, GrepResult, MountableFS, OperationStats, PluginConfig,
-    RagfsConfig, RedirectPolicy, TreeEntry, WriteFlag, FS_CTX,
+    build_default_stack, ConfigValue, FileInfo, FileSystem, FilesystemStats, FsContext,
+    FsContextInner, FsOperation, GrepResult, MountableFS, OperationStats, PluginConfig,
+    RagfsConfig, TreeEntry, WriteFlag, FS_CTX,
 };
 
 fn py_detach_blocking<T, F>(py: Python<'_>, f: F) -> T
@@ -800,45 +800,12 @@ impl RAGFSBindingClient {
         path: String,
         config: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<HashMap<String, String>> {
-        let mut params = match config {
+        let params = match config {
             Some(dict) => py_dict_to_config(dict)?,
             None => HashMap::new(),
         };
-
-        // Extract multi-write fields from params before constructing PluginConfig.
-        // These are removed from params so they don't leak into the plugin's own config.
-        let backups: Option<BackendsConfig> = params.remove("backups").and_then(|v| match v {
-            ConfigValue::Json(json) => serde_json::from_value(json).ok(),
-            _ => None,
-        });
-
-        let server_encryption_enabled = params
-            .remove("server_encryption_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let primary_encryption_enabled = params
-            .remove("primary_encryption_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let primary_redirects: Vec<RedirectPolicy> = params
-            .remove("primary_redirects")
-            .and_then(|v| match v {
-                ConfigValue::Json(json) => serde_json::from_value(json).ok(),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        let plugin_config = PluginConfig {
-            name: fstype.clone(),
-            mount_path: path.clone(),
-            params,
-            backups,
-            server_encryption_enabled,
-            primary_encryption_enabled,
-            primary_redirects,
-        };
+        let plugin_config = PluginConfig::from_raw_parts(fstype.clone(), path.clone(), params)
+            .map_err(to_py_err)?;
 
         let mountable = self.mountable.clone();
         py_detach_blocking(py, move || {

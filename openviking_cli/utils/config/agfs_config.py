@@ -147,63 +147,25 @@ class QueueFSConfig(BaseModel):
         return self
 
 
-class BackupOperationConfig(BaseModel):
-    """Per-operation priority config for a backup backend."""
-
-    operation: str = Field(description="Operation type: 'read' | 'write'")
-    priority: int = Field(default=0, description="Priority (smaller = higher priority)")
-
-
-class BackupEncryptionConfig(BaseModel):
-    """Encryption on/off config for a backup backend."""
-
-    enabled: bool = Field(
-        default=True, description="Whether encryption is enabled for this backend"
-    )
+def _expect_dict(value: Any, field_name: str) -> dict[str, Any]:
+    """Return one config object as a dict or raise a targeted shape error."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    return value
 
 
-class RedirectPolicyConfig(BaseModel):
-    """Redirect / exclude policy configuration."""
-
-    type: str = Field(description="Policy type: 'FileOverSizePolicy' | 'FileExtensionPolicy'")
-    max_size_mb: Optional[int] = Field(
-        default=None, description="Max file size in MB (FileOverSizePolicy)"
-    )
-    extensions: Optional[List[str]] = Field(
-        default=None, description="Regex patterns for file extensions (FileExtensionPolicy)"
-    )
-    target: Optional[List[str]] = Field(
-        default=None, description="Target backend names (redirect only)"
-    )
+def _expect_list(value: Any, field_name: str) -> list[Any]:
+    """Return one config value as a list or raise a targeted shape error."""
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    return value
 
 
-class BackendBaseConfig(BaseModel):
-    """Shared backend description used by backup items."""
-
-    name: str = Field(description="Logical backend name")
-    backend: str = Field(description="User-facing backend type name")
-    timeout: int = Field(default=10, description="RAGFS request timeout (seconds)")
-    backend_params: Optional[Any] = Field(
-        default=None,
-        exclude=True,
-        description="Normalized backend-specific nested config extracted from the backend-named field.",
-    )
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_backend_specific_params(cls, data: Any) -> Any:
-        """Capture the backend-specific nested config while rejecting unrelated unknown fields."""
-        if not isinstance(data, dict):
-            return data
-
-        normalized = dict(data)
-        backend = normalized.get("backend")
-        if isinstance(backend, str) and backend in normalized:
-            normalized["backend_params"] = normalized.pop(backend)
-
-        return normalized
+def _expect_non_empty_str(value: Any, field_name: str) -> str:
+    """Return one config value as a non-empty string."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
 
 
 class AGFSConfig(BaseModel):
@@ -291,10 +253,10 @@ class AGFSConfig(BaseModel):
     s3: S3Config = Field(default_factory=lambda: S3Config(), description="S3 backend configuration")
 
     # Multi-write configuration
-    backups: Optional[BackupsConfig] = Field(
+    backups: Optional[dict[str, Any]] = Field(
         default=None, description="Multi-write backups configuration. None = single backend mode."
     )
-    redirects: Optional[List[RedirectPolicyConfig]] = Field(
+    redirects: Optional[List[dict[str, Any]]] = Field(
         default=None, description="Primary redirect policies."
     )
 
@@ -346,105 +308,57 @@ class AGFSConfig(BaseModel):
                 )
 
         if self.redirects is not None and self.backups is None:
-            raise ValueError("redirects requires backups; single-backend mode does not support redirects")
+            raise ValueError(
+                "redirects requires backups; single-backend mode does not support redirects"
+            )
 
-        # ── Global uniqueness validation ──
         if self.backups is not None:
-            if self.backups.sync_type == "sync" and self.backups.write_ack_count is None:
+            backups = _expect_dict(self.backups, "backups")
+            items = _expect_list(backups.get("items"), "backups.items")
+            sync_type = backups.get("sync_type", "async")
+            if sync_type not in {"sync", "async"}:
+                raise ValueError("backups.sync_type must be one of: 'sync', 'async'")
+            if sync_type == "sync" and backups.get("write_ack_count") is None:
                 raise ValueError("backups.write_ack_count is required when sync_type is 'sync'")
 
-            names_seen: set = {self.name}
-            for item in self.backups.items:
-                if item.name == "primary":
+            names_seen: set[str] = {self.name}
+            backup_names: set[str] = set()
+            for index, item in enumerate(items):
+                item_dict = _expect_dict(item, f"backups.items[{index}]")
+                item_name = _expect_non_empty_str(
+                    item_dict.get("name"), f"backups.items[{index}].name"
+                )
+                backend_type = _expect_non_empty_str(
+                    item_dict.get("backend"), f"backups.items[{index}].backend"
+                )
+
+                if "backups" in item_dict:
+                    raise ValueError("extra field 'backups' is not allowed in backup items")
+                if item_name == "primary":
                     raise ValueError("backup backend name 'primary' is reserved")
-                if item.name in names_seen:
+                if item_name in names_seen:
                     raise ValueError(
-                        f"Duplicate backend name '{item.name}': all backend names "
+                        f"Duplicate backend name '{item_name}': all backend names "
                         f"(primary + backups) must be globally unique"
                     )
-                names_seen.add(item.name)
 
-            # ── Redirect target validation ──
+                names_seen.add(item_name)
+                backup_names.add(item_name)
+
+                if backend_type == "s3" and "s3" in item_dict and item_dict["s3"] is not None:
+                    S3Config.model_validate(item_dict["s3"]).validate_config()
+
             if self.redirects is not None:
-                backup_names = {item.name for item in self.backups.items}
-                for policy in self.redirects:
-                    if not policy.target:
+                for index, policy in enumerate(self.redirects):
+                    policy_dict = _expect_dict(policy, f"redirects[{index}]")
+                    targets = policy_dict.get("target")
+                    if not targets:
                         raise ValueError("Redirect target must not be empty")
-                    for target_name in policy.target:
+                    for target_name in _expect_list(targets, f"redirects[{index}].target"):
                         if target_name not in backup_names:
                             raise ValueError(
                                 f"Redirect target '{target_name}' not found in backups. "
                                 f"Available backups: {sorted(backup_names)}"
                             )
 
-        return self
-
-
-class BackupBackendItemConfig(BackendBaseConfig):
-    """Single backup backend item configuration."""
-
-    encryption: Optional[BackupEncryptionConfig] = Field(
-        default=None, description="Per-backend encryption config"
-    )
-    operations: Optional[List[BackupOperationConfig]] = Field(
-        default=None, description="Operations this backup participates in"
-    )
-    excludes: Optional[List[RedirectPolicyConfig]] = Field(
-        default=None, description="Exclude policies"
-    )
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        """Validate backup-specific constraints."""
-        if not self.name:
-            raise ValueError("backup backend name must not be empty")
-        if not self.backend:
-            raise ValueError("backup backend type must not be empty")
-        if self.backend == "s3" and self.backend_params is not None:
-            S3Config.model_validate(self.backend_params).validate_config()
-        return self
-
-
-BackupItemConfig = BackupBackendItemConfig
-
-
-class BackupsConfig(BaseModel):
-    """Multi-write backups container configuration."""
-
-    sync_type: str = Field(default="async", description="Sync type: 'sync' | 'async'")
-    write_ack_count: Optional[int] = Field(
-        default=None, description="Minimum backup ack count for sync mode"
-    )
-    write_ack_timeout_ms: Optional[int] = Field(
-        default=None, description="Timeout for waiting backup ack in sync mode (ms)"
-    )
-    write_concurrency: Optional[int] = Field(
-        default=None, description="Max concurrent async writes"
-    )
-    retry_interval_ms: Optional[int] = Field(
-        default=None, description="Retry loop interval in milliseconds"
-    )
-    retry_backoff_base_ms: Optional[int] = Field(
-        default=None, description="Base backoff for retry attempts in milliseconds"
-    )
-    retry_max_retries_per_round: Optional[int] = Field(
-        default=None, description="Maximum retry attempts per file/target in one round"
-    )
-    retry_quarantine_after_failures: Optional[int] = Field(
-        default=None, description="Failure threshold before quarantining one file/target pair"
-    )
-    read_probe_cache_ttl_ms: Optional[int] = Field(
-        default=None, description="Read-route probe cache TTL in milliseconds"
-    )
-    items: List[BackupBackendItemConfig] = Field(description="Backup items")
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        """Validate backup container invariants."""
-        if self.sync_type not in {"sync", "async"}:
-            raise ValueError("backups.sync_type must be one of: 'sync', 'async'")
-        if self.sync_type == "sync" and self.write_ack_count is None:
-            raise ValueError("backups.write_ack_count is required when sync_type is 'sync'")
         return self

@@ -94,6 +94,47 @@ async fn test_read_dir_redirect_entries_use_target_stat() {
 }
 
 #[tokio::test]
+async fn test_recursive_grep_finds_nested_redirected_files() {
+    let fs = test_multiwrite_fs(vec![RedirectPolicy::FileExtensionPolicy {
+        extensions: vec!["\\.md$".to_string()],
+        target: Some(vec!["backup1".to_string()]),
+    }]);
+    let ctx = test_ctx();
+
+    FS_CTX
+        .scope(ctx, async {
+            fs.ensure_parent_dirs("/local/acct/resources/doc-1/page.md", 0o755)
+                .await?;
+            fs.write(
+                "/local/acct/resources/doc-1/page.md",
+                b"MULTIWRITE_TEST_MARKER\n",
+                0,
+                WriteFlag::Create,
+            )
+            .await?;
+
+            let result = fs
+                .grep(
+                    "/local/acct/resources",
+                    "MULTIWRITE_TEST_MARKER",
+                    true,
+                    false,
+                    None,
+                    None,
+                    Some(5),
+                )
+                .await?;
+            assert_eq!(result.count, 1);
+            assert_eq!(result.matches.len(), 1);
+            assert_eq!(result.matches[0].file, "doc-1/page.md");
+            assert_eq!(result.matches[0].line, 1);
+            Ok::<(), Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_redirect_write_marks_first_target_acked_before_returning() {
     let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup1: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());

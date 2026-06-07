@@ -3,6 +3,7 @@
 //! This module defines the fundamental data structures used throughout RAGFS,
 //! including file metadata, write flags, and configuration types.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -280,6 +281,89 @@ impl PluginConfig {
             mount_path: mount_path.into(),
             params,
             ..Self::default()
+        }
+    }
+
+    /// Build one plugin config from raw params, extracting multi-write fields in one place.
+    pub fn from_raw_parts(
+        name: impl Into<String>,
+        mount_path: impl Into<String>,
+        mut params: HashMap<String, ConfigValue>,
+    ) -> crate::core::Result<Self> {
+        let backups = Self::take_optional_json("backups", &mut params)?;
+        let server_encryption_enabled =
+            Self::take_bool_with_default("server_encryption_enabled", &mut params, false)?;
+        let primary_encryption_enabled =
+            Self::take_bool_with_default("primary_encryption_enabled", &mut params, false)?;
+        let primary_redirects =
+            Self::take_json_with_default("primary_redirects", &mut params, Vec::new())?;
+
+        Ok(Self {
+            name: name.into(),
+            mount_path: mount_path.into(),
+            params,
+            backups,
+            server_encryption_enabled,
+            primary_encryption_enabled,
+            primary_redirects,
+        })
+    }
+
+    /// Remove one optional bool config value and type-check it.
+    fn take_bool_with_default(
+        field_name: &str,
+        params: &mut HashMap<String, ConfigValue>,
+        default: bool,
+    ) -> crate::core::Result<bool> {
+        match params.remove(field_name) {
+            None => Ok(default),
+            Some(ConfigValue::Bool(value)) => Ok(value),
+            Some(other) => Err(crate::core::Error::config(format!(
+                "'{}' must be a boolean, got {}",
+                field_name,
+                Self::config_value_kind(&other)
+            ))),
+        }
+    }
+
+    /// Remove one optional JSON config value and deserialize it when present.
+    fn take_optional_json<T: DeserializeOwned>(
+        field_name: &str,
+        params: &mut HashMap<String, ConfigValue>,
+    ) -> crate::core::Result<Option<T>> {
+        match params.remove(field_name) {
+            None => Ok(None),
+            Some(ConfigValue::Json(value)) => {
+                let parsed = serde_json::from_value(value).map_err(|err| {
+                    crate::core::Error::config(format!("invalid '{}': {}", field_name, err))
+                })?;
+                Ok(Some(parsed))
+            }
+            Some(other) => Err(crate::core::Error::config(format!(
+                "'{}' must be a JSON object/array, got {}",
+                field_name,
+                Self::config_value_kind(&other)
+            ))),
+        }
+    }
+
+    /// Remove one optional JSON config value and fall back to the provided default.
+    fn take_json_with_default<T: DeserializeOwned>(
+        field_name: &str,
+        params: &mut HashMap<String, ConfigValue>,
+        default: T,
+    ) -> crate::core::Result<T> {
+        Ok(Self::take_optional_json(field_name, params)?.unwrap_or(default))
+    }
+
+    /// Return a human-readable config value kind for error messages.
+    fn config_value_kind(value: &ConfigValue) -> &'static str {
+        match value {
+            ConfigValue::String(_) => "string",
+            ConfigValue::Int(_) => "integer",
+            ConfigValue::Bool(_) => "boolean",
+            ConfigValue::StringList(_) => "string_list",
+            ConfigValue::Json(_) => "json",
         }
     }
 }
@@ -701,5 +785,73 @@ mod tests {
 
         assert!(entry.is_primary_committed());
         assert_eq!(entry.latest_seq, 7);
+    }
+
+    #[test]
+    fn test_plugin_config_from_raw_parts_handles_multiwrite_shapes() {
+        let mut valid_params = HashMap::new();
+        valid_params.insert(
+            "root_path".to_string(),
+            ConfigValue::String("/tmp/data".to_string()),
+        );
+        valid_params.insert(
+            "backups".to_string(),
+            ConfigValue::Json(serde_json::json!({
+                "items": [{"name": "backup1", "backend": "memory"}]
+            })),
+        );
+        valid_params.insert(
+            "server_encryption_enabled".to_string(),
+            ConfigValue::Bool(true),
+        );
+        valid_params.insert(
+            "primary_encryption_enabled".to_string(),
+            ConfigValue::Bool(true),
+        );
+        valid_params.insert(
+            "primary_redirects".to_string(),
+            ConfigValue::Json(serde_json::json!([
+                {
+                    "type": "FileExtensionPolicy",
+                    "extensions": [".bin"],
+                    "target": ["backup1"]
+                }
+            ])),
+        );
+
+        let config = PluginConfig::from_raw_parts("localfs", "/local", valid_params).unwrap();
+        assert!(config.backups.is_some());
+        assert!(config.server_encryption_enabled);
+        assert!(config.primary_encryption_enabled);
+        assert_eq!(config.primary_redirects.len(), 1);
+        assert_eq!(
+            config.params.get("root_path"),
+            Some(&ConfigValue::String("/tmp/data".to_string()))
+        );
+        assert!(!config.params.contains_key("backups"));
+        assert!(!config.params.contains_key("server_encryption_enabled"));
+        assert!(!config.params.contains_key("primary_encryption_enabled"));
+        assert!(!config.params.contains_key("primary_redirects"));
+
+        for (params, expected_message) in [
+            (
+                HashMap::from([(
+                    "backups".to_string(),
+                    ConfigValue::Json(serde_json::json!({"items": "invalid"})),
+                )]),
+                "invalid 'backups'",
+            ),
+            (
+                HashMap::from([(
+                    "server_encryption_enabled".to_string(),
+                    ConfigValue::String("true".to_string()),
+                )]),
+                "'server_encryption_enabled' must be a boolean",
+            ),
+        ] {
+            let err = PluginConfig::from_raw_parts("localfs", "/local", params).unwrap_err();
+            assert!(matches!(err, crate::core::Error::Config(_)));
+            assert!(err.to_string().contains(expected_message));
+        }
     }
 }

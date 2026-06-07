@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify};
 
 use super::context::{FsContext, FS_CTX};
 use super::errors::{Error, Result};
-use super::filesystem::{normalize_prefix_path, FileSystem};
+use super::filesystem::{normalize_prefix_path, relative_match_file, FileSystem};
 use super::types::{
     BackendRole, BackendSyncState, FileInfo, GrepResult, OperationItemConfig, RedirectEntry,
     RedirectPolicy, SyncLogEntry, SyncOp, SyncType, TreeEntry, WriteFlag,
@@ -1127,6 +1127,18 @@ impl Inner {
     }
 }
 
+/// Return true when `path` falls under `exclude_path` (including itself).
+fn is_excluded_grep_path(path: &str, exclude_path: Option<&str>) -> bool {
+    let Some(exclude_path) = exclude_path.map(normalize_prefix_path) else {
+        return false;
+    };
+    let normalized_path = normalize_prefix_path(path);
+    normalized_path == exclude_path
+        || normalized_path
+            .strip_prefix(&exclude_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 // ── FileSystem trait implementation ──
 
 impl Drop for MultiWriteWrappedFS {
@@ -1527,6 +1539,51 @@ impl FileSystem for MultiWriteWrappedFS {
             parent_dir(&path_owned)
         };
 
+        if recursive && search_dir == path_owned {
+            let redirect_entries = self
+                .tree_directory(&path_owned, true, None, level_limit)
+                .await?;
+            for entry in redirect_entries {
+                if node_limit.is_some_and(|limit| result.count >= limit) {
+                    break;
+                }
+                if entry.info.is_dir
+                    || entry.extra.get("redirect").and_then(Value::as_bool) != Some(true)
+                {
+                    continue;
+                }
+                if is_excluded_grep_path(&entry.path, exclude_owned.as_deref()) {
+                    continue;
+                }
+                let Some(read_backend) = inner.resolve_read_backend(&entry.path).await else {
+                    continue;
+                };
+                let rel_path = relative_match_file(&path_owned, &entry.path);
+                let target_result = match read_backend
+                    .grep(
+                        &entry.path,
+                        &pattern_owned,
+                        false,
+                        case_insensitive,
+                        node_limit.map(|limit| limit.saturating_sub(result.count)),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(found) => found,
+                    Err(_) => continue,
+                };
+                for m in target_result.matches {
+                    if node_limit.is_some_and(|limit| result.count >= limit) {
+                        break;
+                    }
+                    result.add_match(rel_path.clone(), m.line, m.content);
+                }
+            }
+            return Ok(result);
+        }
+
         if let Ok(redirect_meta) = inner.meta_store.get_redirect_meta(&search_dir, &ctx).await {
             for (name, redirect_entry) in &redirect_meta.entries {
                 for target_name in &redirect_entry.targets {
@@ -1549,11 +1606,12 @@ impl FileSystem for MultiWriteWrappedFS {
                             )
                             .await
                         {
+                            let rel_path = relative_match_file(&path_owned, &redirect_path);
                             for m in target_result.matches {
                                 if node_limit.is_some_and(|limit| result.count >= limit) {
                                     break;
                                 }
-                                result.add_match(m.file, m.line, m.content);
+                                result.add_match(rel_path.clone(), m.line, m.content);
                             }
                         }
                     }

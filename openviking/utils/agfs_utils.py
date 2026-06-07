@@ -199,6 +199,18 @@ def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
+def _get_backend_specific_params(item: Any) -> Any:
+    """Return backend-specific nested params from one backup item using the backend name key."""
+    backend_params = _get_config_value(item, "backend_params")
+    if backend_params is not None:
+        return backend_params
+
+    backend_type = _get_config_value(item, "backend")
+    if not isinstance(backend_type, str):
+        return None
+    return _get_config_value(item, backend_type)
+
+
 def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
     """Serialize user-facing S3 config into Rust s3fs plugin parameters."""
     directory_marker_mode = _get_config_value(s3_config, "directory_marker_mode")
@@ -251,7 +263,7 @@ def _serialize_local_backup_params(
         _get_config_value(backend_config, "local_dir") if backend_config is not None else None
     )
     if local_dir is None:
-        local_dir = data_path / "viking" / "_backups" / item.name
+        local_dir = data_path / "viking" / "_backups" / _get_config_value(item, "name")
     local_dir_path = Path(local_dir).expanduser()
     return {"local_dir": str(local_dir_path)}
 
@@ -275,62 +287,44 @@ def _backup_param_serializers() -> Dict[str, Callable[[Any, Any, Path], Dict[str
 
 def _serialize_backup_params(item: Any, data_path: Path) -> Dict[str, Any]:
     """Serialize backend-specific params for one backup item via the serializer registry."""
-    backend_type = item.backend
-    backend_config = getattr(item, "backend_params", None)
+    backend_type = _get_config_value(item, "backend")
+    backend_config = _get_backend_specific_params(item)
     serializer = _backup_param_serializers().get(backend_type, _serialize_generic_backup_params)
     return serializer(item, backend_config, data_path)
 
 
+def _normalize_backup_item(item: Any, data_path: Path) -> Dict[str, Any]:
+    """Normalize one raw backup item for Rust while preserving unknown future fields."""
+    item_dict = _dump_config_object(item)
+    backend_type = _get_config_value(item, "backend")
+    item_dict["backend"] = _map_backend_to_plugin_name(backend_type)
+    item_dict.pop("backend_params", None)
+    if isinstance(backend_type, str):
+        item_dict.pop(backend_type, None)
+
+    params = _serialize_backup_params(item, data_path)
+    if params:
+        item_dict["params"] = params
+    else:
+        item_dict.pop("params", None)
+
+    return item_dict
+
+
 def _serialize_backups_config(backups_config: Any, data_path: Path) -> Dict[str, Any]:
-    """Serialize BackupsConfig to a dict suitable for JSON passthrough via FFI."""
-    result: Dict[str, Any] = {
-        "sync_type": getattr(backups_config, "sync_type", "async"),
-    }
-    if backups_config.write_ack_count is not None:
-        result["write_ack_count"] = backups_config.write_ack_count
-    if backups_config.write_ack_timeout_ms is not None:
-        result["write_ack_timeout_ms"] = backups_config.write_ack_timeout_ms
-    if backups_config.write_concurrency is not None:
-        result["write_concurrency"] = backups_config.write_concurrency
-
-    items = []
-    for item in backups_config.items:
-        item_dict: Dict[str, Any] = {
-            "name": item.name,
-            "backend": _map_backend_to_plugin_name(item.backend),
-        }
-        # Only include timeout if explicitly set (inherited default is 10)
-        if "timeout" in item.model_fields_set:
-            item_dict["timeout"] = item.timeout
-        if item.encryption is not None:
-            item_dict["encryption"] = {"enabled": item.encryption.enabled}
-        if item.operations is not None:
-            item_dict["operations"] = [
-                {"operation": op.operation, "priority": op.priority} for op in item.operations
-            ]
-        if item.excludes is not None:
-            item_dict["excludes"] = [_serialize_redirect_policy(p) for p in item.excludes]
-
-        params = _serialize_backup_params(item, data_path)
-        if params:
-            item_dict["params"] = params
-
-        items.append(item_dict)
-
-    result["items"] = items
+    """Serialize raw multi-write backups config with top-level passthrough and normalized items."""
+    result = _dump_config_object(backups_config)
+    result.setdefault("sync_type", "async")
+    result["items"] = [
+        _normalize_backup_item(item, data_path)
+        for item in _get_config_value(backups_config, "items", [])
+    ]
     return result
 
 
 def _serialize_redirect_policy(policy: Any) -> Dict[str, Any]:
-    """Serialize a RedirectPolicyConfig to a dict."""
-    result: Dict[str, Any] = {"type": policy.type}
-    if policy.max_size_mb is not None:
-        result["max_size_mb"] = policy.max_size_mb
-    if policy.extensions is not None:
-        result["extensions"] = policy.extensions
-    if policy.target is not None:
-        result["target"] = policy.target
-    return result
+    """Serialize one raw redirect/exclude policy object to a dict."""
+    return _dump_config_object(policy)
 
 
 def create_agfs_client(config: RagfsBindingConfig) -> Any:
