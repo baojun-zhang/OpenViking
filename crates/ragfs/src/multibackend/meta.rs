@@ -5,10 +5,9 @@
 //! `FsContext` from paths in background tasks.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -46,6 +45,53 @@ impl FsContextResolver for DefaultFsContextResolver {
     }
 }
 
+/// Resolver that extracts `account_id` from paths under one concrete mount root.
+pub struct MountRootFsContextResolver {
+    mount_root: String,
+}
+
+impl MountRootFsContextResolver {
+    /// Create a resolver for one normalized mount root such as `/local` or `/s3`.
+    pub fn new(mount_root: &str) -> Self {
+        let mut normalized = mount_root.trim_end_matches('/').to_string();
+        if normalized.is_empty() {
+            normalized = "/".to_string();
+        } else if !normalized.starts_with('/') {
+            normalized = format!("/{normalized}");
+        }
+        Self {
+            mount_root: normalized,
+        }
+    }
+}
+
+impl FsContextResolver for MountRootFsContextResolver {
+    fn resolve(&self, path: &str) -> Result<FsContext> {
+        let normalized = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let suffix = if self.mount_root == "/" {
+            normalized.trim_start_matches('/')
+        } else {
+            normalized
+                .strip_prefix(&self.mount_root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .ok_or_else(|| {
+                    Error::internal(format!("cannot resolve FsContext from path: {path}"))
+                })?
+        };
+        let account_id = suffix.split('/').next().unwrap_or_default();
+        if account_id.is_empty() {
+            return Err(Error::internal(format!(
+                "cannot resolve FsContext from path: {path}"
+            )));
+        }
+        Ok(Arc::new(FsContextInner::new(account_id.to_string())))
+    }
+}
+
 /// Internal file name for path lock markers.
 pub(crate) const PATH_LOCK_FILE: &str = ".path.ovlock";
 /// Internal file name for redirect metadata.
@@ -57,76 +103,8 @@ pub(crate) const MULTIWRITE_INTERNAL_NAMES: &[&str] =
     &[PATH_LOCK_FILE, SYNC_LOG_FILE, REDIRECT_FILE];
 const GLOBAL_STATE_FILE: &str = "/local/_system/.multiwrite.global.json";
 const GLOBAL_STATE_VERSION: u32 = 1;
-const DEFAULT_META_CACHE_CAPACITY: usize = 1024;
-const DEFAULT_META_CACHE_TTL: Duration = Duration::from_secs(30);
-const DEFAULT_DIR_LOCK_CAPACITY: usize = 2048;
-const DEFAULT_DIR_LOCK_TTL: Duration = Duration::from_secs(300);
-const DEFAULT_PATH_QUEUE_CAPACITY: usize = 4096;
-const DEFAULT_PATH_QUEUE_TTL: Duration = Duration::from_secs(300);
 
-#[derive(Clone)]
-struct DirMetaCacheEntry {
-    redirect: RedirectMeta,
-    sync_log: SyncLogMeta,
-    cached_at: Instant,
-    last_accessed_at: Instant,
-}
-
-struct TrackedLock {
-    mutex: Arc<Mutex<()>>,
-    active_users: AtomicUsize,
-    last_used: StdMutex<Instant>,
-}
-
-struct TrackedLockGuard {
-    owner: Arc<TrackedLock>,
-    _guard: OwnedMutexGuard<()>,
-}
-
-impl TrackedLock {
-    /// Create a new tracked async mutex with usage metadata.
-    fn new() -> Self {
-        Self {
-            mutex: Arc::new(Mutex::new(())),
-            active_users: AtomicUsize::new(0),
-            last_used: StdMutex::new(Instant::now()),
-        }
-    }
-
-    /// Lock the underlying mutex and track one active user.
-    pub(crate) async fn lock(self: &Arc<Self>) -> TrackedLockGuard {
-        self.active_users.fetch_add(1, Ordering::SeqCst);
-        *self.last_used.lock().unwrap() = Instant::now();
-        let guard = self.mutex.clone().lock_owned().await;
-        TrackedLockGuard {
-            owner: Arc::clone(self),
-            _guard: guard,
-        }
-    }
-
-    /// Return whether this lock is idle and stale enough to prune.
-    fn is_prunable(&self, now: Instant, ttl: Duration) -> bool {
-        if self.active_users.load(Ordering::SeqCst) != 0 {
-            return false;
-        }
-        if now.duration_since(*self.last_used.lock().unwrap()) <= ttl {
-            return false;
-        }
-        self.mutex.clone().try_lock_owned().is_ok()
-    }
-
-    /// Return the last access time of this lock.
-    fn last_used_at(&self) -> Instant {
-        *self.last_used.lock().unwrap()
-    }
-}
-
-impl Drop for TrackedLockGuard {
-    fn drop(&mut self) {
-        self.owner.active_users.fetch_sub(1, Ordering::SeqCst);
-        *self.owner.last_used.lock().unwrap() = Instant::now();
-    }
-}
+type TrackedLock = Mutex<()>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct GlobalMultiWriteState {
@@ -156,16 +134,6 @@ pub struct MetaStateStore {
     dir_locks: Mutex<HashMap<String, Arc<TrackedLock>>>,
     /// Dedicated global state lock for next_seq persistence.
     global_state_lock: Mutex<()>,
-    /// Maximum number of directory lock entries to retain.
-    dir_lock_capacity: usize,
-    /// Time-to-live for one idle directory lock entry.
-    dir_lock_ttl: Duration,
-    /// In-memory directory metadata cache to reduce repeated full JSON reads.
-    meta_cache: Mutex<HashMap<String, DirMetaCacheEntry>>,
-    /// Maximum number of directory cache entries to retain.
-    meta_cache_capacity: usize,
-    /// Time-to-live for one directory cache entry.
-    meta_cache_ttl: Duration,
     /// Context resolver for background tasks
     ctx_resolver: Arc<dyn FsContextResolver>,
 }
@@ -176,30 +144,20 @@ impl MetaStateStore {
         primary_backend: Arc<dyn FileSystem>,
         ctx_resolver: Arc<dyn FsContextResolver>,
     ) -> Self {
-        Self::with_cache_config(
-            primary_backend,
-            ctx_resolver,
-            DEFAULT_META_CACHE_CAPACITY,
-            DEFAULT_META_CACHE_TTL,
-        )
+        Self::with_cache_config(primary_backend, ctx_resolver, 0, Duration::ZERO)
     }
 
-    /// Create a new MetaStateStore with explicit cache sizing.
+    /// Create a new MetaStateStore; cache parameters are retained as no-op compatibility knobs.
     pub fn with_cache_config(
         primary_backend: Arc<dyn FileSystem>,
         ctx_resolver: Arc<dyn FsContextResolver>,
-        meta_cache_capacity: usize,
-        meta_cache_ttl: Duration,
+        _meta_cache_capacity: usize,
+        _meta_cache_ttl: Duration,
     ) -> Self {
         Self {
             primary_backend,
             dir_locks: Mutex::new(HashMap::new()),
             global_state_lock: Mutex::new(()),
-            dir_lock_capacity: DEFAULT_DIR_LOCK_CAPACITY,
-            dir_lock_ttl: DEFAULT_DIR_LOCK_TTL,
-            meta_cache: Mutex::new(HashMap::new()),
-            meta_cache_capacity: meta_cache_capacity.max(1),
-            meta_cache_ttl,
             ctx_resolver,
         }
     }
@@ -210,36 +168,9 @@ impl MetaStateStore {
         if let Some(lock) = locks.get(dir).cloned() {
             return lock;
         }
-        let lock = Arc::new(TrackedLock::new());
+        let lock = Arc::new(TrackedLock::new(()));
         locks.insert(dir.to_string(), lock.clone());
-        Self::prune_tracked_locks(&mut locks, self.dir_lock_capacity, self.dir_lock_ttl);
         lock
-    }
-
-    /// Prune stale tracked lock entries and keep the map bounded.
-    fn prune_tracked_locks(
-        locks: &mut HashMap<String, Arc<TrackedLock>>,
-        capacity: usize,
-        ttl: Duration,
-    ) {
-        let now = Instant::now();
-        locks.retain(|_, entry| !entry.is_prunable(now, ttl));
-        while locks.len() > capacity {
-            let oldest_key = locks
-                .iter()
-                .filter(|(_, entry)| entry.active_users.load(Ordering::SeqCst) == 0)
-                .min_by_key(|(_, entry)| entry.last_used_at())
-                .map(|(key, _)| key.clone());
-            if let Some(oldest_key) = oldest_key {
-                if let Some(entry) = locks.get(&oldest_key) {
-                    if entry.mutex.clone().try_lock_owned().is_ok() {
-                        locks.remove(&oldest_key);
-                        continue;
-                    }
-                }
-            }
-            break;
-        }
     }
 
     /// Return the dedicated `_system` context used by global metadata.
@@ -290,75 +221,15 @@ impl MetaStateStore {
         self.read_meta(dir, SYNC_LOG_FILE, ctx).await
     }
 
-    /// Read both metadata files, using the directory cache when available.
+    /// Read both metadata files from the primary backend.
     async fn read_dir_meta_pair(
         &self,
         dir: &str,
         ctx: &FsContext,
     ) -> Result<(RedirectMeta, SyncLogMeta)> {
-        let now = Instant::now();
-        {
-            let mut cache = self.meta_cache.lock().await;
-            if let Some(cached) = cache.get_mut(dir) {
-                if now.duration_since(cached.cached_at) <= self.meta_cache_ttl {
-                    cached.last_accessed_at = now;
-                    return Ok((cached.redirect.clone(), cached.sync_log.clone()));
-                }
-            }
-            cache.remove(dir);
-        }
-
         let redirect = self.read_redirect_meta(dir, ctx).await?;
         let sync_log = self.read_sync_log_meta(dir, ctx).await?;
-        self.meta_cache.lock().await.insert(
-            dir.to_string(),
-            DirMetaCacheEntry {
-                redirect: redirect.clone(),
-                sync_log: sync_log.clone(),
-                cached_at: now,
-                last_accessed_at: now,
-            },
-        );
-        self.prune_meta_cache().await;
         Ok((redirect, sync_log))
-    }
-
-    /// Update cached metadata for a directory.
-    async fn update_meta_cache(&self, dir: &str, redirect: RedirectMeta, sync_log: SyncLogMeta) {
-        let now = Instant::now();
-        self.meta_cache.lock().await.insert(
-            dir.to_string(),
-            DirMetaCacheEntry {
-                redirect,
-                sync_log,
-                cached_at: now,
-                last_accessed_at: now,
-            },
-        );
-        self.prune_meta_cache().await;
-    }
-
-    /// Invalidate one directory metadata cache entry.
-    pub async fn invalidate_dir_cache(&self, dir: &str) {
-        self.meta_cache.lock().await.remove(dir);
-    }
-
-    /// Remove expired cache entries and trim the cache to capacity.
-    async fn prune_meta_cache(&self) {
-        let now = Instant::now();
-        let mut cache = self.meta_cache.lock().await;
-        cache.retain(|_, entry| now.duration_since(entry.cached_at) <= self.meta_cache_ttl);
-        while cache.len() > self.meta_cache_capacity {
-            let oldest_key = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest_key) = oldest_key {
-                cache.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
     }
 
     /// Write one JSON metadata file to a directory.
@@ -427,9 +298,6 @@ impl MetaStateStore {
         if sync_log_meta != original_sync_log {
             self.write_sync_log_meta(dir, &sync_log_meta, ctx).await?;
         }
-        self.update_meta_cache(dir, redirect_meta, sync_log_meta)
-            .await;
-
         Ok(())
     }
 
@@ -495,11 +363,6 @@ impl MetaStateStore {
             self.write_sync_log_meta(target_dir, &tgt_sync_log, ctx)
                 .await?;
         }
-        self.update_meta_cache(source_dir, src_redirect, src_sync_log)
-            .await;
-        self.update_meta_cache(target_dir, tgt_redirect, tgt_sync_log)
-            .await;
-
         Ok(())
     }
 
@@ -589,22 +452,18 @@ impl MetaStateStore {
 /// on backup backends, preventing out-of-order application.
 pub struct PathSerializer {
     queues: Mutex<HashMap<String, Arc<TrackedLock>>>,
-    capacity: usize,
-    ttl: Duration,
 }
 
 impl PathSerializer {
     /// Create a new PathSerializer.
     pub fn new() -> Self {
-        Self::with_limits(DEFAULT_PATH_QUEUE_CAPACITY, DEFAULT_PATH_QUEUE_TTL)
+        Self::with_limits(0, Duration::ZERO)
     }
 
-    /// Create a new PathSerializer with explicit queue limits.
-    pub fn with_limits(capacity: usize, ttl: Duration) -> Self {
+    /// Create a PathSerializer; limit arguments are ignored for compatibility.
+    pub fn with_limits(_capacity: usize, _ttl: Duration) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
-            capacity: capacity.max(1),
-            ttl,
         }
     }
 
@@ -617,9 +476,8 @@ impl PathSerializer {
         let mut queues = self.queues.lock().await;
         let lock = queues
             .entry(path.to_string())
-            .or_insert_with(|| Arc::new(TrackedLock::new()))
+            .or_insert_with(|| Arc::new(TrackedLock::new(())))
             .clone();
-        MetaStateStore::prune_tracked_locks(&mut queues, self.capacity, self.ttl);
         drop(queues);
 
         let _guard = lock.lock().await;
@@ -630,13 +488,6 @@ impl PathSerializer {
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.queues.lock().await.len()
-    }
-
-    /// Prune stale idle queue entries.
-    #[cfg(test)]
-    pub async fn prune_stale(&self) {
-        let mut queues = self.queues.lock().await;
-        MetaStateStore::prune_tracked_locks(&mut queues, self.capacity, self.ttl);
     }
 }
 
@@ -704,6 +555,16 @@ mod tests {
         assert!(resolver.resolve("/invalid/path").is_err());
     }
 
+    #[test]
+    fn test_mount_root_resolver_extracts_account_from_non_local_path() {
+        let resolver = MountRootFsContextResolver::new("/s3");
+        let ctx = resolver.resolve("/s3/acct-1/resources/file.txt").unwrap();
+        assert_eq!(ctx.account_id(), "acct-1");
+        assert!(resolver
+            .resolve("/local/acct-1/resources/file.txt")
+            .is_err());
+    }
+
     #[tokio::test]
     async fn test_invalid_sync_log_json_returns_error() {
         let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
@@ -745,14 +606,5 @@ mod tests {
             !dir_locks.contains_key(GLOBAL_STATE_FILE),
             "global sequence locking should not occupy the directory lock pool"
         );
-    }
-
-    #[tokio::test]
-    async fn test_path_serializer_prunes_stale_entries() {
-        let serializer = PathSerializer::with_limits(1, Duration::from_millis(1));
-        serializer.with_path_lock("/hot/path", || async {}).await;
-        std::thread::sleep(Duration::from_millis(5));
-        serializer.prune_stale().await;
-        assert_eq!(serializer.len().await, 0);
     }
 }

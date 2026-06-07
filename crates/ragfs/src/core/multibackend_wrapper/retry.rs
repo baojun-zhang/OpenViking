@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tracing::warn;
@@ -23,40 +23,49 @@ impl Inner {
 
     /// Recompute whether one directory still has pending retry work.
     pub(super) async fn refresh_pending_dir(&self, dir: &str, ctx: &FsContext) -> Result<()> {
-        let sync_log = self.meta_store.get_sync_log_meta(dir, ctx).await?;
-        if sync_log.entries.is_empty() {
-            self.clear_pending_dir(dir).await;
-            return Ok(());
-        }
-
-        let redirect_meta = self.meta_store.get_redirect_meta(dir, ctx).await?;
-        let mut has_pending = false;
-        for (file_name, sync_entry) in &sync_log.entries {
-            if !sync_entry.is_primary_committed() {
-                continue;
-            }
-            let file_path = if dir == "/" {
-                format!("/{}", file_name)
-            } else {
-                format!("{}/{}", dir, file_name)
-            };
-            let targets =
-                self.target_backend_names(&redirect_meta, file_name, &file_path, sync_entry);
-            if targets
-                .iter()
-                .any(|target| !sync_entry.is_in_sync(target) && !sync_entry.is_quarantined(target))
-            {
-                has_pending = true;
-                break;
-            }
-        }
-
-        if has_pending {
+        if self.sync_work_in_dir(dir, ctx).await?.iter().any(|work| {
+            work.entry.is_primary_committed()
+                && work.targets.iter().any(|target| {
+                    !work.entry.is_in_sync(target) && !work.entry.is_quarantined(target)
+                })
+        }) {
             self.mark_pending_dir(dir).await;
         } else {
             self.clear_pending_dir(dir).await;
         }
         Ok(())
+    }
+
+    /// Collect sync work entries for one metadata directory.
+    pub(crate) async fn sync_work_in_dir(
+        &self,
+        dir: &str,
+        ctx: &FsContext,
+    ) -> Result<Vec<SyncWorkEntry>> {
+        let sync_log = self.meta_store.get_sync_log_meta(dir, ctx).await?;
+        if sync_log.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let redirect_meta = self.meta_store.get_redirect_meta(dir, ctx).await?;
+        Ok(sync_log
+            .entries
+            .into_iter()
+            .map(|(file_name, entry)| {
+                let file_path = if dir == "/" {
+                    format!("/{}", file_name)
+                } else {
+                    format!("{}/{}", dir, file_name)
+                };
+                let targets =
+                    self.target_backend_names(&redirect_meta, &file_name, &file_path, &entry);
+                SyncWorkEntry {
+                    file_path,
+                    entry,
+                    targets,
+                }
+            })
+            .collect())
     }
 
     /// Record a started background task.
@@ -194,25 +203,15 @@ impl Inner {
 
     /// Retry all pending backup work for one directory and keep metadata errors visible.
     pub(crate) async fn retry_pending_dir(&self, dir: &str) -> Result<()> {
-        self.meta_store.invalidate_dir_cache(dir).await;
         let ctx = self.meta_store.ctx_resolver().resolve(dir)?;
-        let sync_log = self.meta_store.get_sync_log_meta(dir, &ctx).await?;
-        let redirect_meta = self.meta_store.get_redirect_meta(dir, &ctx).await?;
 
-        for (file_name, sync_entry) in &sync_log.entries {
-            if !sync_entry.is_primary_committed() {
+        for work in self.sync_work_in_dir(dir, &ctx).await? {
+            if !work.entry.is_primary_committed() {
                 continue;
             }
-            let file_path = if dir == "/" {
-                format!("/{}", file_name)
-            } else {
-                format!("{}/{}", dir, file_name)
-            };
-            let target_backend_names =
-                self.target_backend_names(&redirect_meta, file_name, &file_path, sync_entry);
 
-            for backup_name in &target_backend_names {
-                if sync_entry.is_in_sync(backup_name) || sync_entry.is_quarantined(backup_name) {
+            for backup_name in &work.targets {
+                if work.entry.is_in_sync(backup_name) || work.entry.is_quarantined(backup_name) {
                     continue;
                 }
 
@@ -222,7 +221,7 @@ impl Inner {
                         return Ok(());
                     }
                     if self
-                        .replay_operation(&file_path, backup_name, &ctx)
+                        .replay_operation(&work.file_path, backup_name, &ctx)
                         .await
                         .is_ok()
                     {
@@ -235,7 +234,7 @@ impl Inner {
                 }
 
                 if !success {
-                    self.record_backup_retry_failure(&file_path, backup_name, &ctx)
+                    self.record_backup_retry_failure(&work.file_path, backup_name, &ctx)
                         .await?;
                 }
             }

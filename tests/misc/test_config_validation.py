@@ -297,37 +297,6 @@ def test_generate_plugin_config_passes_multiwrite_encryption_flag(tmp_path):
     assert mount_config["primary_encryption_enabled"] is True
 
 
-@pytest.mark.parametrize(
-    ("backups", "match"),
-    [
-        ({"items": [{"name": "primary", "backend": "memory"}]}, "primary"),
-        (
-            {
-                "items": [
-                    {
-                        "name": "backup1",
-                        "backend": "memory",
-                        "backups": {"items": [{"name": "nested", "backend": "memory"}]},
-                    }
-                ]
-            },
-            "extra|backups",
-        ),
-        (
-            {
-                "sync_type": "sync",
-                "items": [{"name": "backup1", "backend": "memory"}],
-            },
-            "write_ack_count",
-        ),
-    ],
-)
-def test_agfs_multiwrite_validation_rejects_invalid_shapes(tmp_path, backups, match):
-    """Python-side thin validation should still reject the few invalid shapes we keep guarding early."""
-    with pytest.raises(ValueError, match=match):
-        AGFSConfig(path=str(tmp_path), backend="local", backups=backups)
-
-
 def test_generate_plugin_config_materializes_multiwrite_backups(tmp_path):
     """Plugin config generation should normalize backup params while preserving top-level multi-write fields."""
     explicit_backup_dir = tmp_path / "backup-local-no-mkdir"
@@ -337,7 +306,6 @@ def test_generate_plugin_config_materializes_multiwrite_backups(tmp_path):
         backups={
             "retry_interval_ms": 1234,
             "retry_backoff_base_ms": 55,
-            "read_probe_cache_ttl_ms": 88,
             "items": [
                 {
                     "name": "local-explicit",
@@ -372,7 +340,6 @@ def test_generate_plugin_config_materializes_multiwrite_backups(tmp_path):
     mount_backups = plugins["localfs"]["config"]["backups"]
     assert mount_backups["retry_interval_ms"] == 1234
     assert mount_backups["retry_backoff_base_ms"] == 55
-    assert mount_backups["read_probe_cache_ttl_ms"] == 88
 
     explicit_local, default_local, s3_backup = mount_backups["items"]
     assert explicit_local["backend"] == "localfs"

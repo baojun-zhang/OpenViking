@@ -223,31 +223,24 @@ async fn test_redirect_write_marks_first_target_acked_before_returning() {
 async fn test_redirect_write_does_not_publish_metadata_when_first_target_fails() {
     let fs = test_multiwrite_fs(vec![RedirectPolicy::FileExtensionPolicy {
         extensions: vec!["\\.pdf$".to_string()],
-        target: Some(vec!["backup1".to_string()]),
+        target: Some(vec!["missing-backup".to_string()]),
     }]);
     let ctx = test_ctx();
 
     FS_CTX
         .scope(ctx.clone(), async {
-            let err = Inner::execute_write(
-                &fs.inner,
-                WriteOp {
-                    path: "/local/acct/docs/fail.pdf".to_string(),
-                    size: 7,
-                    primary_fn: |_fs: Arc<dyn FileSystem>| async move { Ok::<u64, Error>(7) },
-                    backup_fn: boxed_write_op(|_backup| async {
-                        Err(Error::not_found("/local/acct/docs/fail.pdf"))
-                    }),
-                    sync_op: Some(SyncOp::SyncFile { size: 7 }),
-                    redirect_eligible: true,
-                    redirect_result: Some(7u64),
-                },
-            )
-            .await
-            .expect_err("redirect write should fail when the first target is not durable");
+            let err = fs
+                .write(
+                    "/local/acct/docs/fail.pdf",
+                    b"content",
+                    0,
+                    WriteFlag::Create,
+                )
+                .await
+                .expect_err("redirect write should fail when the first target is not durable");
 
             assert!(
-                err.to_string().contains("not found"),
+                err.to_string().contains("resolved no writable targets"),
                 "unexpected error: {err}"
             );
 
@@ -527,7 +520,7 @@ async fn test_fanout_sync_returns_structured_quorum_error() {
         "/local/acct/docs/fail.txt",
         &targets,
         &ctx,
-        boxed_write_op(|_backup| async { Err(Error::not_found("/backup/fail.txt")) }),
+        BackupWriteOp::Replay(SyncOp::SyncFile { size: 1 }),
     )
     .await
     .expect_err("sync fanout should surface structured quorum failure");
@@ -545,14 +538,70 @@ async fn test_fanout_sync_returns_structured_quorum_error() {
             assert_eq!(failures.len(), 1);
             assert_eq!(failures[0].backend, "backup1");
             assert_eq!(failures[0].kind, "not_found");
-            assert_eq!(failures[0].message, "not found: /backup/fail.txt");
+            assert_eq!(failures[0].message, "not found: /local/acct/docs/fail.txt");
         }
         other => panic!("unexpected error: {other}"),
     }
 }
 
 #[tokio::test]
-async fn test_read_route_metrics_capture_backup_and_cache_hits() {
+async fn test_sync_write_errors_when_required_ack_has_no_targets() {
+    let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let fs = MultiWriteWrappedFS::builder(primary.clone())
+        .with_primary_raw_backend(primary)
+        .with_backups(vec![BackendEntry {
+            name: "backup1".to_string(),
+            role: BackendRole::Backup,
+            backend: backup,
+            raw_backend: None,
+            operations: Vec::new(),
+            excludes: vec![RedirectPolicy::FileExtensionPolicy {
+                extensions: vec!["\\.txt$".to_string()],
+                target: None,
+            }],
+        }])
+        .sync_mode(SyncMode::Sync {
+            ack_count: 1,
+            timeout_ms: 0,
+        })
+        .build()
+        .unwrap();
+    let ctx = test_ctx();
+
+    let err = FS_CTX
+        .scope(ctx, async {
+            fs.ensure_parent_dirs("/local/acct/docs/no-target.txt", 0o755)
+                .await?;
+            fs.write(
+                "/local/acct/docs/no-target.txt",
+                b"payload",
+                0,
+                WriteFlag::Create,
+            )
+            .await
+        })
+        .await
+        .expect_err("sync mode must not silently pass when all backups are excluded");
+
+    match err {
+        Error::SyncWriteQuorum {
+            succeeded,
+            required,
+            attempted,
+            failures,
+        } => {
+            assert_eq!(succeeded, 0);
+            assert_eq!(required, 1);
+            assert_eq!(attempted, 0);
+            assert!(failures.is_empty());
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn test_read_route_metrics_capture_backup_fallbacks() {
     let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup_handle = backup.clone();
@@ -585,8 +634,8 @@ async fn test_read_route_metrics_capture_backup_and_cache_hits() {
             assert_eq!(fs.read("/local/acct/hot/cache.txt", 0, 0).await?, b"hot");
 
             let metrics = fs.inner.read_route_metrics();
-            assert_eq!(metrics.get("backup_hits").and_then(Value::as_u64), Some(1));
-            assert_eq!(metrics.get("cache_hits").and_then(Value::as_u64), Some(1));
+            assert_eq!(metrics.get("backup_hits").and_then(Value::as_u64), Some(2));
+            assert_eq!(metrics.get("cache_hits").and_then(Value::as_u64), Some(0));
             Ok::<(), Error>(())
         })
         .await
@@ -649,6 +698,15 @@ async fn test_retry_pending_dir_reports_corrupt_redirect_meta() {
             fs.write("/local/acct/docs/a.txt", b"hello", 0, WriteFlag::Create)
                 .await?;
             fs.inner
+                .meta_store
+                .update_dir_meta("/local/acct/docs", &ctx, |_redirect, sync_log| {
+                    sync_log
+                        .entries
+                        .insert("a.txt".to_string(), SyncLogEntry::new(1, SyncOp::Create));
+                    Ok(())
+                })
+                .await?;
+            fs.inner
                 .primary()
                 .backend
                 .write(
@@ -657,15 +715,6 @@ async fn test_retry_pending_dir_reports_corrupt_redirect_meta() {
                     0,
                     WriteFlag::Create,
                 )
-                .await?;
-            fs.inner
-                .meta_store
-                .update_dir_meta("/local/acct/docs", &ctx, |_redirect, sync_log| {
-                    sync_log
-                        .entries
-                        .insert("a.txt".to_string(), SyncLogEntry::new(1, SyncOp::Create));
-                    Ok(())
-                })
                 .await?;
 
             let err = fs

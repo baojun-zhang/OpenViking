@@ -147,27 +147,6 @@ class QueueFSConfig(BaseModel):
         return self
 
 
-def _expect_dict(value: Any, field_name: str) -> dict[str, Any]:
-    """Return one config object as a dict or raise a targeted shape error."""
-    if not isinstance(value, dict):
-        raise ValueError(f"{field_name} must be an object")
-    return value
-
-
-def _expect_list(value: Any, field_name: str) -> list[Any]:
-    """Return one config value as a list or raise a targeted shape error."""
-    if not isinstance(value, list):
-        raise ValueError(f"{field_name} must be a list")
-    return value
-
-
-def _expect_non_empty_str(value: Any, field_name: str) -> str:
-    """Return one config value as a non-empty string."""
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field_name} must be a non-empty string")
-    return value
-
-
 class AGFSConfig(BaseModel):
     """Configuration for RAGFS (Rust-based AGFS)."""
 
@@ -311,54 +290,5 @@ class AGFSConfig(BaseModel):
             raise ValueError(
                 "redirects requires backups; single-backend mode does not support redirects"
             )
-
-        if self.backups is not None:
-            backups = _expect_dict(self.backups, "backups")
-            items = _expect_list(backups.get("items"), "backups.items")
-            sync_type = backups.get("sync_type", "async")
-            if sync_type not in {"sync", "async"}:
-                raise ValueError("backups.sync_type must be one of: 'sync', 'async'")
-            if sync_type == "sync" and backups.get("write_ack_count") is None:
-                raise ValueError("backups.write_ack_count is required when sync_type is 'sync'")
-
-            names_seen: set[str] = {self.name}
-            backup_names: set[str] = set()
-            for index, item in enumerate(items):
-                item_dict = _expect_dict(item, f"backups.items[{index}]")
-                item_name = _expect_non_empty_str(
-                    item_dict.get("name"), f"backups.items[{index}].name"
-                )
-                backend_type = _expect_non_empty_str(
-                    item_dict.get("backend"), f"backups.items[{index}].backend"
-                )
-
-                if "backups" in item_dict:
-                    raise ValueError("extra field 'backups' is not allowed in backup items")
-                if item_name == "primary":
-                    raise ValueError("backup backend name 'primary' is reserved")
-                if item_name in names_seen:
-                    raise ValueError(
-                        f"Duplicate backend name '{item_name}': all backend names "
-                        f"(primary + backups) must be globally unique"
-                    )
-
-                names_seen.add(item_name)
-                backup_names.add(item_name)
-
-                if backend_type == "s3" and "s3" in item_dict and item_dict["s3"] is not None:
-                    S3Config.model_validate(item_dict["s3"]).validate_config()
-
-            if self.redirects is not None:
-                for index, policy in enumerate(self.redirects):
-                    policy_dict = _expect_dict(policy, f"redirects[{index}]")
-                    targets = policy_dict.get("target")
-                    if not targets:
-                        raise ValueError("Redirect target must not be empty")
-                    for target_name in _expect_list(targets, f"redirects[{index}].target"):
-                        if target_name not in backup_names:
-                            raise ValueError(
-                                f"Redirect target '{target_name}' not found in backups. "
-                                f"Available backups: {sorted(backup_names)}"
-                            )
 
         return self

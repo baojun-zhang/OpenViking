@@ -5,16 +5,12 @@ use serde_json::{json, Value};
 
 use crate::core::errors::Result;
 use crate::core::filesystem::{normalize_prefix_path, FileSystem};
-use crate::core::multibackend_wrapper::MultiWriteWrappedFS;
-use crate::core::SyncLogEntry;
+use crate::core::multibackend_wrapper::{MultiWriteWrappedFS, SyncWorkEntry};
 use crate::multibackend::meta::{current_required_ctx, parent_dir};
 
 impl MultiWriteWrappedFS {
     /// Collect effective sync work entries under a path using the current request context.
-    async fn collect_sync_work(
-        &self,
-        path: &str,
-    ) -> Result<Vec<(String, SyncLogEntry, Vec<String>)>> {
+    async fn collect_sync_work(&self, path: &str) -> Result<Vec<SyncWorkEntry>> {
         let ctx = current_required_ctx()?;
         let inner = &self.inner;
         let normalized = normalize_prefix_path(path);
@@ -65,26 +61,13 @@ impl MultiWriteWrappedFS {
 
         let mut work = Vec::new();
         for dir in dirs {
-            inner.meta_store.invalidate_dir_cache(&dir).await;
-            let sync_log = inner.meta_store.get_sync_log_meta(&dir, &ctx).await?;
-            if sync_log.entries.is_empty() {
-                continue;
-            }
-            let redirect_meta = inner.meta_store.get_redirect_meta(&dir, &ctx).await?;
-
-            for (name, sync_entry) in sync_log.entries {
-                let file_path = if dir == "/" {
-                    format!("/{}", name)
-                } else {
-                    format!("{}/{}", dir, name)
-                };
-                if !path_info.is_dir && file_path != normalized {
-                    continue;
-                }
-                let target_backend_names =
-                    inner.target_backend_names(&redirect_meta, &name, &file_path, &sync_entry);
-                work.push((file_path, sync_entry, target_backend_names));
-            }
+            work.extend(
+                inner
+                    .sync_work_in_dir(&dir, &ctx)
+                    .await?
+                    .into_iter()
+                    .filter(|work| path_info.is_dir || work.file_path == normalized),
+            );
         }
 
         Ok(work)
@@ -96,23 +79,23 @@ impl MultiWriteWrappedFS {
         let mut entries = Vec::new();
         let mut pending_target_count = 0usize;
 
-        for (file_path, sync_entry, target_backend_names) in work {
+        for work in work {
             let mut targets = Vec::new();
-            let primary_committed = sync_entry.is_primary_committed();
+            let primary_committed = work.entry.is_primary_committed();
             let mut all_synced = primary_committed;
 
-            for backend_name in target_backend_names {
+            for backend_name in work.targets {
                 let acked_seq = if primary_committed {
-                    sync_entry.acked_seq(&backend_name)
+                    work.entry.acked_seq(&backend_name)
                 } else {
                     0
                 };
-                let in_sync = primary_committed && sync_entry.is_in_sync(&backend_name);
+                let in_sync = primary_committed && work.entry.is_in_sync(&backend_name);
                 if primary_committed && !in_sync {
                     pending_target_count += 1;
                     all_synced = false;
                 }
-                let state = sync_entry.backend_state(&backend_name);
+                let state = work.entry.backend_state(&backend_name);
                 targets.push(json!({
                     "name": backend_name,
                     "acked_seq": acked_seq,
@@ -124,10 +107,10 @@ impl MultiWriteWrappedFS {
             }
 
             entries.push(json!({
-                "path": file_path,
-                "latest_seq": sync_entry.latest_seq,
+                "path": work.file_path,
+                "latest_seq": work.entry.latest_seq,
                 "primary_committed": primary_committed,
-                "op": serde_json::to_value(&sync_entry.op)?,
+                "op": serde_json::to_value(&work.entry.op)?,
                 "all_synced": all_synced,
                 "targets": targets,
             }));
@@ -160,15 +143,15 @@ impl MultiWriteWrappedFS {
         let mut failed = 0usize;
         let mut skipped = 0usize;
 
-        for (file_path, sync_entry, target_backend_names) in work {
-            if !sync_entry.is_primary_committed() {
-                skipped += target_backend_names.len();
-                for backend_name in target_backend_names {
+        for work in work {
+            if !work.entry.is_primary_committed() {
+                skipped += work.targets.len();
+                for backend_name in work.targets {
                     results.push(json!({
-                        "path": file_path,
+                        "path": work.file_path,
                         "target": backend_name,
                         "status": "awaiting_primary_commit",
-                        "latest_seq": sync_entry.latest_seq,
+                        "latest_seq": work.entry.latest_seq,
                         "primary_committed": false,
                         "acked_seq": 0,
                     }));
@@ -176,16 +159,16 @@ impl MultiWriteWrappedFS {
                 continue;
             }
 
-            for backend_name in target_backend_names {
-                let acked_seq = sync_entry.acked_seq(&backend_name);
-                let was_quarantined = sync_entry.is_quarantined(&backend_name);
-                if sync_entry.is_in_sync(&backend_name) {
+            for backend_name in work.targets {
+                let acked_seq = work.entry.acked_seq(&backend_name);
+                let was_quarantined = work.entry.is_quarantined(&backend_name);
+                if work.entry.is_in_sync(&backend_name) {
                     skipped += 1;
                     results.push(json!({
-                        "path": file_path,
+                        "path": work.file_path,
                         "target": backend_name,
                         "status": "skipped",
-                        "latest_seq": sync_entry.latest_seq,
+                        "latest_seq": work.entry.latest_seq,
                         "acked_seq": acked_seq,
                     }));
                     continue;
@@ -196,7 +179,7 @@ impl MultiWriteWrappedFS {
                 for _attempt in 0..self.inner.max_retry_per_round {
                     match self
                         .inner
-                        .replay_operation(&file_path, &backend_name, &ctx)
+                        .replay_operation(&work.file_path, &backend_name, &ctx)
                         .await
                     {
                         Ok(()) => {
@@ -216,22 +199,22 @@ impl MultiWriteWrappedFS {
                 if success {
                     retried += 1;
                     results.push(json!({
-                        "path": file_path,
+                        "path": work.file_path,
                         "target": backend_name,
                         "status": "retried",
-                        "latest_seq": sync_entry.latest_seq,
-                        "acked_seq": sync_entry.latest_seq,
+                        "latest_seq": work.entry.latest_seq,
+                        "acked_seq": work.entry.latest_seq,
                     }));
                 } else {
                     self.inner
-                        .record_backup_retry_failure(&file_path, &backend_name, &ctx)
+                        .record_backup_retry_failure(&work.file_path, &backend_name, &ctx)
                         .await?;
                     failed += 1;
                     results.push(json!({
-                        "path": file_path,
+                        "path": work.file_path,
                         "target": backend_name,
                         "status": "failed",
-                        "latest_seq": sync_entry.latest_seq,
+                        "latest_seq": work.entry.latest_seq,
                         "acked_seq": acked_seq,
                         "was_quarantined": was_quarantined,
                         "error": last_error.unwrap_or_else(|| "unknown replay error".to_string()),

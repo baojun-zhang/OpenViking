@@ -425,7 +425,9 @@ impl MountableFS {
             } else {
                 WriteFlag::None
             };
-            raw_backend.write(dst_rel_path, &chunk, offset, flag).await?;
+            raw_backend
+                .write(dst_rel_path, &chunk, offset, flag)
+                .await?;
             offset = offset.saturating_add(chunk.len() as u64);
             if chunk.is_empty() {
                 return Err(Error::internal(format!(

@@ -444,7 +444,8 @@ pub struct BackendsConfig {
     pub retry_max_retries_per_round: Option<usize>,
     /// Failure threshold before quarantining one file/target pair
     pub retry_quarantine_after_failures: Option<u32>,
-    /// TTL for read-route probe cache in milliseconds
+    /// Deprecated no-op retained for config compatibility.
+    #[serde(default)]
     pub read_probe_cache_ttl_ms: Option<u64>,
     /// Backup items
     pub items: Vec<BackendItemConfig>,

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -7,57 +6,12 @@ use super::*;
 use crate::multibackend::meta::{current_required_ctx, file_name, parent_dir};
 
 impl Inner {
-    /// Invalidate one cached read-route entry after a write-side state change.
-    pub(super) async fn invalidate_read_route(&self, path: &str) {
-        self.read_route_cache.lock().await.remove(path);
-    }
-
-    /// Cache a resolved read route for a short TTL window.
-    async fn cache_read_route(&self, path: &str, backend_name: Option<String>) {
-        let now = Instant::now();
-        let mut cache = self.read_route_cache.lock().await;
-        cache.insert(
-            path.to_string(),
-            ReadRouteCacheEntry {
-                backend_name,
-                cached_at: now,
-            },
-        );
-        cache.retain(|_, entry| now.duration_since(entry.cached_at) <= self.read_route_cache_ttl);
-        while cache.len() > self.read_route_cache_capacity {
-            let oldest_key = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.cached_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest_key) = oldest_key {
-                cache.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Read and validate a cached route if it is still fresh.
-    async fn cached_read_route(&self, path: &str) -> Option<Option<Arc<dyn FileSystem>>> {
-        let entry = self.read_route_cache.lock().await.get(path).cloned()?;
-        if entry.cached_at.elapsed() > self.read_route_cache_ttl {
-            self.read_route_cache.lock().await.remove(path);
-            return None;
-        }
-
-        match entry.backend_name {
-            Some(name) if name == self.primary().name => Some(Some(self.primary().backend.clone())),
-            Some(name) => Some(self.backup_by_name(&name).map(|be| be.backend.clone())),
-            None => Some(None),
-        }
-    }
+    /// Keep write-side call sites explicit even though read routing is uncached.
+    pub(super) async fn invalidate_read_route(&self, _path: &str) {}
 
     /// Record read-route counters in one place so hot paths stay explicit.
     fn record_read_route(&self, source: ReadRouteSource) {
         match source {
-            ReadRouteSource::Cache => {
-                self.read_cache_hits.fetch_add(1, Ordering::Relaxed);
-            }
             ReadRouteSource::Backup => {
                 self.read_backup_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -76,7 +30,7 @@ impl Inner {
     /// Export read-route metrics for operational introspection.
     pub(crate) fn read_route_metrics(&self) -> Value {
         json!({
-            "cache_hits": self.read_cache_hits.load(Ordering::Relaxed),
+            "cache_hits": 0,
             "backup_hits": self.read_backup_hits.load(Ordering::Relaxed),
             "primary_hits": self.read_primary_hits.load(Ordering::Relaxed),
             "redirect_hits": self.read_redirect_hits.load(Ordering::Relaxed),
@@ -105,11 +59,6 @@ impl Inner {
     /// Resolve the read backend for a path using the fallback chain.
     pub(super) async fn resolve_read_backend(&self, path: &str) -> Option<Arc<dyn FileSystem>> {
         let normalized = normalize_prefix_path(path);
-        if let Some(cached) = self.cached_read_route(&normalized).await {
-            self.record_read_route(ReadRouteSource::Cache);
-            return cached;
-        }
-
         let read_backups = self.read_backups_sorted();
         let backup_exists = futures::future::join_all(read_backups.iter().map(|backup| async {
             (
@@ -119,17 +68,14 @@ impl Inner {
             )
         }))
         .await;
-        for (name, backend, exists) in backup_exists {
+        for (_name, backend, exists) in backup_exists {
             if exists {
-                self.cache_read_route(&normalized, Some(name)).await;
                 self.record_read_route(ReadRouteSource::Backup);
                 return Some(backend);
             }
         }
 
         if self.primary().backend.exists(&normalized).await {
-            self.cache_read_route(&normalized, Some(self.primary().name.clone()))
-                .await;
             self.record_read_route(ReadRouteSource::Primary);
             return Some(self.primary().backend.clone());
         }
@@ -159,9 +105,8 @@ impl Inner {
                     },
                 ))
                 .await;
-                for (target_name, backend, exists) in redirect_exists {
+                for (_target_name, backend, exists) in redirect_exists {
                     if exists {
-                        self.cache_read_route(&normalized, Some(target_name)).await;
                         self.record_read_route(ReadRouteSource::Redirect);
                         return Some(backend);
                     }
@@ -169,7 +114,6 @@ impl Inner {
             }
         }
 
-        self.cache_read_route(&normalized, None).await;
         self.record_read_route(ReadRouteSource::Miss);
         None
     }

@@ -16,6 +16,7 @@ use crate::multibackend::config::{
     item_params_to_config_values, sync_mode_from_config, validate_backup_excludes,
     validate_primary_encryption_flags, validate_redirect_targets,
 };
+use crate::multibackend::meta::MountRootFsContextResolver;
 use crate::multibackend::types::MultiBackendBuildContext;
 use crate::shape::validate::ensure_backend_shape;
 
@@ -153,8 +154,8 @@ pub async fn build_multi_write_fs(
         .retry_backoff_base_ms(bc.retry_backoff_base_ms.unwrap_or(1_000))
         .max_retry_per_round(bc.retry_max_retries_per_round.unwrap_or(3))
         .quarantine_after_failures(bc.retry_quarantine_after_failures.unwrap_or(9))
-        .read_route_cache_ttl(Duration::from_millis(
-            bc.read_probe_cache_ttl_ms.unwrap_or(2_000),
-        ))
+        .ctx_resolver(Arc::new(MountRootFsContextResolver::new(
+            &config.mount_path,
+        )))
         .build()
 }
