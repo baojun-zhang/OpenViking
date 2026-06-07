@@ -613,6 +613,30 @@ class VikingFS:
             await self._async_agfs.rm(old_path, recursive=is_dir)
             return {}
 
+    async def system_sync_status(
+        self, uri: str, ctx: Optional[RequestContext] = None
+    ) -> Dict[str, Any]:
+        """Return multi-write sync status for one Viking URI subtree."""
+        self._ensure_access(uri, ctx)
+        real_ctx = self._ctx_or_default(ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
+        return await self._async_agfs.system_sync_status(
+            path,
+            fs_ctx={"account_id": real_ctx.account_id},
+        )
+
+    async def system_sync_retry(
+        self, uri: str, ctx: Optional[RequestContext] = None
+    ) -> Dict[str, Any]:
+        """Retry multi-write sync for one Viking URI subtree."""
+        self._ensure_mutable_access(uri, ctx)
+        real_ctx = self._ctx_or_default(ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
+        return await self._async_agfs.system_sync_retry(
+            path,
+            fs_ctx={"account_id": real_ctx.account_id},
+        )
+
     async def _copy_for_mv(
         self,
         old_uri: str,

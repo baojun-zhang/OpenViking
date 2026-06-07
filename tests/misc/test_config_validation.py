@@ -258,11 +258,61 @@ def test_generate_plugin_config_serializes_local_backup_dir(tmp_path):
     )
 
     plugins = _generate_plugin_config(config, tmp_path)
-
     backup = plugins["localfs"]["config"]["backups"]["items"][0]
     assert backup["backend"] == "localfs"
     assert backup["params"]["local_dir"] == str(backup_dir)
     assert not backup_dir.exists()
+
+
+def test_agfs_redirects_require_backups():
+    """Single-backend mode must reject redirect policies during config validation."""
+    with pytest.raises(ValueError, match="redirects requires backups"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            redirects=[
+                {
+                    "type": "FileExtensionPolicy",
+                    "extensions": ["(md)"],
+                    "target": ["s3-backup"],
+                }
+            ],
+        )
+
+
+def test_generate_plugin_config_rejects_redirects_without_backups(tmp_path):
+    """Runtime plugin config generation must also reject redirect-only configs."""
+    config = type(
+        "RedirectOnlyConfig",
+        (),
+        {
+            "backend": "local",
+            "s3": None,
+            "backups": None,
+            "redirects": [
+                type(
+                    "RedirectPolicy",
+                    (),
+                    {"type": "FileExtensionPolicy", "extensions": ["(md)"], "target": ["s3-backup"]},
+                )()
+            ],
+            "queuefs": type(
+                "QueueConfig",
+                (),
+                {
+                    "mode": "shared",
+                    "backend": "sqlite",
+                    "db_path": None,
+                    "recover_stale_sec": 0,
+                    "busy_timeout_ms": 5000,
+                },
+            )(),
+            "queue_db_path": None,
+        },
+    )()
+
+    with pytest.raises(ValueError, match="redirects requires backups"):
+        _generate_plugin_config(config, tmp_path)
 
 
 def test_backup_item_rejects_reserved_primary_name(tmp_path):

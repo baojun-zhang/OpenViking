@@ -35,7 +35,7 @@ struct MountInfo {
     fs: Arc<dyn FileSystem>,
 
     /// The raw plugin backend before encryption wrapping (for read_raw/write_raw).
-    /// None when encryption is disabled or for multi-write mounts.
+    /// None for multi-write mounts.
     raw_fs: Option<Arc<dyn FileSystem>>,
 
     /// The statistics collector for this mount
@@ -44,6 +44,8 @@ struct MountInfo {
     /// The plugin that created this filesystem
     plugin_name: String,
 }
+
+const DEFAULT_RAW_COPY_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// MountableFS routes filesystem operations to mounted plugins
 ///
@@ -65,6 +67,25 @@ pub struct MountableFS {
 }
 
 impl MountableFS {
+    /// Return the raw backend for one mounted path when raw access is supported.
+    fn raw_backend_for_mount<'a>(
+        mount_info: &'a MountInfo,
+        op_name: &str,
+    ) -> Result<&'a Arc<dyn FileSystem>> {
+        if Self::as_multiwrite(&mount_info.fs).is_some() {
+            return Err(Error::invalid_operation(format!(
+                "{} is not supported for multi-write mounts",
+                op_name
+            )));
+        }
+        mount_info.raw_fs.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "raw backend is unavailable for mount '{}'",
+                mount_info.path
+            ))
+        })
+    }
+
     /// Try to unwrap a mounted filesystem stack to the underlying multi-write wrapper.
     fn as_multiwrite(fs: &Arc<dyn FileSystem>) -> Option<&MultiWriteWrappedFS> {
         let any = fs.as_ref() as &dyn std::any::Any;
@@ -335,10 +356,8 @@ impl MountableFS {
     /// Used by tests to verify ciphertext on disk and by cp/persist for verbatim blob copies.
     pub async fn read_raw(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
         let (mount_info, rel_path) = self.find_mount(path).await?;
-        match &mount_info.raw_fs {
-            Some(raw) => raw.read(&rel_path, offset, size).await,
-            None => mount_info.fs.read(&rel_path, offset, size).await,
-        }
+        let raw = Self::raw_backend_for_mount(&mount_info, "read_raw")?;
+        raw.read(&rel_path, offset, size).await
     }
 
     /// Write raw bytes to the underlying plugin backend, bypassing the encryption layer.
@@ -346,10 +365,77 @@ impl MountableFS {
     /// Counterpart to `read_raw` for cp/persist verbatim blob copies.
     pub async fn write_raw(&self, path: &str, data: &[u8], flags: WriteFlag) -> Result<u64> {
         let (mount_info, rel_path) = self.find_mount(path).await?;
-        match &mount_info.raw_fs {
-            Some(raw) => raw.write(&rel_path, data, 0, flags).await,
-            None => mount_info.fs.write(&rel_path, data, 0, flags).await,
+        let raw = Self::raw_backend_for_mount(&mount_info, "write_raw")?;
+        raw.write(&rel_path, data, 0, flags).await
+    }
+
+    /// Copy one file within the same mounted filesystem while preserving raw bytes when possible.
+    pub async fn copy_within_mount(&self, src_path: &str, dst_path: &str) -> Result<bool> {
+        let (src_mount, src_rel_path) = self.find_mount(src_path).await?;
+        let (dst_mount, dst_rel_path) = self.find_mount(dst_path).await?;
+
+        if src_mount.path != dst_mount.path {
+            return Ok(false);
         }
+
+        if normalize_path(&src_rel_path) == normalize_path(&dst_rel_path) {
+            return Ok(true);
+        }
+
+        if let Some(multiwrite) = Self::as_multiwrite(&src_mount.fs) {
+            return multiwrite
+                .copy_within_primary(&src_rel_path, &dst_rel_path)
+                .await;
+        }
+
+        let Some(raw_backend) = src_mount.raw_fs.clone() else {
+            return Ok(false);
+        };
+
+        Self::copy_raw_within_mount(raw_backend, &src_rel_path, &dst_rel_path).await?;
+        Ok(true)
+    }
+
+    /// Copy one file within one raw backend in bounded-size chunks.
+    async fn copy_raw_within_mount(
+        raw_backend: Arc<dyn FileSystem>,
+        src_rel_path: &str,
+        dst_rel_path: &str,
+    ) -> Result<()> {
+        let source_info = raw_backend.stat(src_rel_path).await?;
+        if source_info.is_dir {
+            return Err(Error::IsADirectory(src_rel_path.to_string()));
+        }
+
+        raw_backend.ensure_parent_dirs(dst_rel_path, 0o755).await?;
+
+        if source_info.size == 0 {
+            raw_backend
+                .write(dst_rel_path, &[], 0, WriteFlag::Create)
+                .await?;
+            return Ok(());
+        }
+
+        let mut offset = 0u64;
+        while offset < source_info.size {
+            let chunk_len = (source_info.size - offset).min(DEFAULT_RAW_COPY_CHUNK_SIZE as u64);
+            let chunk = raw_backend.read(src_rel_path, offset, chunk_len).await?;
+            let flag = if offset == 0 {
+                WriteFlag::Create
+            } else {
+                WriteFlag::None
+            };
+            raw_backend.write(dst_rel_path, &chunk, offset, flag).await?;
+            offset = offset.saturating_add(chunk.len() as u64);
+            if chunk.is_empty() {
+                return Err(Error::internal(format!(
+                    "raw backend returned empty chunk while copying '{}' -> '{}'",
+                    src_rel_path, dst_rel_path
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Find the mount point for a given path
@@ -587,15 +673,7 @@ mod tests {
 
     /// Helper to create a PluginConfig for tests with new fields defaulted.
     fn test_config(name: &str, mount_path: &str) -> PluginConfig {
-        PluginConfig {
-            name: name.to_string(),
-            mount_path: mount_path.to_string(),
-            params: HashMap::new(),
-            backups: None,
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
-        }
+        PluginConfig::single_backend(name, mount_path, HashMap::new())
     }
 
     /// Helper to create a simple multi-write PluginConfig for tests.
@@ -628,9 +706,7 @@ mod tests {
                     excludes: None,
                 }],
             }),
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
+            ..PluginConfig::default()
         }
     }
 
@@ -1110,8 +1186,7 @@ mod tests {
             params: HashMap::new(),
             backups: Some(backups.clone()),
             server_encryption_enabled: true,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
+            ..PluginConfig::default()
         };
 
         let result = mfs.build_multi_write_fs(&config, &backups).await;
@@ -1153,9 +1228,7 @@ mod tests {
             mount_path: "/local".to_string(),
             params: HashMap::new(),
             backups: Some(backups.clone()),
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
+            ..PluginConfig::default()
         };
 
         let result = mfs.build_multi_write_fs(&config, &backups).await;
@@ -1194,9 +1267,7 @@ mod tests {
             mount_path: "/local".to_string(),
             params: HashMap::new(),
             backups: Some(backups.clone()),
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
+            ..PluginConfig::default()
         };
 
         let result = mfs.build_multi_write_fs(&config, &backups).await;
@@ -1246,6 +1317,26 @@ mod tests {
                 .is_some(),
             "multi-write mount should place MultiWriteWrappedFS directly under stats"
         );
+    }
+
+    #[tokio::test]
+    async fn test_multiwrite_raw_access_is_rejected() {
+        let mfs = MountableFS::new();
+        mfs.register_plugin(MockPlugin::new("primary")).await;
+        mfs.register_plugin(MockPlugin::new("backupfs")).await;
+
+        mfs.mount(multiwrite_test_config("primary", "backupfs", "/local"))
+            .await
+            .unwrap();
+
+        let read_err = mfs.read_raw("/local/data.txt", 0, 0).await.unwrap_err();
+        assert!(matches!(read_err, Error::InvalidOperation(_)));
+
+        let write_err = mfs
+            .write_raw("/local/data.txt", b"raw", WriteFlag::Create)
+            .await
+            .unwrap_err();
+        assert!(matches!(write_err, Error::InvalidOperation(_)));
     }
 
     #[tokio::test]

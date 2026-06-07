@@ -225,7 +225,7 @@ impl ConfigParameter {
 }
 
 /// Plugin configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Plugin name
     pub name: String,
@@ -251,6 +251,37 @@ pub struct PluginConfig {
     /// Primary redirect policies
     #[serde(default)]
     pub primary_redirects: Vec<RedirectPolicy>,
+}
+
+impl Default for PluginConfig {
+    /// Build an empty plugin config with all optional multi-write fields disabled.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mount_path: String::new(),
+            params: HashMap::new(),
+            backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
+        }
+    }
+}
+
+impl PluginConfig {
+    /// Build one single-backend plugin config with defaulted optional fields.
+    pub fn single_backend(
+        name: impl Into<String>,
+        mount_path: impl Into<String>,
+        params: HashMap<String, ConfigValue>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            mount_path: mount_path.into(),
+            params,
+            ..Self::default()
+        }
+    }
 }
 
 /// Configuration value types
@@ -473,20 +504,48 @@ impl BackendSyncState {
 pub struct SyncLogEntry {
     /// Latest monotonic sequence number.
     pub latest_seq: u64,
+    /// Whether the primary backend has durably completed this operation.
+    #[serde(default = "default_primary_committed")]
+    pub primary_committed: bool,
     /// Strongly typed operation payload.
     pub op: SyncOp,
     /// Per-backend acked sequence numbers.
     pub backends: std::collections::HashMap<String, BackendSyncState>,
 }
 
+fn default_primary_committed() -> bool {
+    true
+}
+
 impl SyncLogEntry {
-    /// Create a new sync log entry for a sequenced operation.
+    /// Create a new prepared sync log entry for a sequenced operation.
     pub fn new(latest_seq: u64, op: SyncOp) -> Self {
         Self {
             latest_seq,
+            primary_committed: false,
             op,
             backends: std::collections::HashMap::new(),
         }
+    }
+
+    /// Create a committed sync log entry for an operation already applied on primary.
+    pub fn committed(latest_seq: u64, op: SyncOp) -> Self {
+        Self {
+            latest_seq,
+            primary_committed: true,
+            op,
+            backends: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Mark this entry as committed on primary.
+    pub fn mark_primary_committed(&mut self) {
+        self.primary_committed = true;
+    }
+
+    /// Return whether this entry is committed on primary.
+    pub fn is_primary_committed(&self) -> bool {
+        self.primary_committed
     }
 
     /// Return the backend sync state if present.
@@ -627,5 +686,20 @@ mod tests {
         assert_eq!(param.name, "host");
         assert!(param.required);
         assert_eq!(param.param_type, "string");
+    }
+
+    #[test]
+    fn test_sync_log_entry_legacy_payload_defaults_primary_committed_true() {
+        let entry: SyncLogEntry = serde_json::from_value(serde_json::json!({
+            "latest_seq": 7,
+            "op": {
+                "type": "Create"
+            },
+            "backends": {}
+        }))
+        .unwrap();
+
+        assert!(entry.is_primary_committed());
+        assert_eq!(entry.latest_seq, 7);
     }
 }

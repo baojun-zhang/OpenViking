@@ -132,6 +132,10 @@ def _generate_plugin_config(
     # Check for multi-write configuration
     backups_config = getattr(agfs_config, "backups", None)
     redirects_config = getattr(agfs_config, "redirects", None)
+    if redirects_config is not None and backups_config is None:
+        raise ValueError(
+            "redirects requires backups; single-backend mode does not support redirects"
+        )
 
     # Build primary backend plugin config
     primary_plugin_config: Dict[str, Any] = {}

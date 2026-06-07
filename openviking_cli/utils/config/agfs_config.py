@@ -345,6 +345,9 @@ class AGFSConfig(BaseModel):
                     "db_path/queue_db_path will be ignored."
                 )
 
+        if self.redirects is not None and self.backups is None:
+            raise ValueError("redirects requires backups; single-backend mode does not support redirects")
+
         # ── Global uniqueness validation ──
         if self.backups is not None:
             if self.backups.sync_type == "sync" and self.backups.write_ack_count is None:

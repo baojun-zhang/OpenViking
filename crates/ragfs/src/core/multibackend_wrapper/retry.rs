@@ -32,6 +32,9 @@ impl Inner {
         let redirect_meta = self.meta_store.get_redirect_meta(dir, ctx).await?;
         let mut has_pending = false;
         for (file_name, sync_entry) in &sync_log.entries {
+            if !sync_entry.is_primary_committed() {
+                continue;
+            }
             let file_path = if dir == "/" {
                 format!("/{}", file_name)
             } else {
@@ -197,6 +200,9 @@ impl Inner {
         let redirect_meta = self.meta_store.get_redirect_meta(dir, &ctx).await?;
 
         for (file_name, sync_entry) in &sync_log.entries {
+            if !sync_entry.is_primary_committed() {
+                continue;
+            }
             let file_path = if dir == "/" {
                 format!("/{}", file_name)
             } else {

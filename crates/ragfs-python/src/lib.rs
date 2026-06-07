@@ -688,6 +688,28 @@ impl RAGFSBindingClient {
         Ok(m)
     }
 
+    /// Attempt a same-mount verbatim copy and report whether the fast-path was used.
+    #[pyo3(signature = (src_path, dst_path, ctx=None))]
+    fn copy_within_mount(
+        &self,
+        py: Python<'_>,
+        src_path: String,
+        dst_path: String,
+        ctx: Option<HashMap<String, String>>,
+    ) -> PyResult<HashMap<String, bool>> {
+        let fs_ctx = build_fs_context(ctx);
+        let mountable = self.mountable.clone();
+        let performed = self
+            .run_scoped(py, fs_ctx, move || async move {
+                mountable.copy_within_mount(&src_path, &dst_path).await
+            })
+            .map_err(to_py_err)?;
+
+        let mut result = HashMap::new();
+        result.insert("performed".to_string(), performed);
+        Ok(result)
+    }
+
     /// Change file permissions.
     #[pyo3(signature = (path, mode, ctx=None))]
     fn chmod(

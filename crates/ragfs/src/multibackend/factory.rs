@@ -33,15 +33,7 @@ pub async fn init_backend_plugin(
             .ok_or_else(|| Error::plugin(format!("Plugin '{}' not registered", plugin_name)))?
     };
 
-    let plugin_config = PluginConfig {
-        name: plugin_name.to_string(),
-        mount_path: String::new(),
-        params: params.clone(),
-        backups: None,
-        server_encryption_enabled: false,
-        primary_encryption_enabled: false,
-        primary_redirects: Vec::new(),
-    };
+    let plugin_config = PluginConfig::single_backend(plugin_name, String::new(), params.clone());
 
     plugin.validate(&plugin_config).await?;
     let fs = plugin.initialize(plugin_config).await?;
@@ -69,7 +61,7 @@ pub async fn build_multi_write_fs(
     .await?;
     let primary_backend: Arc<dyn FileSystem> = if global_encryption_enabled {
         Arc::new(EncryptionWrappedFS::new(
-            primary_raw,
+            primary_raw.clone(),
             build_ctx
                 .enc_root_key
                 .expect("global encryption validated before building primary backend"),
@@ -78,7 +70,7 @@ pub async fn build_multi_write_fs(
                 .expect("global encryption validated before building primary backend"),
         ))
     } else {
-        primary_raw
+        primary_raw.clone()
     };
 
     let mut backup_entries: Vec<BackendEntry> = Vec::new();
@@ -140,6 +132,7 @@ pub async fn build_multi_write_fs(
             name: item.name.clone(),
             role: BackendRole::Backup,
             backend: backup_backend,
+            raw_backend: None,
             operations: item.operations.clone().unwrap_or_default(),
             excludes: item.excludes.clone().unwrap_or_default(),
         });
@@ -149,6 +142,7 @@ pub async fn build_multi_write_fs(
     validate_backup_excludes(bc)?;
 
     MultiWriteWrappedFS::builder(primary_backend)
+        .with_primary_raw_backend(primary_raw)
         .with_backups(backup_entries)
         .with_redirects(config.primary_redirects.clone())
         .sync_mode(sync_mode_from_config(bc))

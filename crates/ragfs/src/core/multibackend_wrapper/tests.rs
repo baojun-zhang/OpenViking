@@ -15,11 +15,13 @@ fn test_ctx() -> FsContext {
 fn test_multiwrite_fs(redirects: Vec<RedirectPolicy>) -> MultiWriteWrappedFS {
     let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
-    let builder = MultiWriteWrappedFS::builder(primary)
+    let builder = MultiWriteWrappedFS::builder(primary.clone())
+        .with_primary_raw_backend(primary)
         .with_backups(vec![BackendEntry {
             name: "backup1".to_string(),
             role: BackendRole::Backup,
             backend: backup,
+            raw_backend: None,
             operations: Vec::new(),
             excludes: Vec::new(),
         }])
@@ -92,6 +94,148 @@ async fn test_read_dir_redirect_entries_use_target_stat() {
 }
 
 #[tokio::test]
+async fn test_redirect_write_marks_first_target_acked_before_returning() {
+    let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup1: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup2: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup1_handle = backup1.clone();
+    let fs = MultiWriteWrappedFS::builder(primary.clone())
+        .with_primary_raw_backend(primary)
+        .with_backups(vec![
+            BackendEntry {
+                name: "backup1".to_string(),
+                role: BackendRole::Backup,
+                backend: backup1,
+                raw_backend: None,
+                operations: Vec::new(),
+                excludes: Vec::new(),
+            },
+            BackendEntry {
+                name: "backup2".to_string(),
+                role: BackendRole::Backup,
+                backend: backup2,
+                raw_backend: None,
+                operations: Vec::new(),
+                excludes: Vec::new(),
+            },
+        ])
+        .with_redirects(vec![RedirectPolicy::FileExtensionPolicy {
+            extensions: vec!["\\.pdf$".to_string()],
+            target: Some(vec!["backup1".to_string(), "backup2".to_string()]),
+        }])
+        .sync_mode(SyncMode::Async)
+        .build()
+        .unwrap();
+    let ctx = test_ctx();
+
+    FS_CTX
+        .scope(ctx.clone(), async {
+            fs.ensure_parent_dirs("/local/acct/docs/report.pdf", 0o755)
+                .await?;
+            fs.write(
+                "/local/acct/docs/report.pdf",
+                b"pdf body",
+                0,
+                WriteFlag::Create,
+            )
+            .await?;
+
+            let redirect_meta = fs
+                .inner
+                .meta_store
+                .get_redirect_meta("/local/acct/docs", &ctx)
+                .await?;
+            let entry = redirect_meta
+                .entries
+                .get("report.pdf")
+                .expect("redirect metadata should only appear after one target succeeds");
+            assert_eq!(
+                entry.targets,
+                vec!["backup1".to_string(), "backup2".to_string()]
+            );
+
+            let sync_log = fs
+                .inner
+                .meta_store
+                .get_sync_log_meta("/local/acct/docs", &ctx)
+                .await?;
+            let log_entry = sync_log
+                .entries
+                .get("report.pdf")
+                .expect("redirected file should be tracked in sync log");
+            assert!(log_entry.is_primary_committed());
+            assert!(
+                log_entry.is_in_sync("backup1"),
+                "the first redirect target must be acknowledged before returning"
+            );
+            assert!(
+                backup1_handle.exists("/local/acct/docs/report.pdf").await,
+                "the first redirect target must already contain the file"
+            );
+            Ok::<(), Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_redirect_write_does_not_publish_metadata_when_first_target_fails() {
+    let fs = test_multiwrite_fs(vec![RedirectPolicy::FileExtensionPolicy {
+        extensions: vec!["\\.pdf$".to_string()],
+        target: Some(vec!["backup1".to_string()]),
+    }]);
+    let ctx = test_ctx();
+
+    FS_CTX
+        .scope(ctx.clone(), async {
+            let err = Inner::execute_write(
+                &fs.inner,
+                WriteOp {
+                    path: "/local/acct/docs/fail.pdf".to_string(),
+                    size: 7,
+                    primary_fn: |_fs: Arc<dyn FileSystem>| async move { Ok::<u64, Error>(7) },
+                    backup_fn: boxed_write_op(|_backup| async {
+                        Err(Error::not_found("/local/acct/docs/fail.pdf"))
+                    }),
+                    sync_op: Some(SyncOp::SyncFile { size: 7 }),
+                    redirect_eligible: true,
+                    redirect_result: Some(7u64),
+                },
+            )
+            .await
+            .expect_err("redirect write should fail when the first target is not durable");
+
+            assert!(
+                err.to_string().contains("not found"),
+                "unexpected error: {err}"
+            );
+
+            let redirect_meta = fs
+                .inner
+                .meta_store
+                .get_redirect_meta("/local/acct/docs", &ctx)
+                .await?;
+            assert!(
+                !redirect_meta.entries.contains_key("fail.pdf"),
+                "redirect metadata must not be published before the first target succeeds"
+            );
+
+            let sync_log = fs
+                .inner
+                .meta_store
+                .get_sync_log_meta("/local/acct/docs", &ctx)
+                .await?;
+            assert!(
+                !sync_log.entries.contains_key("fail.pdf"),
+                "sync log must not record a committed redirect write before durability"
+            );
+            Ok::<(), Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_cross_dir_rename_does_not_create_target_write_log() {
     let fs = test_multiwrite_fs(Vec::new());
     let ctx = test_ctx();
@@ -145,11 +289,13 @@ async fn test_rename_redirected_file_renames_original_redirect_target() {
     let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
     let backup_handle = backup.clone();
-    let fs = MultiWriteWrappedFS::builder(primary)
+    let fs = MultiWriteWrappedFS::builder(primary.clone())
+        .with_primary_raw_backend(primary)
         .with_backups(vec![BackendEntry {
             name: "backup1".to_string(),
             role: BackendRole::Backup,
             backend: backup,
+            raw_backend: None,
             operations: vec![OperationItemConfig {
                 operation: "read".to_string(),
                 priority: 1,
@@ -194,6 +340,74 @@ async fn test_rename_redirected_file_renames_original_redirect_target() {
                 !backup_handle.exists("/local/acct/src/a.pdf").await,
                 "redirect target backend should not retain the old path"
             );
+            Ok::<(), Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_copy_within_primary_preserves_primary_bytes_and_fanouts_backups() {
+    let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+    let backup_handle = backup.clone();
+    let fs = MultiWriteWrappedFS::builder(primary.clone())
+        .with_primary_raw_backend(primary)
+        .with_backups(vec![BackendEntry {
+            name: "backup1".to_string(),
+            role: BackendRole::Backup,
+            backend: backup,
+            raw_backend: None,
+            operations: Vec::new(),
+            excludes: Vec::new(),
+        }])
+        .sync_mode(SyncMode::Sync {
+            ack_count: 1,
+            timeout_ms: 0,
+        })
+        .build()
+        .unwrap();
+    let ctx = test_ctx();
+
+    FS_CTX
+        .scope(ctx.clone(), async {
+            fs.ensure_parent_dirs("/local/acct/docs/src.bin", 0o755)
+                .await?;
+            fs.write("/local/acct/docs/src.bin", b"payload", 0, WriteFlag::Create)
+                .await?;
+
+            let copied = fs
+                .copy_within_primary("/local/acct/docs/src.bin", "/local/acct/docs/dst.bin")
+                .await?;
+            assert!(
+                copied,
+                "copy_within_primary should use the primary fast-path"
+            );
+
+            assert_eq!(
+                fs.inner
+                    .primary()
+                    .backend
+                    .read("/local/acct/docs/dst.bin", 0, 0)
+                    .await?,
+                b"payload"
+            );
+            assert_eq!(
+                backup_handle.read("/local/acct/docs/dst.bin", 0, 0).await?,
+                b"payload"
+            );
+
+            let sync_log = fs
+                .inner
+                .meta_store
+                .get_sync_log_meta("/local/acct/docs", &ctx)
+                .await?;
+            let entry = sync_log
+                .entries
+                .get("dst.bin")
+                .expect("copied file should be tracked for backup fanout");
+            assert!(entry.is_primary_committed());
+            assert!(matches!(entry.op, SyncOp::SyncFile { size } if size == 7));
             Ok::<(), Error>(())
         })
         .await
@@ -306,6 +520,7 @@ async fn test_read_route_metrics_capture_backup_and_cache_hits() {
             name: "backup1".to_string(),
             role: BackendRole::Backup,
             backend: backup,
+            raw_backend: None,
             operations: vec![OperationItemConfig {
                 operation: "read".to_string(),
                 priority: 1,
@@ -423,6 +638,45 @@ async fn test_retry_pending_dir_reports_corrupt_redirect_meta() {
                     || err.to_string().contains("serialization"),
                 "unexpected error: {err}"
             );
+            Ok::<(), Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_uncommitted_sync_log_entry_is_visible_but_not_retried() {
+    let fs = test_multiwrite_fs(Vec::new());
+    let ctx = test_ctx();
+
+    FS_CTX
+        .scope(ctx.clone(), async {
+            fs.ensure_parent_dirs("/local/acct/docs/a.txt", 0o755)
+                .await?;
+            fs.inner
+                .meta_store
+                .update_dir_meta("/local/acct/docs", &ctx, |_redirect, sync_log| {
+                    sync_log
+                        .entries
+                        .insert("a.txt".to_string(), SyncLogEntry::new(1, SyncOp::Create));
+                    Ok(())
+                })
+                .await?;
+
+            let status = fs.system_sync_status("/local/acct/docs").await?;
+            assert_eq!(status["entry_count"], 1);
+            assert_eq!(status["pending_target_count"], 0);
+            assert_eq!(status["entries"][0]["primary_committed"], false);
+            assert_eq!(
+                status["entries"][0]["targets"][0]["primary_committed"],
+                false
+            );
+
+            let retry = fs.system_sync_retry("/local/acct/docs").await?;
+            assert_eq!(retry["retried"], 0);
+            assert_eq!(retry["failed"], 0);
+            assert_eq!(retry["skipped"], 1);
+            assert_eq!(retry["results"][0]["status"], "awaiting_primary_commit");
             Ok::<(), Error>(())
         })
         .await

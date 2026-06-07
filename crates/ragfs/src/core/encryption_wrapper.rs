@@ -327,15 +327,7 @@ mod tests {
 
     /// Build a memfs plugin config for encryption wrapper tests.
     fn memfs_config(mount_path: &str) -> PluginConfig {
-        PluginConfig {
-            name: "memfs".to_string(),
-            mount_path: mount_path.to_string(),
-            params: HashMap::new(),
-            backups: None,
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
-        }
+        PluginConfig::single_backend("memfs", mount_path, HashMap::new())
     }
 
     /// Build a memfs-backed stack mounted at the default path.

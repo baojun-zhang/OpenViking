@@ -104,15 +104,7 @@ mod tests {
         mount_path: &str,
         params: HashMap<String, ConfigValue>,
     ) -> PluginConfig {
-        PluginConfig {
-            name: name.to_string(),
-            mount_path: mount_path.to_string(),
-            params,
-            backups: None,
-            server_encryption_enabled: false,
-            primary_encryption_enabled: false,
-            primary_redirects: Vec::new(),
-        }
+        PluginConfig::single_backend(name, mount_path, params)
     }
 
     async fn mount_mem(stack: &RagfsStack) {

@@ -98,12 +98,17 @@ impl MultiWriteWrappedFS {
 
         for (file_path, sync_entry, target_backend_names) in work {
             let mut targets = Vec::new();
-            let mut all_synced = true;
+            let primary_committed = sync_entry.is_primary_committed();
+            let mut all_synced = primary_committed;
 
             for backend_name in target_backend_names {
-                let acked_seq = sync_entry.acked_seq(&backend_name);
-                let in_sync = sync_entry.is_in_sync(&backend_name);
-                if !in_sync {
+                let acked_seq = if primary_committed {
+                    sync_entry.acked_seq(&backend_name)
+                } else {
+                    0
+                };
+                let in_sync = primary_committed && sync_entry.is_in_sync(&backend_name);
+                if primary_committed && !in_sync {
                     pending_target_count += 1;
                     all_synced = false;
                 }
@@ -113,6 +118,7 @@ impl MultiWriteWrappedFS {
                     "acked_seq": acked_seq,
                     "retry_failures": state.map(|state| state.retry_failures).unwrap_or(0),
                     "quarantined": state.map(|state| state.quarantined).unwrap_or(false),
+                    "primary_committed": primary_committed,
                     "in_sync": in_sync,
                 }));
             }
@@ -120,6 +126,7 @@ impl MultiWriteWrappedFS {
             entries.push(json!({
                 "path": file_path,
                 "latest_seq": sync_entry.latest_seq,
+                "primary_committed": primary_committed,
                 "op": serde_json::to_value(&sync_entry.op)?,
                 "all_synced": all_synced,
                 "targets": targets,
@@ -154,6 +161,21 @@ impl MultiWriteWrappedFS {
         let mut skipped = 0usize;
 
         for (file_path, sync_entry, target_backend_names) in work {
+            if !sync_entry.is_primary_committed() {
+                skipped += target_backend_names.len();
+                for backend_name in target_backend_names {
+                    results.push(json!({
+                        "path": file_path,
+                        "target": backend_name,
+                        "status": "awaiting_primary_commit",
+                        "latest_seq": sync_entry.latest_seq,
+                        "primary_committed": false,
+                        "acked_seq": 0,
+                    }));
+                }
+                continue;
+            }
+
             for backend_name in target_backend_names {
                 let acked_seq = sync_entry.acked_seq(&backend_name);
                 let was_quarantined = sync_entry.is_quarantined(&backend_name);

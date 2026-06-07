@@ -154,6 +154,8 @@ pub struct MetaStateStore {
     primary_backend: Arc<dyn FileSystem>,
     /// Per-directory locks for serialized read-modify-write
     dir_locks: Mutex<HashMap<String, Arc<TrackedLock>>>,
+    /// Dedicated global state lock for next_seq persistence.
+    global_state_lock: Mutex<()>,
     /// Maximum number of directory lock entries to retain.
     dir_lock_capacity: usize,
     /// Time-to-live for one idle directory lock entry.
@@ -192,6 +194,7 @@ impl MetaStateStore {
         Self {
             primary_backend,
             dir_locks: Mutex::new(HashMap::new()),
+            global_state_lock: Mutex::new(()),
             dir_lock_capacity: DEFAULT_DIR_LOCK_CAPACITY,
             dir_lock_ttl: DEFAULT_DIR_LOCK_TTL,
             meta_cache: Mutex::new(HashMap::new()),
@@ -204,10 +207,11 @@ impl MetaStateStore {
     /// Get or create a per-directory lock.
     async fn get_dir_lock(&self, dir: &str) -> Arc<TrackedLock> {
         let mut locks = self.dir_locks.lock().await;
-        let lock = locks
-            .entry(dir.to_string())
-            .or_insert_with(|| Arc::new(TrackedLock::new()))
-            .clone();
+        if let Some(lock) = locks.get(dir).cloned() {
+            return lock;
+        }
+        let lock = Arc::new(TrackedLock::new());
+        locks.insert(dir.to_string(), lock.clone());
         Self::prune_tracked_locks(&mut locks, self.dir_lock_capacity, self.dir_lock_ttl);
         lock
     }
@@ -525,8 +529,7 @@ impl MetaStateStore {
 
     /// Allocate and persist the next global sequence number.
     pub async fn next_seq(&self) -> Result<u64> {
-        let lock = self.get_dir_lock(GLOBAL_STATE_FILE).await;
-        let _guard = lock.lock().await;
+        let _guard = self.global_state_lock.lock().await;
         let mut state = self.read_global_state().await?;
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
@@ -727,6 +730,21 @@ mod tests {
 
         let result = store.get_sync_log_meta("/local/acct/docs", &ctx).await;
         assert!(result.is_err(), "corrupted metadata must fail fast");
+    }
+
+    #[tokio::test]
+    async fn test_next_seq_uses_dedicated_global_lock() {
+        let primary: Arc<dyn FileSystem> = Arc::new(MemFileSystem::new());
+        let store = MetaStateStore::new(primary, Arc::new(DefaultFsContextResolver));
+
+        assert_eq!(store.next_seq().await.unwrap(), 1);
+        assert_eq!(store.next_seq().await.unwrap(), 2);
+
+        let dir_locks = store.dir_locks.lock().await;
+        assert!(
+            !dir_locks.contains_key(GLOBAL_STATE_FILE),
+            "global sequence locking should not occupy the directory lock pool"
+        );
     }
 
     #[tokio::test]

@@ -130,6 +130,8 @@ pub struct BackendEntry {
     pub role: BackendRole,
     /// The backend filesystem handle (may be encrypted)
     pub backend: Arc<dyn FileSystem>,
+    /// Optional raw backend handle used by primary verbatim copy fast-paths.
+    pub raw_backend: Option<Arc<dyn FileSystem>>,
     /// Operations this backend participates in (only for Backup)
     pub operations: Vec<OperationItemConfig>,
     /// Exclude policies (only for Backup)
@@ -258,6 +260,52 @@ impl SyncOp {
     }
 }
 
+/// Copy one file between two filesystem handles in bounded-size chunks.
+async fn copy_file_state(
+    source: Arc<dyn FileSystem>,
+    source_path: &str,
+    destination: Arc<dyn FileSystem>,
+    destination_path: &str,
+    size: u64,
+    ctx: &FsContext,
+) -> Result<()> {
+    FS_CTX
+        .scope(ctx.clone(), async {
+            destination
+                .ensure_parent_dirs(destination_path, 0o755)
+                .await?;
+            if size == 0 {
+                if destination.exists(destination_path).await {
+                    return destination.truncate(destination_path, 0).await;
+                }
+                return destination.create(destination_path).await;
+            }
+
+            let mut offset = 0u64;
+            while offset < size {
+                let chunk_len = (size - offset).min(DEFAULT_COPY_CHUNK_SIZE as u64);
+                let chunk = source.read(source_path, offset, chunk_len).await?;
+                let flag = if offset == 0 {
+                    WriteFlag::Create
+                } else {
+                    WriteFlag::None
+                };
+                destination
+                    .write(destination_path, &chunk, offset, flag)
+                    .await?;
+                offset = offset.saturating_add(chunk.len() as u64);
+                if chunk.is_empty() {
+                    return Err(Error::internal(format!(
+                        "source returned empty chunk while copying '{}' -> '{}'",
+                        source_path, destination_path
+                    )));
+                }
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Copy the current file state from primary to backup in bounded-size chunks.
 async fn copy_current_primary_state(
     primary: Arc<dyn FileSystem>,
@@ -266,37 +314,35 @@ async fn copy_current_primary_state(
     size: u64,
     ctx: &FsContext,
 ) -> Result<()> {
-    FS_CTX
-        .scope(ctx.clone(), async {
-            backup.ensure_parent_dirs(file_path, 0o755).await?;
-            if size == 0 {
-                if backup.exists(file_path).await {
-                    return backup.truncate(file_path, 0).await;
-                }
-                return backup.create(file_path).await;
-            }
+    copy_file_state(primary, file_path, backup, file_path, size, ctx).await
+}
 
-            let mut offset = 0u64;
-            while offset < size {
-                let chunk_len = (size - offset).min(DEFAULT_COPY_CHUNK_SIZE as u64);
-                let chunk = primary.read(file_path, offset, chunk_len).await?;
-                let flag = if offset == 0 {
-                    WriteFlag::Create
-                } else {
-                    WriteFlag::None
-                };
-                backup.write(file_path, &chunk, offset, flag).await?;
-                offset = offset.saturating_add(chunk.len() as u64);
-                if chunk.is_empty() {
-                    return Err(Error::internal(format!(
-                        "primary returned empty chunk while copying '{}'",
-                        file_path
-                    )));
-                }
+/// Copy one file within the primary raw backend without decrypting and re-encrypting bytes.
+async fn copy_raw_primary_state(
+    primary_raw: Arc<dyn FileSystem>,
+    source_path: &str,
+    destination_path: &str,
+    ctx: &FsContext,
+) -> Result<()> {
+    let raw_size = FS_CTX
+        .scope(ctx.clone(), async {
+            let source_info = primary_raw.stat(source_path).await?;
+            if source_info.is_dir {
+                return Err(Error::IsADirectory(source_path.to_string()));
             }
-            Ok(())
+            Ok::<u64, Error>(source_info.size)
         })
-        .await
+        .await?;
+
+    copy_file_state(
+        primary_raw.clone(),
+        source_path,
+        primary_raw,
+        destination_path,
+        raw_size,
+        ctx,
+    )
+    .await
 }
 
 /// Inner state shared via Arc for async spawn and retry_loop.
@@ -359,6 +405,7 @@ pub struct MultiWriteWrappedFS {
 /// Builder for `MultiWriteWrappedFS`.
 pub struct MultiWriteWrappedFSBuilder {
     primary_backend: Arc<dyn FileSystem>,
+    primary_raw_backend: Option<Arc<dyn FileSystem>>,
     backup_entries: Vec<BackendEntry>,
     redirects: Vec<RedirectPolicy>,
     sync_mode: SyncMode,
@@ -372,6 +419,12 @@ pub struct MultiWriteWrappedFSBuilder {
 }
 
 impl MultiWriteWrappedFSBuilder {
+    /// Attach the raw primary backend so the wrapper can do verbatim primary copies.
+    pub fn with_primary_raw_backend(mut self, primary_raw_backend: Arc<dyn FileSystem>) -> Self {
+        self.primary_raw_backend = Some(primary_raw_backend);
+        self
+    }
+
     /// Set backup backend entries on the builder.
     pub fn with_backups(mut self, backup_entries: Vec<BackendEntry>) -> Self {
         self.backup_entries = backup_entries;
@@ -433,6 +486,7 @@ impl MultiWriteWrappedFSBuilder {
             name: "primary".to_string(),
             role: BackendRole::Primary,
             backend: self.primary_backend.clone(),
+            raw_backend: self.primary_raw_backend.clone(),
             operations: Vec::new(),
             excludes: Vec::new(),
         });
@@ -498,6 +552,7 @@ impl MultiWriteWrappedFS {
     pub fn builder(primary_backend: Arc<dyn FileSystem>) -> MultiWriteWrappedFSBuilder {
         MultiWriteWrappedFSBuilder {
             primary_backend,
+            primary_raw_backend: None,
             backup_entries: Vec::new(),
             redirects: Vec::new(),
             sync_mode: SyncMode::Async,
@@ -540,6 +595,33 @@ impl Inner {
             .filter_map(|name| self.backup_by_name(name))
             .map(BackendEntry::fanout_target)
             .collect()
+    }
+
+    /// Execute one backup write synchronously so redirect visibility only appears
+    /// after at least one target has durably materialized the file contents.
+    async fn write_first_target(
+        inner: &Arc<Inner>,
+        path: &str,
+        target: &FanoutTarget,
+        ctx: &FsContext,
+        op: BoxedWriteOp,
+    ) -> Result<()> {
+        let queue_key = Self::backup_queue_key(path, &target.name);
+        let fs = target.backend.clone();
+        let op_ctx = ctx.clone();
+        let ack_ctx = ctx.clone();
+        let op_clone = op.clone();
+
+        inner
+            .path_queues
+            .with_path_lock(&queue_key, || async move {
+                FS_CTX.scope(op_ctx.clone(), op_clone(fs)).await
+            })
+            .await?;
+
+        inner
+            .update_backup_acked_seq(path, &target.name, &ack_ctx)
+            .await
     }
 
     /// Resolve effective target backend names for sync/retry work.
@@ -648,7 +730,23 @@ impl Inner {
                 let dir = parent_dir(&op.path);
                 let name = file_name(&op.path).to_string();
                 let seq = inner.next_seq().await?;
+                let resolved_targets = inner.named_targets(&targets);
+                let first_target = resolved_targets.first().cloned().ok_or_else(|| {
+                    Error::internal(format!(
+                        "redirect path '{}' resolved no writable targets",
+                        op.path
+                    ))
+                })?;
+                Inner::write_first_target(
+                    inner,
+                    &op.path,
+                    &first_target,
+                    &ctx,
+                    op.backup_fn.clone(),
+                )
+                .await?;
                 let targets_clone = targets.clone();
+                let first_target_name = first_target.name.clone();
                 let entry = sync_op.take();
                 inner
                     .meta_store
@@ -660,41 +758,105 @@ impl Inner {
                             },
                         );
                         if let Some(op) = entry {
-                            sync_log.entries.insert(name, SyncLogEntry::new(seq, op));
+                            let mut committed = SyncLogEntry::committed(seq, op);
+                            committed
+                                .backends
+                                .insert(first_target_name.clone(), BackendSyncState::acked(seq));
+                            sync_log.entries.insert(name, committed);
                         }
                         Ok(())
                     })
                     .await?;
-                inner.mark_pending_dir(&dir).await;
-                let fanout_result = Inner::fanout_write_to_targets(
-                    inner,
-                    &op.path,
-                    &targets,
-                    ctx.clone(),
-                    op.backup_fn,
-                )
-                .await;
+                let remaining_targets: Vec<FanoutTarget> =
+                    resolved_targets.into_iter().skip(1).collect();
+                let fanout_result: Result<()> = if remaining_targets.is_empty() {
+                    Ok(())
+                } else {
+                    inner.mark_pending_dir(&dir).await;
+                    Inner::fanout_async(
+                        inner,
+                        &op.path,
+                        remaining_targets,
+                        &ctx,
+                        op.backup_fn.clone(),
+                    )
+                    .await;
+                    Ok(())
+                };
                 inner.refresh_pending_dir(&dir, &ctx).await?;
                 fanout_result?;
                 return Ok(result);
             }
         }
 
-        let result = FS_CTX
-            .scope(
-                ctx.clone(),
-                (op.primary_fn)(inner.primary().backend.clone()),
-            )
-            .await?;
-
-        if let Some(entry) = sync_op {
+        let prepared_entry = if let Some(entry) = sync_op {
             let dir = parent_dir(&op.path);
             let name = file_name(&op.path).to_string();
             let seq = inner.next_seq().await?;
             inner
                 .meta_store
+                .update_dir_meta(&dir, &ctx, {
+                    let name = name.clone();
+                    move |_redirect, sync_log| {
+                        sync_log.entries.insert(name, SyncLogEntry::new(seq, entry));
+                        Ok(())
+                    }
+                })
+                .await?;
+            Some((dir, name, seq))
+        } else {
+            None
+        };
+
+        let result = match FS_CTX
+            .scope(
+                ctx.clone(),
+                (op.primary_fn)(inner.primary().backend.clone()),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some((dir, name, seq)) = prepared_entry.as_ref() {
+                    let _ = inner
+                        .meta_store
+                        .update_dir_meta(dir, &ctx, {
+                            let name = name.clone();
+                            let seq = *seq;
+                            move |_redirect, sync_log| {
+                                let should_remove =
+                                    sync_log.entries.get(&name).is_some_and(|entry| {
+                                        entry.latest_seq == seq && !entry.is_primary_committed()
+                                    });
+                                if should_remove {
+                                    sync_log.entries.remove(&name);
+                                }
+                                Ok(())
+                            }
+                        })
+                        .await;
+                }
+                return Err(err);
+            }
+        };
+
+        if let Some((dir, name, seq)) = prepared_entry {
+            inner
+                .meta_store
                 .update_dir_meta(&dir, &ctx, move |_redirect, sync_log| {
-                    sync_log.entries.insert(name, SyncLogEntry::new(seq, entry));
+                    let entry = sync_log.entries.get_mut(&name).ok_or_else(|| {
+                        Error::internal(format!(
+                            "prepared sync log entry missing while committing '{}'",
+                            name
+                        ))
+                    })?;
+                    if entry.latest_seq != seq {
+                        return Err(Error::internal(format!(
+                            "prepared sync log entry seq mismatch while committing '{}'",
+                            name
+                        )));
+                    }
+                    entry.mark_primary_committed();
                     Ok(())
                 })
                 .await?;
@@ -937,7 +1099,7 @@ impl Inner {
                 .update_dir_meta(&source_dir, ctx, move |redirect, sync_log| {
                     sync_log
                         .entries
-                        .insert(old_name.clone(), SyncLogEntry::new(seq, rename_op));
+                        .insert(old_name.clone(), SyncLogEntry::committed(seq, rename_op));
                     if let Some(redirect_entry) = redirect.entries.remove(&old_name) {
                         redirect.entries.insert(new_name, redirect_entry);
                     }
@@ -953,7 +1115,7 @@ impl Inner {
                     move |src_redirect, src_sync_log, tgt_redirect, _tgt_sync_log| {
                         src_sync_log
                             .entries
-                            .insert(old_name.clone(), SyncLogEntry::new(seq, rename_op));
+                            .insert(old_name.clone(), SyncLogEntry::committed(seq, rename_op));
                         if let Some(redirect_entry) = src_redirect.entries.remove(&old_name) {
                             tgt_redirect.entries.insert(new_name, redirect_entry);
                         }
@@ -981,6 +1143,103 @@ impl MultiWriteWrappedFS {
         self.inner.retry_cancelled.store(true, Ordering::SeqCst);
         self.inner.retry_shutdown.notify_waiters();
         self.inner.wait_idle(DEFAULT_SHUTDOWN_WAIT).await
+    }
+
+    /// Copy one primary-resident file to a new path while preserving physical primary bytes.
+    pub async fn copy_within_primary(&self, src_path: &str, dst_path: &str) -> Result<bool> {
+        if normalize_prefix_path(src_path) == normalize_prefix_path(dst_path) {
+            return Ok(true);
+        }
+
+        let ctx = current_required_ctx()?;
+        let inner = &self.inner;
+        let source_path = src_path.to_string();
+        let destination_path = dst_path.to_string();
+
+        let source_exists_on_primary = FS_CTX
+            .scope(ctx.clone(), async {
+                inner.primary().backend.exists(&source_path).await
+            })
+            .await;
+        if !source_exists_on_primary {
+            return Ok(false);
+        }
+
+        let source_size = FS_CTX
+            .scope(ctx.clone(), async {
+                let source_info = inner.primary().backend.stat(&source_path).await?;
+                if source_info.is_dir {
+                    return Err(Error::IsADirectory(source_path.clone()));
+                }
+                Ok::<u64, Error>(source_info.size)
+            })
+            .await?;
+
+        if inner
+            .check_redirect(&destination_path, source_size)
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        let Some(primary_raw_backend) = inner.primary().raw_backend.clone() else {
+            return Ok(false);
+        };
+
+        let primary_source = source_path.clone();
+        let primary_destination = destination_path.clone();
+        let primary_ctx = ctx.clone();
+        let backup_source = source_path.clone();
+        let backup_destination = destination_path.clone();
+        let backup_ctx = ctx.clone();
+        let logical_primary = inner.primary().backend.clone();
+
+        Inner::execute_write(
+            inner,
+            WriteOp {
+                path: destination_path,
+                size: source_size,
+                primary_fn: move |_ignored_fs| {
+                    let primary_raw_backend = primary_raw_backend.clone();
+                    let primary_source = primary_source.clone();
+                    let primary_destination = primary_destination.clone();
+                    let primary_ctx = primary_ctx.clone();
+                    async move {
+                        copy_raw_primary_state(
+                            primary_raw_backend,
+                            &primary_source,
+                            &primary_destination,
+                            &primary_ctx,
+                        )
+                        .await?;
+                        Ok(())
+                    }
+                },
+                backup_fn: boxed_write_op(move |backup_fs| {
+                    let logical_primary = logical_primary.clone();
+                    let backup_source = backup_source.clone();
+                    let backup_destination = backup_destination.clone();
+                    let backup_ctx = backup_ctx.clone();
+                    async move {
+                        copy_file_state(
+                            logical_primary,
+                            &backup_source,
+                            backup_fs,
+                            &backup_destination,
+                            source_size,
+                            &backup_ctx,
+                        )
+                        .await
+                    }
+                }),
+                sync_op: Some(SyncOp::SyncFile { size: source_size }),
+                redirect_eligible: false,
+                redirect_result: Some(()),
+            },
+        )
+        .await?;
+
+        Ok(true)
     }
 
     /// Execute one non-redirecting write-like operation through the shared multi-write pipeline.
