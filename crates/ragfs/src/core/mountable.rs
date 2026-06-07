@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::multibackend::factory::build_multi_write_fs;
 use crate::multibackend::types::MultiBackendBuildContext;
@@ -183,6 +184,7 @@ impl MountableFS {
                         &config.name,
                         enc_root_key.is_some() && enc_provider_type.is_some(),
                         enc_provider_type,
+                        enc_root_key,
                     )
                     .await?;
                 }
@@ -200,6 +202,9 @@ impl MountableFS {
             }
             Some(bc) => {
                 // Multi-write: build MultiWriteWrappedFS
+                warn!(
+                    "multi-write metadata locking is process-local only; multi-instance shared-primary mounts are not safe"
+                );
                 let mw = self.build_multi_write_fs(&config, bc).await?;
                 let arc: Arc<dyn FileSystem> = Arc::new(mw);
                 (arc, None)
@@ -577,6 +582,7 @@ mod tests {
     use crate::core::BackendItemConfig;
     use crate::core::RedirectPolicy;
     use crate::shape::SHAPE_MANIFEST_PATH;
+    use serde_json::Value;
     use std::collections::HashMap;
 
     /// Helper to create a PluginConfig for tests with new fields defaulted.
@@ -586,6 +592,42 @@ mod tests {
             mount_path: mount_path.to_string(),
             params: HashMap::new(),
             backups: None,
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
+        }
+    }
+
+    /// Helper to create a simple multi-write PluginConfig for tests.
+    fn multiwrite_test_config(
+        primary_backend: &str,
+        backup_backend: &str,
+        mount_path: &str,
+    ) -> PluginConfig {
+        PluginConfig {
+            name: primary_backend.to_string(),
+            mount_path: mount_path.to_string(),
+            params: HashMap::new(),
+            backups: Some(BackendsConfig {
+                sync_type: "async".to_string(),
+                write_ack_count: None,
+                write_ack_timeout_ms: None,
+                write_concurrency: None,
+                retry_interval_ms: None,
+                retry_backoff_base_ms: None,
+                retry_max_retries_per_round: None,
+                retry_quarantine_after_failures: None,
+                read_probe_cache_ttl_ms: None,
+                items: vec![BackendItemConfig {
+                    name: "backup1".to_string(),
+                    backend: backup_backend.to_string(),
+                    params: Value::Null,
+                    timeout: None,
+                    encryption: None,
+                    operations: None,
+                    excludes: None,
+                }],
+            }),
             server_encryption_enabled: false,
             primary_encryption_enabled: false,
             primary_redirects: Vec::new(),
@@ -633,7 +675,10 @@ mod tests {
         }
 
         async fn read(&self, path: &str, _offset: u64, _size: u64) -> Result<Vec<u8>> {
-            if path == SHAPE_MANIFEST_PATH {
+            if path == SHAPE_MANIFEST_PATH
+                || path.ends_with(".redirect.json")
+                || path.ends_with(".sync_log.json")
+            {
                 return Err(Error::not_found(path));
             }
             Ok(self.name.as_bytes().to_vec())
@@ -1116,5 +1161,126 @@ mod tests {
         let result = mfs.build_multi_write_fs(&config, &backups).await;
         assert!(result.is_err());
         assert!(matches!(result.err(), Some(Error::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn test_build_multi_write_fs_rejects_reserved_primary_backup_name() {
+        let mfs = MountableFS::new();
+        mfs.register_plugin(MockPlugin::new("primary")).await;
+        mfs.register_plugin(MockPlugin::new("backupfs")).await;
+
+        let backups = BackendsConfig {
+            sync_type: "async".to_string(),
+            write_ack_count: None,
+            write_ack_timeout_ms: None,
+            write_concurrency: None,
+            retry_interval_ms: None,
+            retry_backoff_base_ms: None,
+            retry_max_retries_per_round: None,
+            retry_quarantine_after_failures: None,
+            read_probe_cache_ttl_ms: None,
+            items: vec![BackendItemConfig {
+                name: "primary".to_string(),
+                backend: "backupfs".to_string(),
+                params: serde_json::Value::Null,
+                timeout: None,
+                encryption: None,
+                operations: None,
+                excludes: None,
+            }],
+        };
+        let config = PluginConfig {
+            name: "primary".to_string(),
+            mount_path: "/local".to_string(),
+            params: HashMap::new(),
+            backups: Some(backups.clone()),
+            server_encryption_enabled: false,
+            primary_encryption_enabled: false,
+            primary_redirects: Vec::new(),
+        };
+
+        let result = mfs.build_multi_write_fs(&config, &backups).await;
+        assert!(result.is_err());
+        assert!(matches!(result.err(), Some(Error::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn test_single_backend_mount_wraps_stats_outside_encryption() {
+        let mfs = MountableFS::new();
+        mfs.register_plugin(MockPlugin::new("mock")).await;
+        mfs.set_encryption_config(Some([9u8; 32]), Some(1)).await;
+
+        mfs.mount(test_config("mock", "/mock")).await.unwrap();
+
+        let mounts = mfs.mounts.read().await;
+        let mount_info = mounts.get("/mock").expect("mounted entry should exist");
+        let wrapped = (mount_info.fs.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<StatsWrappedFS>()
+            .expect("stats wrapper should be outermost");
+        assert!(
+            (wrapped.inner_fs().as_ref() as &dyn std::any::Any)
+                .downcast_ref::<EncryptionWrappedFS>()
+                .is_some(),
+            "single-backend encrypted mount should place encryption under stats"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiwrite_mount_wraps_stats_outside_multiwrite() {
+        let mfs = MountableFS::new();
+        mfs.register_plugin(MockPlugin::new("primary")).await;
+        mfs.register_plugin(MockPlugin::new("backupfs")).await;
+
+        mfs.mount(multiwrite_test_config("primary", "backupfs", "/local"))
+            .await
+            .unwrap();
+
+        let mounts = mfs.mounts.read().await;
+        let mount_info = mounts.get("/local").expect("mounted entry should exist");
+        let wrapped = (mount_info.fs.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<StatsWrappedFS>()
+            .expect("stats wrapper should be outermost");
+        assert!(
+            (wrapped.inner_fs().as_ref() as &dyn std::any::Any)
+                .downcast_ref::<MultiWriteWrappedFS>()
+                .is_some(),
+            "multi-write mount should place MultiWriteWrappedFS directly under stats"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mountable_multiwrite_admin_smoke() {
+        let mfs = MountableFS::new();
+        mfs.register_plugin(MockPlugin::new("primary")).await;
+        mfs.register_plugin(MockPlugin::new("backupfs")).await;
+
+        mfs.mount(multiwrite_test_config("primary", "backupfs", "/local"))
+            .await
+            .unwrap();
+
+        let status = crate::core::FS_CTX
+            .scope(
+                Arc::new(crate::core::context::FsContextInner::new(
+                    "acct".to_string(),
+                )),
+                async { mfs.system_sync_status("/local").await.unwrap() },
+            )
+            .await;
+        assert_eq!(status["path"], "/");
+        assert_eq!(status["entry_count"], 0);
+        assert_eq!(status["pending_target_count"], 0);
+        assert_eq!(status["capabilities"]["multi_instance_safe"], false);
+
+        let retry = crate::core::FS_CTX
+            .scope(
+                Arc::new(crate::core::context::FsContextInner::new(
+                    "acct".to_string(),
+                )),
+                async { mfs.system_sync_retry("/local").await.unwrap() },
+            )
+            .await;
+        assert_eq!(retry["path"], "/");
+        assert_eq!(retry["retried"], 0);
+        assert_eq!(retry["failed"], 0);
     }
 }

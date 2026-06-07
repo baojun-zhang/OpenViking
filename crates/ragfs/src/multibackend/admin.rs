@@ -30,18 +30,29 @@ impl MultiWriteWrappedFS {
 
         if path_info.is_dir {
             add_dir(&mut dirs, &mut seen_dirs, normalized.clone());
-            for entry in inner
-                .primary()
-                .backend
-                .tree_directory(&normalized, true, None, None)
-                .await?
-            {
-                if entry.info.is_dir {
-                    add_dir(
-                        &mut dirs,
-                        &mut seen_dirs,
-                        normalize_prefix_path(&entry.path),
-                    );
+            for dir in inner.pending_dirs_snapshot().await {
+                if dir == normalized
+                    || dir
+                        .strip_prefix(&normalized)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    add_dir(&mut dirs, &mut seen_dirs, dir);
+                }
+            }
+            if dirs.len() == 1 {
+                for entry in inner
+                    .primary()
+                    .backend
+                    .tree_directory(&normalized, true, None, None)
+                    .await?
+                {
+                    if entry.info.is_dir {
+                        add_dir(
+                            &mut dirs,
+                            &mut seen_dirs,
+                            normalize_prefix_path(&entry.path),
+                        );
+                    }
                 }
             }
         } else {
@@ -54,15 +65,12 @@ impl MultiWriteWrappedFS {
 
         let mut work = Vec::new();
         for dir in dirs {
+            inner.meta_store.invalidate_dir_cache(&dir).await;
             let sync_log = inner.meta_store.get_sync_log_meta(&dir, &ctx).await?;
             if sync_log.entries.is_empty() {
                 continue;
             }
-            let redirect_meta = inner
-                .meta_store
-                .get_redirect_meta(&dir, &ctx)
-                .await
-                .unwrap_or_default();
+            let redirect_meta = inner.meta_store.get_redirect_meta(&dir, &ctx).await?;
 
             for (name, sync_entry) in sync_log.entries {
                 let file_path = if dir == "/" {
@@ -128,6 +136,9 @@ impl MultiWriteWrappedFS {
             "path": normalize_prefix_path(path),
             "entry_count": entries.len(),
             "pending_target_count": pending_target_count,
+            "capabilities": {
+                "multi_instance_safe": false
+            },
             "read_route_metrics": self.inner.read_route_metrics(),
             "entries": entries,
         }))

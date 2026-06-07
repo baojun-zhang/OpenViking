@@ -64,6 +64,7 @@ pub async fn build_multi_write_fs(
         &config.name,
         global_encryption_enabled,
         build_ctx.enc_provider_type,
+        build_ctx.enc_root_key,
     )
     .await?;
     let primary_backend: Arc<dyn FileSystem> = if global_encryption_enabled {
@@ -84,6 +85,11 @@ pub async fn build_multi_write_fs(
     let mut seen_names: HashSet<String> = HashSet::new();
 
     for item in &bc.items {
+        if item.name == "primary" {
+            return Err(Error::config(
+                "backup backend name 'primary' is reserved".to_string(),
+            ));
+        }
         if !seen_names.insert(item.name.clone()) {
             return Err(Error::config(format!(
                 "duplicate backup name '{}'",
@@ -105,6 +111,11 @@ pub async fn build_multi_write_fs(
             backup_encrypted,
             if backup_encrypted {
                 build_ctx.enc_provider_type
+            } else {
+                None
+            },
+            if backup_encrypted {
+                build_ctx.enc_root_key
             } else {
                 None
             },

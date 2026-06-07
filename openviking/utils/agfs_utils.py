@@ -8,7 +8,7 @@ import multiprocessing
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from openviking_cli.utils.logger import get_logger
 
@@ -188,23 +188,32 @@ def _map_backend_to_plugin_name(backend: str) -> str:
     return mapping.get(backend, backend)
 
 
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    """Read one value from a dict-like or object-like config."""
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
     """Serialize user-facing S3 config into Rust s3fs plugin parameters."""
-    directory_marker_mode = s3_config.directory_marker_mode
+    directory_marker_mode = _get_config_value(s3_config, "directory_marker_mode")
     return {
-        "bucket": s3_config.bucket,
-        "region": s3_config.region,
-        "access_key_id": s3_config.access_key,
-        "secret_access_key": s3_config.secret_key,
-        "endpoint": s3_config.endpoint,
-        "prefix": s3_config.prefix,
-        "disable_ssl": not s3_config.use_ssl,
-        "use_path_style": s3_config.use_path_style,
+        "bucket": _get_config_value(s3_config, "bucket"),
+        "region": _get_config_value(s3_config, "region"),
+        "access_key_id": _get_config_value(s3_config, "access_key"),
+        "secret_access_key": _get_config_value(s3_config, "secret_key"),
+        "endpoint": _get_config_value(s3_config, "endpoint"),
+        "prefix": _get_config_value(s3_config, "prefix", ""),
+        "disable_ssl": not _get_config_value(s3_config, "use_ssl", True),
+        "use_path_style": _get_config_value(s3_config, "use_path_style", True),
         "directory_marker_mode": directory_marker_mode.value
         if hasattr(directory_marker_mode, "value")
         else directory_marker_mode,
-        "disable_batch_delete": s3_config.disable_batch_delete,
-        "normalize_encoding_chars": s3_config.normalize_encoding_chars,
+        "disable_batch_delete": _get_config_value(s3_config, "disable_batch_delete", False),
+        "normalize_encoding_chars": _get_config_value(
+            s3_config, "normalize_encoding_chars", "?#%+@"
+        ),
     }
 
 
@@ -219,6 +228,53 @@ def _dump_config_object(config: Any) -> Dict[str, Any]:
         for key, value in vars(config).items()
         if value is not None and not key.startswith("_")
     }
+
+
+def _serialize_s3_backup_params(
+    _item: Any, backend_config: Any, _data_path: Path
+) -> Dict[str, Any]:
+    """Serialize one S3 backup item into the Rust s3fs parameter shape."""
+    if backend_config is None:
+        return {}
+    return _serialize_s3_plugin_params(backend_config)
+
+
+def _serialize_local_backup_params(
+    item: Any, backend_config: Any, data_path: Path
+) -> Dict[str, Any]:
+    """Serialize one local backup item and fill the default workspace local_dir."""
+    local_dir = (
+        _get_config_value(backend_config, "local_dir") if backend_config is not None else None
+    )
+    if local_dir is None:
+        local_dir = data_path / "viking" / "_backups" / item.name
+    local_dir_path = Path(local_dir).expanduser()
+    return {"local_dir": str(local_dir_path)}
+
+
+def _serialize_generic_backup_params(
+    _item: Any, backend_config: Any, _data_path: Path
+) -> Dict[str, Any]:
+    """Serialize one backup item with the generic config dumper."""
+    if backend_config is None:
+        return {}
+    return _dump_config_object(backend_config)
+
+
+def _backup_param_serializers() -> Dict[str, Callable[[Any, Any, Path], Dict[str, Any]]]:
+    """Return the serializer registry keyed by user-facing backup backend type."""
+    return {
+        "s3": _serialize_s3_backup_params,
+        "local": _serialize_local_backup_params,
+    }
+
+
+def _serialize_backup_params(item: Any, data_path: Path) -> Dict[str, Any]:
+    """Serialize backend-specific params for one backup item via the serializer registry."""
+    backend_type = item.backend
+    backend_config = getattr(item, "backend_params", None)
+    serializer = _backup_param_serializers().get(backend_type, _serialize_generic_backup_params)
+    return serializer(item, backend_config, data_path)
 
 
 def _serialize_backups_config(backups_config: Any, data_path: Path) -> Dict[str, Any]:
@@ -251,29 +307,9 @@ def _serialize_backups_config(backups_config: Any, data_path: Path) -> Dict[str,
         if item.excludes is not None:
             item_dict["excludes"] = [_serialize_redirect_policy(p) for p in item.excludes]
 
-        # Collect backend-specific params into "params" key for Rust BackendItemConfig
-        # Check the original field names (e.g. "s3") not the mapped plugin names.
-        backend_type = item.backend  # original user-facing name: "local", "s3", "memory"
-        if backend_type == "s3" and "s3" in item.model_fields_set:
-            s3_config = item.s3
-            if s3_config is not None:
-                item_dict["params"] = _serialize_s3_plugin_params(s3_config)
-        elif backend_type == "local":
-            local_config = getattr(item, "local", None)
-            local_dir = None
-            if isinstance(local_config, dict):
-                local_dir = local_config.get("local_dir")
-            elif local_config is not None:
-                local_dir = getattr(local_config, "local_dir", None)
-            if local_dir is None:
-                local_dir = data_path / "viking" / "_backups" / item.name
-            local_dir_path = Path(local_dir).expanduser()
-            local_dir_path.mkdir(parents=True, exist_ok=True)
-            item_dict["params"] = {"local_dir": str(local_dir_path)}
-        elif backend_type in item.model_fields_set:
-            backend_config = getattr(item, backend_type, None)
-            if backend_config is not None:
-                item_dict["params"] = _dump_config_object(backend_config)
+        params = _serialize_backup_params(item, data_path)
+        if params:
+            item_dict["params"] = params
 
         items.append(item_dict)
 
@@ -365,6 +401,12 @@ def mount_agfs_backend(agfs: Any, config: RagfsBindingConfig | Any) -> None:
             local_dir = plugin_config["config"]["local_dir"]
             os.makedirs(local_dir, exist_ok=True)
             logger.debug("[RAGFSUtils] Ensured localfs storage directory exists")
+        for backup_item in plugin_config.get("config", {}).get("backups", {}).get("items", []):
+            if backup_item.get("backend") != "localfs":
+                continue
+            backup_local_dir = backup_item.get("params", {}).get("local_dir")
+            if backup_local_dir:
+                os.makedirs(backup_local_dir, exist_ok=True)
         # Ensure queuefs db_path parent directory exists before mounting
         if plugin_name == "queuefs" and "db_path" in plugin_config.get("config", {}):
             db_path = plugin_config["config"]["db_path"]

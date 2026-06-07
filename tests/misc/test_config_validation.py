@@ -262,7 +262,136 @@ def test_generate_plugin_config_serializes_local_backup_dir(tmp_path):
     backup = plugins["localfs"]["config"]["backups"]["items"][0]
     assert backup["backend"] == "localfs"
     assert backup["params"]["local_dir"] == str(backup_dir)
-    assert backup_dir.exists()
+    assert not backup_dir.exists()
+
+
+def test_backup_item_rejects_reserved_primary_name(tmp_path):
+    with pytest.raises(ValueError, match="primary"):
+        AGFSConfig(
+            path=str(tmp_path),
+            backend="local",
+            backups={"items": [{"name": "primary", "backend": "memory"}]},
+        )
+
+
+def test_backup_item_rejects_nested_backups(tmp_path):
+    with pytest.raises(ValueError, match="extra|backups"):
+        AGFSConfig(
+            path=str(tmp_path),
+            backend="local",
+            backups={
+                "items": [
+                    {
+                        "name": "backup1",
+                        "backend": "memory",
+                        "backups": {"items": [{"name": "nested", "backend": "memory"}]},
+                    }
+                ]
+            },
+        )
+
+
+def test_sync_mode_requires_write_ack_count(tmp_path):
+    with pytest.raises(ValueError, match="write_ack_count"):
+        AGFSConfig(
+            path=str(tmp_path),
+            backend="local",
+            backups={
+                "sync_type": "sync",
+                "items": [{"name": "backup1", "backend": "memory"}],
+            },
+        )
+
+
+def test_generate_plugin_config_serializes_local_backup_dir_without_creating_it(tmp_path):
+    backup_dir = tmp_path / "backup-local-no-mkdir"
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "items": [
+                {
+                    "name": "local-backup",
+                    "backend": "local",
+                    "local": {"local_dir": str(backup_dir)},
+                }
+            ]
+        },
+    )
+
+    plugins = _generate_plugin_config(config, tmp_path)
+
+    backup = plugins["localfs"]["config"]["backups"]["items"][0]
+    assert backup["backend"] == "localfs"
+    assert backup["params"]["local_dir"] == str(backup_dir)
+    assert not backup_dir.exists()
+
+
+def test_generate_plugin_config_uses_default_local_backup_dir_for_local_backup(tmp_path):
+    """Local backup items without an explicit local_dir must use the workspace default path."""
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "items": [
+                {
+                    "name": "local-backup",
+                    "backend": "local",
+                }
+            ]
+        },
+    )
+
+    plugins = _generate_plugin_config(config, tmp_path)
+
+    backup = plugins["localfs"]["config"]["backups"]["items"][0]
+    assert backup["backend"] == "localfs"
+    assert backup["params"]["local_dir"] == str(tmp_path / "viking" / "_backups" / "local-backup")
+
+
+def test_generate_plugin_config_serializes_s3_backup_params(tmp_path):
+    """S3 backup items must be serialized through the s3fs parameter shape."""
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "items": [
+                {
+                    "name": "s3-backup",
+                    "backend": "s3",
+                    "s3": {
+                        "bucket": "backup-bucket",
+                        "region": "cn-beijing",
+                        "access_key": "test-access-key",
+                        "secret_key": "test-secret-key",
+                        "endpoint": "https://tos.example.com",
+                        "prefix": "backup-prefix",
+                        "use_ssl": False,
+                        "use_path_style": False,
+                        "normalize_encoding_chars": "#?",
+                    },
+                }
+            ]
+        },
+    )
+
+    plugins = _generate_plugin_config(config, tmp_path)
+
+    backup = plugins["localfs"]["config"]["backups"]["items"][0]
+    assert backup["backend"] == "s3fs"
+    assert backup["params"] == {
+        "bucket": "backup-bucket",
+        "region": "cn-beijing",
+        "access_key_id": "test-access-key",
+        "secret_access_key": "test-secret-key",
+        "endpoint": "https://tos.example.com",
+        "prefix": "backup-prefix",
+        "disable_ssl": True,
+        "use_path_style": False,
+        "directory_marker_mode": None,
+        "disable_batch_delete": False,
+        "normalize_encoding_chars": "#?",
+    }
 
 
 def test_generate_plugin_config_passes_multiwrite_encryption_flag(tmp_path):

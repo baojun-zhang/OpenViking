@@ -5,9 +5,10 @@
 //! `FsContext` from paths in background tasks.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -45,13 +46,23 @@ impl FsContextResolver for DefaultFsContextResolver {
     }
 }
 
-/// Internal file names for metadata files.
-const REDIRECT_FILE: &str = ".redirect.json";
-const SYNC_LOG_FILE: &str = ".sync_log.json";
+/// Internal file name for path lock markers.
+pub(crate) const PATH_LOCK_FILE: &str = ".path.ovlock";
+/// Internal file name for redirect metadata.
+pub(crate) const REDIRECT_FILE: &str = ".redirect.json";
+/// Internal file name for sync-log metadata.
+pub(crate) const SYNC_LOG_FILE: &str = ".sync_log.json";
+/// Single Rust-side source of truth for hidden multi-write internal file names.
+pub(crate) const MULTIWRITE_INTERNAL_NAMES: &[&str] =
+    &[PATH_LOCK_FILE, SYNC_LOG_FILE, REDIRECT_FILE];
 const GLOBAL_STATE_FILE: &str = "/local/_system/.multiwrite.global.json";
 const GLOBAL_STATE_VERSION: u32 = 1;
 const DEFAULT_META_CACHE_CAPACITY: usize = 1024;
 const DEFAULT_META_CACHE_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_DIR_LOCK_CAPACITY: usize = 2048;
+const DEFAULT_DIR_LOCK_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_PATH_QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_PATH_QUEUE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 struct DirMetaCacheEntry {
@@ -59,6 +70,62 @@ struct DirMetaCacheEntry {
     sync_log: SyncLogMeta,
     cached_at: Instant,
     last_accessed_at: Instant,
+}
+
+struct TrackedLock {
+    mutex: Arc<Mutex<()>>,
+    active_users: AtomicUsize,
+    last_used: StdMutex<Instant>,
+}
+
+struct TrackedLockGuard {
+    owner: Arc<TrackedLock>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl TrackedLock {
+    /// Create a new tracked async mutex with usage metadata.
+    fn new() -> Self {
+        Self {
+            mutex: Arc::new(Mutex::new(())),
+            active_users: AtomicUsize::new(0),
+            last_used: StdMutex::new(Instant::now()),
+        }
+    }
+
+    /// Lock the underlying mutex and track one active user.
+    pub(crate) async fn lock(self: &Arc<Self>) -> TrackedLockGuard {
+        self.active_users.fetch_add(1, Ordering::SeqCst);
+        *self.last_used.lock().unwrap() = Instant::now();
+        let guard = self.mutex.clone().lock_owned().await;
+        TrackedLockGuard {
+            owner: Arc::clone(self),
+            _guard: guard,
+        }
+    }
+
+    /// Return whether this lock is idle and stale enough to prune.
+    fn is_prunable(&self, now: Instant, ttl: Duration) -> bool {
+        if self.active_users.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        if now.duration_since(*self.last_used.lock().unwrap()) <= ttl {
+            return false;
+        }
+        self.mutex.clone().try_lock_owned().is_ok()
+    }
+
+    /// Return the last access time of this lock.
+    fn last_used_at(&self) -> Instant {
+        *self.last_used.lock().unwrap()
+    }
+}
+
+impl Drop for TrackedLockGuard {
+    fn drop(&mut self) {
+        self.owner.active_users.fetch_sub(1, Ordering::SeqCst);
+        *self.owner.last_used.lock().unwrap() = Instant::now();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,7 +153,11 @@ pub struct MetaStateStore {
     /// Primary backend (may be encrypted)
     primary_backend: Arc<dyn FileSystem>,
     /// Per-directory locks for serialized read-modify-write
-    dir_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    dir_locks: Mutex<HashMap<String, Arc<TrackedLock>>>,
+    /// Maximum number of directory lock entries to retain.
+    dir_lock_capacity: usize,
+    /// Time-to-live for one idle directory lock entry.
+    dir_lock_ttl: Duration,
     /// In-memory directory metadata cache to reduce repeated full JSON reads.
     meta_cache: Mutex<HashMap<String, DirMetaCacheEntry>>,
     /// Maximum number of directory cache entries to retain.
@@ -121,6 +192,8 @@ impl MetaStateStore {
         Self {
             primary_backend,
             dir_locks: Mutex::new(HashMap::new()),
+            dir_lock_capacity: DEFAULT_DIR_LOCK_CAPACITY,
+            dir_lock_ttl: DEFAULT_DIR_LOCK_TTL,
             meta_cache: Mutex::new(HashMap::new()),
             meta_cache_capacity: meta_cache_capacity.max(1),
             meta_cache_ttl,
@@ -129,12 +202,40 @@ impl MetaStateStore {
     }
 
     /// Get or create a per-directory lock.
-    async fn get_dir_lock(&self, dir: &str) -> Arc<Mutex<()>> {
+    async fn get_dir_lock(&self, dir: &str) -> Arc<TrackedLock> {
         let mut locks = self.dir_locks.lock().await;
-        locks
+        let lock = locks
             .entry(dir.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .or_insert_with(|| Arc::new(TrackedLock::new()))
+            .clone();
+        Self::prune_tracked_locks(&mut locks, self.dir_lock_capacity, self.dir_lock_ttl);
+        lock
+    }
+
+    /// Prune stale tracked lock entries and keep the map bounded.
+    fn prune_tracked_locks(
+        locks: &mut HashMap<String, Arc<TrackedLock>>,
+        capacity: usize,
+        ttl: Duration,
+    ) {
+        let now = Instant::now();
+        locks.retain(|_, entry| !entry.is_prunable(now, ttl));
+        while locks.len() > capacity {
+            let oldest_key = locks
+                .iter()
+                .filter(|(_, entry)| entry.active_users.load(Ordering::SeqCst) == 0)
+                .min_by_key(|(_, entry)| entry.last_used_at())
+                .map(|(key, _)| key.clone());
+            if let Some(oldest_key) = oldest_key {
+                if let Some(entry) = locks.get(&oldest_key) {
+                    if entry.mutex.clone().try_lock_owned().is_ok() {
+                        locks.remove(&oldest_key);
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
     }
 
     /// Return the dedicated `_system` context used by global metadata.
@@ -231,6 +332,11 @@ impl MetaStateStore {
             },
         );
         self.prune_meta_cache().await;
+    }
+
+    /// Invalidate one directory metadata cache entry.
+    pub async fn invalidate_dir_cache(&self, dir: &str) {
+        self.meta_cache.lock().await.remove(dir);
     }
 
     /// Remove expired cache entries and trim the cache to capacity.
@@ -479,24 +585,55 @@ impl MetaStateStore {
 /// Ensures that multiple writes to the same path are executed in FIFO order
 /// on backup backends, preventing out-of-order application.
 pub struct PathSerializer {
-    queues: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    queues: Mutex<HashMap<String, Arc<TrackedLock>>>,
+    capacity: usize,
+    ttl: Duration,
 }
 
 impl PathSerializer {
     /// Create a new PathSerializer.
     pub fn new() -> Self {
+        Self::with_limits(DEFAULT_PATH_QUEUE_CAPACITY, DEFAULT_PATH_QUEUE_TTL)
+    }
+
+    /// Create a new PathSerializer with explicit queue limits.
+    pub fn with_limits(capacity: usize, ttl: Duration) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+            ttl,
         }
     }
 
-    /// Get or create a per-path serialization lock.
-    pub async fn get_path_lock(&self, path: &str) -> Arc<Mutex<()>> {
+    /// Run one async operation under the per-path serialization lock.
+    pub async fn with_path_lock<F, Fut, T>(&self, path: &str, op: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
         let mut queues = self.queues.lock().await;
-        queues
+        let lock = queues
             .entry(path.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .or_insert_with(|| Arc::new(TrackedLock::new()))
+            .clone();
+        MetaStateStore::prune_tracked_locks(&mut queues, self.capacity, self.ttl);
+        drop(queues);
+
+        let _guard = lock.lock().await;
+        op().await
+    }
+
+    /// Return the number of tracked queue entries.
+    #[cfg(test)]
+    pub async fn len(&self) -> usize {
+        self.queues.lock().await.len()
+    }
+
+    /// Prune stale idle queue entries.
+    #[cfg(test)]
+    pub async fn prune_stale(&self) {
+        let mut queues = self.queues.lock().await;
+        MetaStateStore::prune_tracked_locks(&mut queues, self.capacity, self.ttl);
     }
 }
 
@@ -590,5 +727,14 @@ mod tests {
 
         let result = store.get_sync_log_meta("/local/acct/docs", &ctx).await;
         assert!(result.is_err(), "corrupted metadata must fail fast");
+    }
+
+    #[tokio::test]
+    async fn test_path_serializer_prunes_stale_entries() {
+        let serializer = PathSerializer::with_limits(1, Duration::from_millis(1));
+        serializer.with_path_lock("/hot/path", || async {}).await;
+        std::thread::sleep(Duration::from_millis(5));
+        serializer.prune_stale().await;
+        assert_eq!(serializer.len().await, 0);
     }
 }

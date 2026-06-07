@@ -177,6 +177,35 @@ class RedirectPolicyConfig(BaseModel):
     )
 
 
+class BackendBaseConfig(BaseModel):
+    """Shared backend description used by backup items."""
+
+    name: str = Field(description="Logical backend name")
+    backend: str = Field(description="User-facing backend type name")
+    timeout: int = Field(default=10, description="RAGFS request timeout (seconds)")
+    backend_params: Optional[Any] = Field(
+        default=None,
+        exclude=True,
+        description="Normalized backend-specific nested config extracted from the backend-named field.",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_backend_specific_params(cls, data: Any) -> Any:
+        """Capture the backend-specific nested config while rejecting unrelated unknown fields."""
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        backend = normalized.get("backend")
+        if isinstance(backend, str) and backend in normalized:
+            normalized["backend_params"] = normalized.pop(backend)
+
+        return normalized
+
+
 class AGFSConfig(BaseModel):
     """Configuration for RAGFS (Rust-based AGFS)."""
 
@@ -318,8 +347,13 @@ class AGFSConfig(BaseModel):
 
         # ── Global uniqueness validation ──
         if self.backups is not None:
+            if self.backups.sync_type == "sync" and self.backups.write_ack_count is None:
+                raise ValueError("backups.write_ack_count is required when sync_type is 'sync'")
+
             names_seen: set = {self.name}
             for item in self.backups.items:
+                if item.name == "primary":
+                    raise ValueError("backup backend name 'primary' is reserved")
                 if item.name in names_seen:
                     raise ValueError(
                         f"Duplicate backend name '{item.name}': all backend names "
@@ -343,8 +377,8 @@ class AGFSConfig(BaseModel):
         return self
 
 
-class BackupItemConfig(AGFSConfig):
-    """Single backup backend item configuration. Inherits name/backend/timeout/s3 from AGFSConfig."""
+class BackupBackendItemConfig(BackendBaseConfig):
+    """Single backup backend item configuration."""
 
     encryption: Optional[BackupEncryptionConfig] = Field(
         default=None, description="Per-backend encryption config"
@@ -356,7 +390,19 @@ class BackupItemConfig(AGFSConfig):
         default=None, description="Exclude policies"
     )
 
-    model_config = {"extra": "allow"}
+    @model_validator(mode="after")
+    def validate_config(self):
+        """Validate backup-specific constraints."""
+        if not self.name:
+            raise ValueError("backup backend name must not be empty")
+        if not self.backend:
+            raise ValueError("backup backend type must not be empty")
+        if self.backend == "s3" and self.backend_params is not None:
+            S3Config.model_validate(self.backend_params).validate_config()
+        return self
+
+
+BackupItemConfig = BackupBackendItemConfig
 
 
 class BackupsConfig(BaseModel):
@@ -387,4 +433,15 @@ class BackupsConfig(BaseModel):
     read_probe_cache_ttl_ms: Optional[int] = Field(
         default=None, description="Read-route probe cache TTL in milliseconds"
     )
-    items: List[BackupItemConfig] = Field(description="Backup items")
+    items: List[BackupBackendItemConfig] = Field(description="Backup items")
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_config(self):
+        """Validate backup container invariants."""
+        if self.sync_type not in {"sync", "async"}:
+            raise ValueError("backups.sync_type must be one of: 'sync', 'async'")
+        if self.sync_type == "sync" and self.write_ack_count is None:
+            raise ValueError("backups.write_ack_count is required when sync_type is 'sync'")
+        return self
