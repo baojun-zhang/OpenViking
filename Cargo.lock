@@ -3720,6 +3720,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "globset",
  "grep",
  "grep-matcher",
  "grep-regex",
