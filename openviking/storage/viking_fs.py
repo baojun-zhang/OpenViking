@@ -855,13 +855,11 @@ class VikingFS:
 
             files_scanned_set.add(file_uri)
 
-            results.append(
-                {
-                    "line": match.get("line", match.get("line_number", 0)),
-                    "uri": file_uri,
-                    "content": match.get("content", ""),
-                }
-            )
+            results.append({
+                "line": match.get("line", match.get("line_number", 0)),
+                "uri": file_uri,
+                "content": match.get("content", ""),
+            })
 
             if node_limit and len(results) >= node_limit:
                 break
@@ -992,16 +990,64 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive."""
-        entries = await self.tree(uri, node_limit=1000000, level_limit=None, ctx=ctx)
-        base_uri = uri.rstrip("/")
+        _ensure_non_empty_search_query(pattern)
+        self._ensure_access(uri, ctx)
+        real_ctx = self._ctx_or_default(ctx)
+        primary_path = self._uri_to_path(uri, ctx=ctx)
+        path: Optional[str] = None
+        for candidate_path in self._read_paths(uri, ctx=ctx):
+            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
+                continue
+            if await self._agfs_path_exists(candidate_path):
+                path = candidate_path
+                break
+        if path is None:
+            if self._is_legacy_session_root_uri(uri):
+                return {"matches": [], "count": 0}
+            raise NotFoundError(uri, "directory")
+
+        page_size = self._glob_page_size(node_limit)
+        continuation_token: Optional[str] = None
         matches = []
-        for entry in entries:
-            rel_path = entry.get("rel_path", "")
-            if PurePath(rel_path).match(pattern):
-                matches.append(f"{base_uri}/{rel_path}")
-        # Now apply node limit to the filtered matches
-        if node_limit is not None and node_limit > 0:
-            matches = matches[:node_limit]
+        while True:
+            page = await self._async_agfs.glob_directory(
+                path,
+                pattern,
+                show_hidden=False,
+                page_size=page_size,
+                level_limit=None,
+                continuation_token=continuation_token,
+            )
+
+            for entry in page.get("entries", []):
+                if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+                    return {"matches": matches, "count": len(matches)}
+                if not self._is_path_entry_visible(
+                    entry["path"],
+                    entry.get("name") or entry["path"].rsplit("/", 1)[-1],
+                    path,
+                    real_ctx,
+                ):
+                    continue
+                if not await self._read_path_visible(uri, entry["path"], primary_path, real_ctx):
+                    continue
+                rel_path = entry.get("rel_path", "")
+                # Re-check with Python to keep the existing PurePath semantics as the final oracle.
+                if not PurePath(rel_path).match(pattern):
+                    continue
+                entry_uri = self._alias_uri_for_path(
+                    request_uri=uri,
+                    base_path=path,
+                    entry_path=entry["path"],
+                    ctx=ctx,
+                )
+                matches.append(entry_uri)
+
+            if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+                return {"matches": matches, "count": len(matches)}
+            continuation_token = page.get("next_token")
+            if not continuation_token:
+                break
         return {"matches": matches, "count": len(matches)}
 
     async def _batch_fetch_abstracts(
@@ -1115,17 +1161,15 @@ class VikingFS:
         ):
             info = entry["info"]
             new_entry = dict(entry.get("extra", {}))
-            new_entry.update(
-                {
-                    "name": info["name"],
-                    "size": info["size"],
-                    "mode": info["mode"],
-                    "modTime": info["modTime"],
-                    "isDir": info["isDir"],
-                    "rel_path": entry["rel_path"],
-                    "uri": entry_uri,
-                }
-            )
+            new_entry.update({
+                "name": info["name"],
+                "size": info["size"],
+                "mode": info["mode"],
+                "modTime": info["modTime"],
+                "isDir": info["isDir"],
+                "rel_path": entry["rel_path"],
+                "uri": entry_uri,
+            })
             result.append(new_entry)
         return result
 
@@ -1150,15 +1194,13 @@ class VikingFS:
         ):
             info = entry["info"]
             is_dir = info["isDir"]
-            result.append(
-                {
-                    "uri": entry_uri,
-                    "size": 0 if is_dir else info["size"],
-                    "isDir": is_dir,
-                    "modTime": format_iso8601(parse_iso_datetime(info["modTime"])),
-                    "rel_path": entry["rel_path"],
-                }
-            )
+            result.append({
+                "uri": entry_uri,
+                "size": 0 if is_dir else info["size"],
+                "isDir": is_dir,
+                "modTime": format_iso8601(parse_iso_datetime(info["modTime"])),
+                "rel_path": entry["rel_path"],
+            })
 
         await self._batch_fetch_abstracts(result, abs_limit, ctx=ctx)
 
@@ -1664,25 +1706,15 @@ class VikingFS:
                 return True
         return False
 
-    def _is_tree_entry_visible(
-        self, entry: Dict[str, Any], base_path: str, ctx: RequestContext
+    def _is_path_entry_visible(
+        self, entry_path: str, name: str, base_path: str, ctx: RequestContext
     ) -> bool:
-        """Check visibility for a single TreeEntry returned by Rust tree_directory.
-
-        Applies three layers of filtering:
-        1. Ancestor chain — if any ancestor directory would be filtered by _ls_entries,
-           all descendants are invisible.
-        2. Self — the entry's own name must pass _ls_entries at its parent level.
-        3. ACL — the entry must be accessible by the requesting context.
-        """
-        entry_path = entry["path"]
-
+        """Check visibility for one flattened path entry returned by Rust."""
         if self._ancestor_is_filtered(entry_path, base_path):
             return False
 
         entry_parts = [p for p in entry_path.strip("/").split("/") if p]
         if entry_parts:
-            name = entry_parts[-1]
             parent_parts = entry_parts[:-1]
             parent_path = "/" + "/".join(parent_parts) if parent_parts else "/"
             if not self._is_name_visible_at_path(name, parent_path):
@@ -1694,10 +1726,26 @@ class VikingFS:
 
         return True
 
+    def _is_tree_entry_visible(
+        self, entry: Dict[str, Any], base_path: str, ctx: RequestContext
+    ) -> bool:
+        """Check visibility for a single TreeEntry returned by Rust tree_directory."""
+        entry_path = entry["path"]
+        entry_info = entry.get("info", {})
+        name = entry_info.get("name") or entry_path.rstrip("/").rsplit("/", 1)[-1]
+        return self._is_path_entry_visible(entry_path, name, base_path, ctx)
+
     # Over-fetch multiplier for bounded tree traversal. When a node_limit is
     # set, we push down node_limit * this factor as the raw-node limit to Rust,
     # leaving headroom for ACL/internal-name filtering before re-fetching.
     _TREE_OVERFETCH_FACTOR = 4
+    _GLOB_PAGE_SIZE_DEFAULT = 1024
+
+    def _glob_page_size(self, node_limit: Optional[int]) -> int:
+        """Return the backend page size used by glob_directory."""
+        if node_limit is None or node_limit <= 0:
+            return self._GLOB_PAGE_SIZE_DEFAULT
+        return node_limit
 
     async def _iter_visible_tree_entries(
         self,
@@ -1922,14 +1970,16 @@ class VikingFS:
         entry_path: str,
         ctx: Optional[RequestContext],
     ) -> str:
-        normalized_request, request_parts = self._normalized_uri_parts(request_uri)
-        if not request_parts or request_parts[0] not in {"agent", "session"}:
-            return self._path_to_uri(entry_path, ctx=ctx)
         base = base_path.rstrip("/")
+        normalized_request, _request_parts = self._normalized_uri_parts(request_uri)
+        request_root = normalized_request if normalized_request == "viking://" else normalized_request.rstrip("/")
         rel_path = entry_path[len(base) :].strip("/") if entry_path.startswith(base) else ""
         if not rel_path:
-            return normalized_request.rstrip("/")
-        return f"{normalized_request.rstrip('/')}/{rel_path}"
+            return request_root
+        if entry_path.startswith(base):
+            separator = "" if request_root.endswith("://") else "/"
+            return f"{request_root}{separator}{rel_path}"
+        return self._path_to_uri(entry_path, ctx=ctx)
 
     async def _agfs_path_exists(self, path: str) -> bool:
         try:
