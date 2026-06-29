@@ -131,6 +131,24 @@ impl EncryptionWrappedFS {
         }
         Ok(())
     }
+
+    /// Build the sibling hidden `.encrypt` temp-file path for a final file path.
+    fn encrypted_temp_path(path: &str) -> String {
+        let (parent, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => (parent, name),
+            None => ("", path),
+        };
+        let temp_name = if name.starts_with('.') {
+            format!("{}.encrypt", name)
+        } else {
+            format!(".{}.encrypt", name)
+        };
+        if parent.is_empty() {
+            format!("/{}", temp_name)
+        } else {
+            format!("{}/{}", parent, temp_name)
+        }
+    }
 }
 
 /// Slice `data` by `(offset, size)` with `size == 0` meaning "to end", matching plugin read semantics.
@@ -211,7 +229,27 @@ impl FileSystem for EncryptionWrappedFS {
         let ct = crypto::aes_gcm_encrypt(&file_key, &data_iv, data)?;
         let enc_key = crypto::aes_gcm_encrypt(&account_key, &key_iv, &file_key)?;
         let envelope = crypto::build_envelope(self.provider_type, &enc_key, &key_iv, &data_iv, &ct);
-        self.inner.write(path, &envelope, 0, flags).await
+        let temp_path = Self::encrypted_temp_path(path);
+
+        match self.inner.remove(&temp_path).await {
+            Ok(()) | Err(Error::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+
+        let written = self
+            .inner
+            .write(&temp_path, &envelope, 0, WriteFlag::Create)
+            .await?;
+        if written != envelope.len() as u64 {
+            return Err(Error::internal(format!(
+                "encrypted temp write incomplete: wrote {} of {} bytes",
+                written,
+                envelope.len()
+            )));
+        }
+
+        self.inner.rename(&temp_path, path).await?;
+        Ok(written)
     }
 
     async fn grep(
@@ -552,5 +590,30 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_replaces_stale_hidden_temp_file_before_publish() {
+        let inner = memfs_stack().await;
+        let enc = EncryptionWrappedFS::new(inner.clone(), [6u8; 32], crypto::PROVIDER_LOCAL);
+
+        inner
+            .write("/mem/.a.txt.encrypt", b"stale-temp", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+
+        FS_CTX
+            .scope(ctx("tenant-1"), async {
+                enc.write("/mem/a.txt", b"fresh", 0, WriteFlag::Create)
+                    .await
+                    .unwrap();
+                let out = enc.read("/mem/a.txt", 0, 0).await.unwrap();
+                assert_eq!(out, b"fresh");
+            })
+            .await;
+
+        assert!(inner.stat("/mem/.a.txt.encrypt").await.is_err());
+        let raw = inner.read("/mem/a.txt", 0, 0).await.unwrap();
+        assert!(crypto::is_encrypted(&raw));
     }
 }
