@@ -798,8 +798,58 @@ impl FileSystem for LocalFileSystem {
             }
         }
 
-        fs::rename(&src_local, &dst_local)
-            .map_err(|e| Error::plugin(format!("failed to replace: {}", e)))?;
+          // Keep replace semantics explicit instead of inheriting rename behavior:
+          // encrypted publish needs an overwrite-on-destination move.
+          #[cfg(windows)]
+          {
+              use std::ffi::OsStr;
+              use std::io;
+              use std::os::windows::ffi::OsStrExt;
+
+              type BOOL = i32;
+              type DWORD = u32;
+              type LPCWSTR = *const u16;
+
+              const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
+              const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;
+
+              unsafe extern "system" {
+                  fn MoveFileExW(
+                      lpExistingFileName: LPCWSTR,
+                      lpNewFileName: LPCWSTR,
+                      dwFlags: DWORD,
+                  ) -> BOOL;
+              }
+
+              let src_wide: Vec<u16> = OsStr::new(src_local.as_os_str())
+                  .encode_wide()
+                  .chain(std::iter::once(0))
+                  .collect();
+              let dst_wide: Vec<u16> = OsStr::new(dst_local.as_os_str())
+                  .encode_wide()
+                  .chain(std::iter::once(0))
+                  .collect();
+
+              let replaced = unsafe {
+                  MoveFileExW(
+                      src_wide.as_ptr(),
+                      dst_wide.as_ptr(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                  )
+              };
+              if replaced == 0 {
+                  return Err(Error::plugin(format!(
+                      "failed to replace: {}",
+                      io::Error::last_os_error()
+                  )));
+              }
+          }
+
+          #[cfg(not(windows))]
+          {
+              fs::rename(&src_local, &dst_local)
+                  .map_err(|e| Error::plugin(format!("failed to replace: {}", e)))?;
+          }
 
         Ok(())
     }

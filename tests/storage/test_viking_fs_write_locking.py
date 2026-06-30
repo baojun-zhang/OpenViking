@@ -75,7 +75,7 @@ async def test_encrypted_writes_lock_final_and_temp_paths(
         (
             [
                 "/local/default/resources/note.md",
-                "/local/default/temp/.encrypt_stage/823e7fa1698ab91f00481e4960d38764c6d77fa9230a86a0cca178bf87becc93.encrypt",
+                "/local/default/temp/.encrypt_stage/571a25aab6e6bca05a60a6e4aec646389a9ac38237daf55ceda4f72f3d1b4afe.encrypt",
             ],
             "exact",
             {"handle": None},
@@ -89,11 +89,15 @@ async def test_encrypted_writes_lock_final_and_temp_paths(
     [
         (
             "/local/default/resources/.abstract.md",
-            "/local/default/temp/.encrypt_stage/86cb67683e7cee2a07dce5921d450af2b6d5757bec1f05f5c1738b966cdc8edd.encrypt",
+            "/local/default/temp/.encrypt_stage/1ea2c4fea9d85474a57fd03cac44d3bbe7c85fd6eb3c678c54044c4f49ecdbf7.encrypt",
         ),
         (
             "/local/default/resources/note.md",
-            "/local/default/temp/.encrypt_stage/823e7fa1698ab91f00481e4960d38764c6d77fa9230a86a0cca178bf87becc93.encrypt",
+            "/local/default/temp/.encrypt_stage/571a25aab6e6bca05a60a6e4aec646389a9ac38237daf55ceda4f72f3d1b4afe.encrypt",
+        ),
+        (
+            "/s3/bucket/docs/a.md",
+            "/s3/bucket/temp/.encrypt_stage/2a95445c0cdc88c4efdf32724651d61f72990a95d445fe0ce146150e39e5630d.encrypt",
         ),
         (
             "/note.md",

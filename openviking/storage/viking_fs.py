@@ -337,18 +337,29 @@ class VikingFS:
 
         return normalized, parts
 
-    def _encrypted_temp_path(self, path: str) -> str:
-        """Build the deterministic internal `.encrypt` temp-file path for a final file path."""
+    # TODO: Once pathlock moves down into ragfs, stop reconstructing the
+    # encrypted mount-relative path in Python and derive the lock target from
+    # the same backend-side source of truth.
+    def _encrypted_mount_relative_path(self, path: str) -> tuple[str, str]:
+        """Return the mount prefix and mount-relative path used by Rust encrypted writes."""
         normalized = path if path.startswith("/") else f"/{path}"
         parts = [part for part in normalized.split("/") if part]
-        if len(parts) >= 2 and parts[0] == "local":
-            temp_root = f"/local/{parts[1]}/temp/.encrypt_stage"
-        elif len(parts) >= 2:
-            temp_root = f"/{parts[0]}/temp/.encrypt_stage"
+        if len(parts) < 2:
+            return "", normalized
+        return f"/{parts[0]}", f"/{'/'.join(parts[1:])}"
+
+    def _encrypted_temp_path(self, path: str) -> str:
+        """Build the deterministic internal `.encrypt` temp-file path for a final file path."""
+        mount_prefix, relative_path = self._encrypted_mount_relative_path(path)
+        relative_parts = [part for part in relative_path.split("/") if part]
+        if len(relative_parts) >= 2 and relative_parts[0] == "local":
+            temp_root = f"/local/{relative_parts[1]}/temp/.encrypt_stage"
+        elif len(relative_parts) >= 2:
+            temp_root = f"/{relative_parts[0]}/temp/.encrypt_stage"
         else:
             temp_root = "/temp/.encrypt_stage"
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        return f"{temp_root}/{digest}.encrypt"
+        digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+        return f"{mount_prefix}{temp_root}/{digest}.encrypt"
 
     def _encrypted_write_lock_paths(self, path: str) -> List[str]:
         """Return the final and temp paths protected by the encrypted write protocol."""
