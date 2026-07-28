@@ -159,7 +159,12 @@ async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch)
     assert fake_fs.contents["viking://resources/root/.abstract.md"] == "old abstract"
     assert fake_fs.deleted_temp == ["viking://temp/import"]
     assert fake_fs.mutation_leases
-    assert all(mutation_lease is lease for _, _, mutation_lease in fake_fs.mutation_leases)
+    assert all(
+        mutation_lease is lease
+        for operation, _, mutation_lease in fake_fs.mutation_leases
+        if operation != "delete_temp"
+    )
+    assert fake_fs.mutation_leases[-1] == ("delete_temp", "viking://temp/import", None)
 
 
 @pytest.mark.asyncio

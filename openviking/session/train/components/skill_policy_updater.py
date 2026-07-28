@@ -101,7 +101,7 @@ class SkillPolicyUpdater:
                 continue
             try:
                 skill_root = _root_uri_from_skill_md(old_file.uri)
-                await viking_fs.rm(skill_root, ctx=ctx)
+                await viking_fs.rm(skill_root, ctx=ctx, lease_ref=transaction_handle)
                 deleted_uris.append(old_file.uri)
             except Exception as exc:
                 delete_errors.append(f"{old_file.uri}: {exc}")

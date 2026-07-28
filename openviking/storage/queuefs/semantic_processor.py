@@ -942,7 +942,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # before the temp tree is deleted below.
         await self._rewrite_target_image_uris(root_uri, target_uri, ctx=ctx, lock=lock)
         try:
-            await viking_fs.delete_temp(root_uri, ctx=ctx, lease_ref=lock)
+            await viking_fs.delete_temp(root_uri, ctx=ctx)
         except Exception as e:
             logger.error(f"[SyncDiff] Failed to delete root directory {root_uri}: {e}")
         return diff

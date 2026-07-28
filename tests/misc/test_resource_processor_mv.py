@@ -151,7 +151,7 @@ async def test_resource_processor_first_add_summarizes_from_committed_uri(monkey
     assert fake_fs.persist_calls == [
         ("viking://temp/root_tmp", "viking://resources/root", {"id": "lock-1"})
     ]
-    assert fake_fs.delete_temp_calls == [("viking://temp/tmpdir", {"id": "lock-1"})]
+    assert fake_fs.delete_temp_calls == [("viking://temp/tmpdir", None)]
     assert summarize_calls[0]["temp_uris"] == ["viking://resources/root"]
     assert summarize_calls[0]["target_preexisting"] is False
 

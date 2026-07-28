@@ -1727,18 +1727,19 @@ mod tests {
         };
         use crate::plugins::MemFSPlugin;
 
-        let provider = Arc::new(MemoryCacheProvider::new());
+        let cache_provider = Arc::new(MemoryCacheProvider::new());
         let mfs = Arc::new(MountableFS::with_cache(
-            provider.clone(),
+            cache_provider.clone(),
             CacheNamespace::new("encrypted-mount-test"),
             CachePolicy::default(),
         ));
         mfs.register_plugin(MemFSPlugin).await;
         mfs.set_encryption_config(Some([9u8; 32]), Some(1)).await;
-        let provider: Arc<dyn PathLockProvider> = Arc::new(MemoryPathLockProvider::new());
+        let pathlock_provider: Arc<dyn PathLockProvider> =
+            Arc::new(MemoryPathLockProvider::new());
         let manager = Arc::new(PathLockManager::new(
             mfs.clone() as Arc<dyn FileSystem>,
-            provider,
+            pathlock_provider,
             PathLockConfig::default(),
         ));
         mfs.set_pathlock_manager(manager).await;
@@ -1779,13 +1780,13 @@ mod tests {
             "missing account context must not receive cached plaintext"
         );
 
-        let file_key = provider
+        let file_key = cache_provider
             .keys()
             .await
             .into_iter()
             .find(|key| key.contains(":file:"))
             .expect("encrypted read should populate one file cache object");
-        let encoded = provider
+        let encoded = cache_provider
             .get(&file_key)
             .await
             .unwrap()

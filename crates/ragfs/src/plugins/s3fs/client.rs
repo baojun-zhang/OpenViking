@@ -110,14 +110,28 @@ where
     }
 }
 
-/// Return true when an S3 SDK error string represents a failed conditional request.
-fn is_s3_conditional_failure(message: &str) -> bool {
-    message.contains("PreconditionFailed")
-        || message.contains("ConditionalRequestConflict")
-        || message.contains("status: 412")
-        || message.contains("status=412")
-        || message.contains("status: 409")
-        || message.contains("status=409")
+/// Return true when an S3 SDK service error represents a failed conditional request.
+fn is_s3_conditional_failure<E, R>(sdk_err: &SdkError<E, R>) -> bool
+where
+    E: ProvideErrorMetadata,
+    R: 'static,
+{
+    use std::any::Any;
+
+    let SdkError::ServiceError(service_err) = sdk_err else {
+        return false;
+    };
+
+    if matches!(
+        service_err.err().code(),
+        Some("PreconditionFailed" | "ConditionalRequestConflict")
+    ) {
+        return true;
+    }
+
+    (service_err.raw() as &dyn Any)
+        .downcast_ref::<HttpResponse>()
+        .is_some_and(|response| matches!(response.status().as_u16(), 409 | 412))
 }
 
 fn format_generic_s3_error(
@@ -619,8 +633,7 @@ impl S3Client {
         }
 
         request.send().await.map_err(|e| {
-            let message = e.to_string();
-            if is_s3_conditional_failure(&message) {
+            if is_s3_conditional_failure(&e) {
                 Error::already_exists(key)
             } else {
                 format_sdk_s3_error(
@@ -651,8 +664,7 @@ impl S3Client {
         }
 
         request.send().await.map_err(|e| {
-            let message = e.to_string();
-            if is_s3_conditional_failure(&message) {
+            if is_s3_conditional_failure(&e) {
                 Error::AlreadyExists(key.to_string())
             } else {
                 format_sdk_s3_error(
@@ -699,8 +711,7 @@ impl S3Client {
             .send()
             .await
             .map_err(|e| {
-                let message = e.to_string();
-                if is_s3_conditional_failure(&message) {
+                if is_s3_conditional_failure(&e) {
                     Error::AlreadyExists(key.to_string())
                 } else {
                     format_sdk_s3_error(

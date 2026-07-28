@@ -361,7 +361,6 @@ class ResourceProcessor:
                         await viking_fs.delete_temp(
                             parse_result.temp_dir_path,
                             ctx=ctx,
-                            lease_ref=resource_lock,
                         )
                         temp_uri = root_uri
                         source_committed = True
@@ -489,7 +488,6 @@ class ResourceProcessor:
                         await viking_fs.delete_temp(
                             temp_dir_path,
                             ctx=ctx,
-                            lease_ref=resource_lock,
                         )
             finally:
                 await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
