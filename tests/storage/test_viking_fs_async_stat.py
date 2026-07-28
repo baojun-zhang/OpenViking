@@ -3,34 +3,27 @@
 
 import pytest
 
-import openviking.storage.transaction as transaction_module
 from openviking.storage.viking_fs import VikingFS
 
 
 class _StatAGFS:
+    def __init__(self):
+        self.pathlock_is_locked_calls = []
+
+    async def pathlock_is_locked(self, path):
+        self.pathlock_is_locked_calls.append(path)
+        return True
+
     def stat(self, path):
         return {"name": path.rsplit("/", 1)[-1], "isDir": False}
 
 
-class _AsyncOnlyLockManager:
-    def __init__(self):
-        self.paths = []
-
-    async def is_path_locked_async(self, path, ignore_stale=True):
-        self.paths.append((path, ignore_stale))
-        return True
-
-    def is_path_locked(self, path, ignore_stale=True):
-        raise AssertionError("stat() should use the async lock lookup")
-
-
 @pytest.mark.asyncio
 async def test_stat_uses_async_lock_lookup(monkeypatch):
-    lock_manager = _AsyncOnlyLockManager()
-    monkeypatch.setattr(transaction_module, "get_lock_manager", lambda: lock_manager)
+    agfs = _StatAGFS()
 
-    fs = VikingFS(agfs=_StatAGFS())
+    fs = VikingFS(agfs=agfs)
     result = await fs.stat("viking://resources/file.txt")
 
     assert result["isLocked"] is True
-    assert lock_manager.paths == [("/local/default/resources/file.txt", True)]
+    assert agfs.pathlock_is_locked_calls == ["/local/default/resources/file.txt"]

@@ -93,6 +93,138 @@ impl LocalFileSystem {
         }
     }
 
+    /// Return whether an open file still identifies the file currently stored at `path`.
+    fn open_file_matches_path(file: &fs::File, path: &Path) -> Result<bool> {
+        let open_metadata = file
+            .metadata()
+            .map_err(|e| Error::plugin(format!("failed to stat open CAS file: {}", e)))?;
+        let path_metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::plugin(format!(
+                    "failed to stat CAS path '{}': {}",
+                    path.display(),
+                    e
+                )));
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(open_metadata.dev() == path_metadata.dev()
+                && open_metadata.ino() == path_metadata.ino())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Ok(open_metadata.volume_serial_number() == path_metadata.volume_serial_number()
+                && open_metadata.file_index() == path_metadata.file_index())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (open_metadata, path_metadata);
+            Err(Error::invalid_operation(
+                "CAS file identity checks are unsupported on this platform",
+            ))
+        }
+    }
+
+    /// Replace local file content only when the locked file content matches `expected`.
+    fn compare_and_write_locked(
+        local_path: PathBuf,
+        expected: Vec<u8>,
+        new_data: Vec<u8>,
+    ) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&local_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound(local_path.to_string_lossy().to_string())
+                } else {
+                    Error::plugin(format!("failed to open file for compare_and_write: {}", e))
+                }
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let mut file = lock
+            .write()
+            .map_err(|e| Error::plugin(format!("failed to lock for compare_and_write: {}", e)))?;
+        if !Self::open_file_matches_path(&file, &local_path)? {
+            return Ok(false);
+        }
+
+        let mut current = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to seek for compare_and_write: {}", e)))?;
+        file.read_to_end(&mut current)
+            .map_err(|e| Error::plugin(format!("failed to read for compare_and_write: {}", e)))?;
+        if current != expected {
+            return Ok(false);
+        }
+
+        file.set_len(0)
+            .map_err(|e| Error::plugin(format!("failed to truncate for compare_and_write: {}", e)))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to rewind for compare_and_write: {}", e)))?;
+        file.write_all(&new_data)
+            .map_err(|e| Error::plugin(format!("failed to write for compare_and_write: {}", e)))?;
+        file.sync_data()
+            .map_err(|e| Error::plugin(format!("failed to sync for compare_and_write: {}", e)))?;
+        Ok(true)
+    }
+
+    /// Remove a local file only when the locked file content matches `expected`.
+    fn compare_and_remove_locked(local_path: PathBuf, expected: Vec<u8>) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&local_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound(local_path.to_string_lossy().to_string())
+                } else {
+                    Error::plugin(format!("failed to open file for compare_and_remove: {}", e))
+                }
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let mut file = lock
+            .write()
+            .map_err(|e| Error::plugin(format!("failed to lock for compare_and_remove: {}", e)))?;
+        if !Self::open_file_matches_path(&file, &local_path)? {
+            return Ok(false);
+        }
+
+        let mut current = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to seek for compare_and_remove: {}", e)))?;
+        file.read_to_end(&mut current)
+            .map_err(|e| Error::plugin(format!("failed to read for compare_and_remove: {}", e)))?;
+        if current != expected {
+            return Ok(false);
+        }
+
+        fs::remove_file(&local_path)
+            .map_err(|e| Error::plugin(format!("failed to remove for compare_and_remove: {}", e)))?;
+        Ok(true)
+    }
+
     /// Run blocking local filesystem work on a dedicated thread.
     async fn run_blocking_fs<T, F>(job: F) -> Result<T>
     where
@@ -814,6 +946,9 @@ impl FileSystem for LocalFileSystem {
             WriteFlag::Create => {
                 options.write(true).create(true).truncate(true);
             }
+            WriteFlag::CreateNew => {
+                options.write(true).create_new(true);
+            }
             WriteFlag::Append => {
                 options.append(true);
             }
@@ -840,6 +975,29 @@ impl FileSystem for LocalFileSystem {
         file.write_all(data)
             .map_err(|e| Error::plugin(format!("failed to write: {}", e)))?;
         Ok(data.len() as u64)
+    }
+
+    /// Atomically replace a local file when its current content exactly matches `expected`.
+    async fn compare_and_write(
+        &self,
+        path: &str,
+        expected: &[u8],
+        new_data: &[u8],
+    ) -> Result<bool> {
+        let local_path = self.resolve_path(path)?;
+        let expected = expected.to_vec();
+        let new_data = new_data.to_vec();
+        Self::run_blocking_fs(move || {
+            Self::compare_and_write_locked(local_path, expected, new_data)
+        })
+        .await
+    }
+
+    /// Atomically remove a local file when its current content exactly matches `expected`.
+    async fn compare_and_remove(&self, path: &str, expected: &[u8]) -> Result<bool> {
+        let local_path = self.resolve_path(path)?;
+        let expected = expected.to_vec();
+        Self::run_blocking_fs(move || Self::compare_and_remove_locked(local_path, expected)).await
     }
 
     async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
@@ -1337,6 +1495,61 @@ mod tests {
         assert!(fs.stat("/src.txt").await.is_err());
         let data = fs.read("/dst.txt", 0, 0).await.unwrap();
         assert_eq!(data, b"fresh");
+    }
+
+    #[tokio::test]
+    /// Verify LocalFS compare-and-write/remove only mutate exact current content.
+    async fn test_localfs_compare_and_write_remove_require_exact_content() {
+        let (_dir, fs) = fallback_localfs();
+
+        fs.write("/lock", b"owner1:100:E", 0, WriteFlag::CreateNew)
+            .await
+            .unwrap();
+
+        assert!(!fs
+            .compare_and_write("/lock", b"owner2:100:E", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:100:E");
+
+        assert!(fs
+            .compare_and_write("/lock", b"owner1:100:E", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:200:E");
+
+        assert!(!fs
+            .compare_and_remove("/lock", b"owner1:100:E")
+            .await
+            .unwrap());
+        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:200:E");
+
+        assert!(fs
+            .compare_and_remove("/lock", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert!(fs.read("/lock", 0, 0).await.is_err());
+        assert!(!fs
+            .compare_and_write("/lock", b"owner1:200:E", b"owner1:300:E")
+            .await
+            .unwrap());
+        assert!(!fs
+            .compare_and_remove("/lock", b"owner1:200:E")
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn test_localfs_rejects_unlinked_open_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        std::fs::write(&path, b"old").unwrap();
+        let old_file = std::fs::File::open(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+
+        assert!(!LocalFileSystem::open_file_matches_path(&old_file, &path).unwrap());
     }
 
     #[tokio::test]

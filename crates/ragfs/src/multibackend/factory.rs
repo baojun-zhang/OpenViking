@@ -77,7 +77,7 @@ pub async fn build_multi_write_fs(
                 config.name
             )));
         }
-        Arc::new(EncryptionWrappedFS::new(
+        Arc::new(EncryptionWrappedFS::with_pathlock(
             primary_raw.clone(),
             build_ctx
                 .enc_root_key
@@ -85,6 +85,8 @@ pub async fn build_multi_write_fs(
             build_ctx
                 .enc_provider_type
                 .expect("global encryption validated before building primary backend"),
+            build_ctx.pathlock_manager.clone(),
+            build_ctx.backend_prefix.clone(),
         ))
     } else {
         primary_raw.clone()
@@ -138,7 +140,7 @@ pub async fn build_multi_write_fs(
                     item.backend
                 )));
             }
-            Arc::new(EncryptionWrappedFS::new(
+            Arc::new(EncryptionWrappedFS::with_pathlock(
                 backup_raw,
                 build_ctx
                     .enc_root_key
@@ -146,6 +148,8 @@ pub async fn build_multi_write_fs(
                 build_ctx
                     .enc_provider_type
                     .expect("global encryption validated before building backup backend"),
+                build_ctx.pathlock_manager.clone(),
+                build_ctx.backend_prefix.clone(),
             ))
         } else {
             backup_raw

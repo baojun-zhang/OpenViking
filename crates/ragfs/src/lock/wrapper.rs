@@ -1,0 +1,479 @@
+//! PathLockWrappedFS — automatic lock acquisition for simple file operations.
+//!
+//! This wrapper sits between `StatsWrappedFS` and `MountableFS` in the stack.
+//! It auto-acquires locks for `create`, `write`, `truncate`, `remove`, `remove_all`,
+//! `rename`, and `replace`, then delegates to the inner filesystem.
+//!
+//! It is NOT a lock protocol implementation — all lock logic is delegated to
+//! `PathLockManager`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+
+use crate::core::context::FsContextView;
+use crate::core::filesystem::FileSystem;
+use crate::core::internal_names::is_hidden_runtime_lock_name;
+use crate::core::types::{FileInfo, GlobPage, GrepResult, TreeEntry, WriteFlag};
+use crate::core::MountableFS;
+
+use super::manager::PathLockManager;
+use super::types::{PathLockKind, PathLockRequest};
+
+/// Default timeout for auto-acquired locks.
+const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `FileSystem` wrapper that auto-acquires path locks for mutating operations.
+pub struct PathLockWrappedFS {
+    /// The lock manager (single source of truth).
+    manager: Arc<PathLockManager>,
+    /// The inner filesystem.
+    inner: Arc<dyn FileSystem>,
+}
+
+impl PathLockWrappedFS {
+    /// Create a new PathLockWrappedFS.
+    pub fn new(manager: Arc<PathLockManager>, inner: Arc<dyn FileSystem>) -> Self {
+        Self { manager, inner }
+    }
+
+    /// Return the inner filesystem.
+    pub fn inner_fs(&self) -> &Arc<dyn FileSystem> {
+        &self.inner
+    }
+
+    /// Return true for virtual control paths and lock metadata that must not be auto-locked.
+    fn should_bypass_auto_lock(path: &str) -> bool {
+        path == "/queue"
+            || path.starts_with("/queue/")
+            || path == "/serverinfo"
+            || path.starts_with("/serverinfo/")
+            || path
+                .rsplit_once('/')
+                .map(|(_, name)| is_hidden_runtime_lock_name(name))
+                .unwrap_or_else(|| is_hidden_runtime_lock_name(path))
+    }
+
+    /// Check if auto-locking should be skipped for the current context.
+    ///
+    /// Returns `true` only when the context carries a lease_ref that maps to an
+    /// active owned lease in the manager's registry. A bare string that does not
+    /// correspond to a real lease is rejected.
+    async fn should_skip_auto_lock(
+        &self,
+        requests: &[PathLockRequest],
+    ) -> crate::core::Result<bool> {
+        let view = FsContextView::current();
+        if view.disable_auto_pathlock() {
+            return Ok(true);
+        }
+        match view.pathlock_lease_ref() {
+            Some(lease_ref) => self
+                .manager
+                .require_covered_lease_ref(lease_ref, requests)
+                .await
+                .map(|_| true)
+                .map_err(|error| {
+                    crate::core::Error::internal(format!("lock lease error: {error}"))
+                }),
+            None => Ok(false),
+        }
+    }
+
+    /// Merge an operation result with its lock-release result.
+    fn merge_operation_and_release<T>(
+        operation: crate::core::Result<T>,
+        release: super::types::PathLockResult<()>,
+    ) -> crate::core::Result<T> {
+        match (operation, release) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(crate::core::Error::internal(format!(
+                "lock release error: {error}"
+            ))),
+        }
+    }
+
+    /// Return whether the routed encryption wrapper owns locking for this write.
+    async fn encryption_handles_pathlock(&self, path: &str) -> bool {
+        let any = self.inner.as_ref() as &dyn std::any::Any;
+        match any.downcast_ref::<MountableFS>() {
+            Some(mountable) => mountable.encryption_handles_pathlock(path).await,
+            None => false,
+        }
+    }
+}
+
+#[async_trait]
+impl FileSystem for PathLockWrappedFS {
+    async fn create(&self, path: &str) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(path) || self.encryption_handles_pathlock(path).await {
+            return self.inner.create(path).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.create(path).await;
+        }
+        let lease = self
+            .manager
+            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.create(path).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn mkdir(&self, path: &str, mode: u32) -> crate::core::Result<()> {
+        self.inner.mkdir(path, mode).await
+    }
+
+    async fn remove(&self, path: &str) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(path) {
+            return self.inner.remove(path).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.remove(path).await;
+        }
+        let lease = self
+            .manager
+            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.remove(path).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn remove_all(&self, path: &str) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(path) {
+            return self.inner.remove_all(path).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Tree,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.remove_all(path).await;
+        }
+        let lease = self
+            .manager
+            .acquire_tree(path, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.remove_all(path).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn read(&self, path: &str, offset: u64, size: u64) -> crate::core::Result<Vec<u8>> {
+        self.inner.read(path, offset, size).await
+    }
+
+    async fn write(
+        &self,
+        path: &str,
+        data: &[u8],
+        offset: u64,
+        flags: WriteFlag,
+    ) -> crate::core::Result<u64> {
+        if Self::should_bypass_auto_lock(path) || self.encryption_handles_pathlock(path).await {
+            return self.inner.write(path, data, offset, flags).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.write(path, data, offset, flags).await;
+        }
+        let lease = self
+            .manager
+            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.write(path, data, offset, flags).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn read_dir(&self, path: &str) -> crate::core::Result<Vec<FileInfo>> {
+        self.inner.read_dir(path).await
+    }
+
+    async fn stat(&self, path: &str) -> crate::core::Result<FileInfo> {
+        self.inner.stat(path).await
+    }
+
+    async fn rename(&self, old_path: &str, new_path: &str) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(old_path) || Self::should_bypass_auto_lock(new_path) {
+            return self.inner.rename(old_path, new_path).await;
+        }
+
+        // Determine if source is a directory.
+        let src_is_dir = self
+            .inner
+            .stat(old_path)
+            .await
+            .map(|info| info.is_dir)
+            .unwrap_or(false);
+
+        let requests: Vec<PathLockRequest> = if src_is_dir {
+            vec![
+                PathLockRequest {
+                    path: old_path.to_string(),
+                    kind: PathLockKind::Tree,
+                },
+                PathLockRequest {
+                    path: new_path.to_string(),
+                    kind: PathLockKind::Exact,
+                },
+            ]
+        } else {
+            vec![
+                PathLockRequest {
+                    path: old_path.to_string(),
+                    kind: PathLockKind::Exact,
+                },
+                PathLockRequest {
+                    path: new_path.to_string(),
+                    kind: PathLockKind::Exact,
+                },
+            ]
+        };
+
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.rename(old_path, new_path).await;
+        }
+
+        let lease = self
+            .manager
+            .acquire_batch(&requests, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.rename(old_path, new_path).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn replace(&self, src_path: &str, dst_path: &str) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(src_path) || Self::should_bypass_auto_lock(dst_path) {
+            return self.inner.replace(src_path, dst_path).await;
+        }
+
+        let requests = vec![
+            PathLockRequest {
+                path: src_path.to_string(),
+                kind: PathLockKind::Exact,
+            },
+            PathLockRequest {
+                path: dst_path.to_string(),
+                kind: PathLockKind::Exact,
+            },
+        ];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.replace(src_path, dst_path).await;
+        }
+        let lease = self
+            .manager
+            .acquire_batch(&requests, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.replace(src_path, dst_path).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn chmod(&self, path: &str, mode: u32) -> crate::core::Result<()> {
+        self.inner.chmod(path, mode).await
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> crate::core::Result<()> {
+        if Self::should_bypass_auto_lock(path) || self.encryption_handles_pathlock(path).await {
+            return self.inner.truncate(path, size).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.truncate(path, size).await;
+        }
+        let lease = self
+            .manager
+            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .await
+            .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
+        let result = self.inner.truncate(path, size).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
+    }
+
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        recursive: bool,
+        case_insensitive: bool,
+        node_limit: Option<usize>,
+        exclude_path: Option<&str>,
+        level_limit: Option<usize>,
+    ) -> crate::core::Result<GrepResult> {
+        self.inner
+            .grep(
+                path,
+                pattern,
+                recursive,
+                case_insensitive,
+                node_limit,
+                exclude_path,
+                level_limit,
+            )
+            .await
+    }
+
+    async fn tree_directory(
+        &self,
+        path: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+    ) -> crate::core::Result<Vec<TreeEntry>> {
+        self.inner
+            .tree_directory(path, show_hidden, node_limit, level_limit)
+            .await
+    }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> crate::core::Result<GlobPage> {
+        self.inner
+            .glob_directory(
+                path,
+                pattern,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+            .await
+    }
+
+    async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> crate::core::Result<()> {
+        self.inner.ensure_parent_dirs(path, mode).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::context::{FsContextInner, PathLockContext, FS_CTX};
+    use crate::lock::types::PathLockError;
+    use crate::lock::{MemoryPathLockProvider, PathLockConfig};
+    use crate::plugins::memfs::MemFileSystem;
+
+    /// Build a wrapper and manager backed by the real in-memory filesystem.
+    async fn wrapper_fixture() -> (PathLockWrappedFS, Arc<PathLockManager>) {
+        let fs = Arc::new(MemFileSystem::new());
+        fs.mkdir("/data", 0o755).await.unwrap();
+        let manager = Arc::new(PathLockManager::new(
+            fs.clone(),
+            Arc::new(MemoryPathLockProvider::new()),
+            PathLockConfig::default(),
+        ));
+        (PathLockWrappedFS::new(manager.clone(), fs), manager)
+    }
+
+    #[tokio::test]
+    async fn lease_context_must_exist_and_cover_requests() {
+        let (wrapper, manager) = wrapper_fixture().await;
+        let requests = [PathLockRequest {
+            path: "/data/file.txt".to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        let lease = manager
+            .acquire_tree("/data", Duration::ZERO, None)
+            .await
+            .unwrap();
+
+        let valid = Arc::new(FsContextInner::with_pathlock(
+            "test",
+            PathLockContext {
+                lease_ref: Some(lease.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+        assert!(FS_CTX
+            .scope(valid, wrapper.should_skip_auto_lock(&requests))
+            .await
+            .unwrap());
+
+        let exact = manager
+            .acquire_exact(
+                "/data/other.txt",
+                Duration::ZERO,
+                Some(&lease.lease.owner_id),
+            )
+            .await
+            .unwrap();
+        let insufficient = Arc::new(FsContextInner::with_pathlock(
+            "test",
+            PathLockContext {
+                lease_ref: Some(exact.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+        assert!(FS_CTX
+            .scope(insufficient, wrapper.should_skip_auto_lock(&requests))
+            .await
+            .is_err());
+
+        let invalid = Arc::new(FsContextInner::with_pathlock(
+            "test",
+            PathLockContext {
+                lease_ref: Some("missing".to_string()),
+                disable_auto_pathlock: false,
+            },
+        ));
+        assert!(FS_CTX
+            .scope(invalid, wrapper.should_skip_auto_lock(&requests))
+            .await
+            .is_err());
+
+        manager.release(&exact).await.unwrap();
+        manager.release(&lease).await.unwrap();
+    }
+
+    #[test]
+    fn operation_error_takes_precedence_over_release_error() {
+        let operation: crate::core::Result<()> =
+            Err(crate::core::Error::internal("operation failed"));
+        let release = Err(PathLockError::Io("release failed".to_string()));
+        let error = PathLockWrappedFS::merge_operation_and_release(operation, release).unwrap_err();
+
+        assert!(error.to_string().contains("operation failed"));
+    }
+
+    #[test]
+    fn release_error_is_returned_after_successful_operation() {
+        let release = Err(PathLockError::Io("release failed".to_string()));
+        let error =
+            PathLockWrappedFS::merge_operation_and_release(Ok(()), release).unwrap_err();
+
+        assert!(error.to_string().contains("release failed"));
+    }
+}

@@ -18,12 +18,6 @@ from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
-from openviking.storage.transaction import (
-    LOCK_TIMEOUT_DEFAULT,
-    NO_LOCK,
-    LockLease,
-    OwnedLockLease,
-)
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource
@@ -166,7 +160,7 @@ class ResourceProcessor:
             "source_path": None,
         }
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
-        preacquired_lock = kwargs.pop("resource_lock", NO_LOCK) or NO_LOCK
+        preacquired_lock = kwargs.pop("resource_lock", None)
         telemetry = get_current_telemetry()
 
         async def _set_stage(stage: str) -> None:
@@ -308,20 +302,17 @@ class ResourceProcessor:
             temp_uri = result.get("temp_uri")  # temp_doc_uri
             original_temp_uri = temp_uri  # 保存原始 temp_uri 用于最终输出
             candidate_uri = getattr(context_tree, "_candidate_uri", None) if context_tree else None
-            resource_lock: LockLease = preacquired_lock
+            resource_lock: Optional[Dict[str, Any]] = preacquired_lock
             target_preexisting = False
             source_committed = False
 
             if root_uri and temp_uri:
-                from openviking.storage.transaction import get_lock_manager
-
                 stage_start = time.perf_counter()
                 stage_status = "ok"
                 viking_fs = get_viking_fs()
-                lock_manager = get_lock_manager()
                 try:
                     if candidate_uri:
-                        if resource_lock.active:
+                        if resource_lock is not None:
                             root_uri = candidate_uri
                         else:
                             root_uri, resource_lock = await self.reserve_unique_candidate(
@@ -356,17 +347,22 @@ class ResourceProcessor:
                                         target_preexisting = False
                             except Exception:
                                 pass
-                        if not resource_lock.active:
+                        if resource_lock is None:
                             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
-                            resource_lock = await self.acquire_resource_lock(
-                                lock_manager, dst_path, uri=root_uri
-                            )
+                            resource_lock = await self.acquire_resource_lock(dst_path, uri=root_uri)
                     if not target_preexisting:
-                        await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
-                        await rewrite_image_uris(
-                            root_uri, ctx=ctx, lock_handle=resource_lock.handle
+                        await viking_fs.persist_temp_tree(
+                            temp_uri,
+                            root_uri,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
                         )
-                        await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                        await rewrite_image_uris(root_uri, ctx=ctx, lease_ref=resource_lock)
+                        await viking_fs.delete_temp(
+                            parse_result.temp_dir_path,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                        )
                         temp_uri = root_uri
                         source_committed = True
                 except Exception:
@@ -425,7 +421,7 @@ class ResourceProcessor:
         prepared: Dict[str, Any],
         *,
         ctx: RequestContext,
-        resource_lock: LockLease = NO_LOCK,
+        resource_lock: Optional[Dict[str, Any]] = None,
         summarize: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -457,12 +453,12 @@ class ResourceProcessor:
                         **kwargs,
                     )
                     if (
-                        resource_lock.active
+                        resource_lock is not None
                         and summary_result.get("status") == "success"
                         and summary_result.get("enqueued_count", 0) > 0
                     ):
-                        await resource_lock.handoff()
-                        resource_lock = NO_LOCK
+                        await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
+                        resource_lock = None
             except Exception as exc:
                 logger.error("Summarization failed: %s", exc)
                 result["warnings"] = [f"Summarization failed: {exc}"]
@@ -478,20 +474,25 @@ class ResourceProcessor:
                 except Exception:
                     pass
 
-        if resource_lock.active:
+        if resource_lock is not None:
             try:
                 if not should_summarize and temp_uri and not source_committed:
                     viking_fs = get_viking_fs()
-                    await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
-                    await rewrite_image_uris(
+                    await viking_fs.persist_temp_tree(
+                        temp_uri,
                         root_uri,
                         ctx=ctx,
-                        lock_handle=resource_lock.handle,
+                        lease_ref=resource_lock,
                     )
+                    await rewrite_image_uris(root_uri, ctx=ctx, lease_ref=resource_lock)
                     if temp_dir_path:
-                        await viking_fs.delete_temp(temp_dir_path, ctx=ctx)
+                        await viking_fs.delete_temp(
+                            temp_dir_path,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                        )
             finally:
-                await resource_lock.close()
+                await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
         return result
 
     async def reserve_unique_candidate(
@@ -500,13 +501,11 @@ class ResourceProcessor:
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
-    ) -> tuple[str, OwnedLockLease]:
+    ) -> tuple[str, Dict[str, Any]]:
         """Pick the first free candidate URI and reserve it with a resource TreeLock."""
         from openviking.storage.errors import ResourceBusyError
-        from openviking.storage.transaction import get_lock_manager
 
         viking_fs = get_viking_fs()
-        lock_manager = get_lock_manager()
         last_busy_error: Optional[ResourceBusyError] = None
 
         for attempt in range(max_attempts + 1):
@@ -517,7 +516,7 @@ class ResourceProcessor:
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
                 resource_lock = await self.acquire_resource_lock(
-                    lock_manager, dst_path, uri=root_uri, timeout=0.0
+                    dst_path, uri=root_uri, timeout=0.0
                 )
                 return root_uri, resource_lock
             except ResourceBusyError as exc:
@@ -539,17 +538,18 @@ class ResourceProcessor:
 
     @staticmethod
     async def acquire_resource_lock(
-        lock_manager,
         path: str,
         *,
         uri: str = "",
-        timeout: Any = LOCK_TIMEOUT_DEFAULT,
-    ) -> OwnedLockLease:
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
         """Acquire the per-resource TreeLock or raise a structured conflict."""
         from openviking.storage.errors import ResourceBusyError
 
         try:
-            return await OwnedLockLease.acquire_tree(lock_manager, path, timeout=timeout)
+            return await get_viking_fs()._async_agfs.pathlock_acquire_tree(
+                path, timeout_secs=timeout
+            )
         except LockAcquisitionError as exc:
             logger.warning(f"[ResourceProcessor] Failed to acquire resource lock on {path}")
             raise ResourceBusyError(

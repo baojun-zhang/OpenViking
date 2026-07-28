@@ -175,12 +175,12 @@ impl MetaStateStore {
         Arc::new(FsContextInner::new("_system".to_string()))
     }
 
-    /// - root directory using `_system` context
+    /// Build a metadata context without inheriting a business PathLock lease.
     fn effective_meta_ctx(dir: &str, ctx: &FsContext) -> FsContext {
         if dir == "/" {
             Self::system_ctx()
         } else {
-            ctx.clone()
+            Arc::new(FsContextInner::new(ctx.account_id().to_string()))
         }
     }
 

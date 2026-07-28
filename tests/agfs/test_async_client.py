@@ -8,14 +8,23 @@ from openviking.pyagfs import AsyncAGFSClient
 
 
 class _SyncAGFS:
+    """Minimal synchronous binding stub used by the async adapter tests."""
+
     def read(self, path, **kwargs):
+        """Return read call arguments."""
         return ("read", path, kwargs)
 
     def write(self, path, data, **kwargs):
+        """Return write call arguments."""
         return ("write", path, data, kwargs)
 
     def rm(self, path, **kwargs):
+        """Return remove call arguments."""
         return ("rm", path, kwargs)
+
+    def pathlock_is_locked(self, ctx, path, ignore_stale):
+        """Return pathlock query arguments."""
+        return ("pathlock_is_locked", ctx, path, ignore_stale)
 
 
 @pytest.mark.asyncio
@@ -58,3 +67,22 @@ async def test_async_agfs_client_hides_threadpool(monkeypatch):
             {"recursive": True, "ctx": {"account_id": "_system"}},
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_pathlock_is_locked_ignores_stale_tokens_by_default(monkeypatch):
+    """The async adapter must preserve the legacy ignore-stale default."""
+
+    async def fake_to_thread(func, *args, **kwargs):
+        """Execute one binding call inline for deterministic assertions."""
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(async_client.asyncio, "to_thread", fake_to_thread)
+    agfs = AsyncAGFSClient(_SyncAGFS())
+
+    assert await agfs.pathlock_is_locked("/local/default/a.md") == (
+        "pathlock_is_locked",
+        {"account_id": "default"},
+        "/local/default/a.md",
+        True,
+    )

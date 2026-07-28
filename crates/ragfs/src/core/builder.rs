@@ -6,12 +6,18 @@
 //! `EncryptionWrappedFS` wrapper is removed from this builder.
 //!
 //! The top layer is always `StatsWrappedFS` so end-to-end timing (including crypto) is captured.
+//! When pathlock is enabled, `PathLockWrappedFS` sits between `StatsWrappedFS` and `MountableFS`.
 
 use std::sync::Arc;
 
 use super::filesystem::FileSystem;
 use super::mountable::MountableFS;
 use super::stats_wrapper::StatsWrappedFS;
+
+use crate::lock::{
+    FilesystemPathLockProvider, MemoryPathLockProvider, PathLockConfig, PathLockManager,
+    PathLockProvider, PathLockWrappedFS,
+};
 
 #[cfg(feature = "s3")]
 use crate::plugins::S3FSPlugin;
@@ -27,6 +33,8 @@ use crate::plugins::{
 pub struct RagfsConfig {
     /// Encryption section: `None` → plaintext stack; `Some` → per-backend encryption wrapping.
     pub encryption: Option<EncryptionConfig>,
+    /// PathLock section: `None` → no automatic locking; `Some` → enable PathLockWrappedFS.
+    pub pathlock: Option<PathLockConfig>,
 }
 
 /// Encryption section: root key fixed and immutable at construction time.
@@ -41,16 +49,30 @@ pub struct EncryptionConfig {
 pub struct RagfsStack {
     /// Mount manager (mount/unmount/list/stats/register_plugin live here).
     pub mountable: Arc<MountableFS>,
-    /// Data entry point: `Stats(Mountable)` — encryption is per-backend inside mount.
+    /// Data entry point: `Stats(PathLock?(Mountable))`.
     pub top: Arc<dyn FileSystem>,
+    /// PathLock manager, if pathlock is enabled.
+    pub pathlock_manager: Option<Arc<PathLockManager>>,
 }
 
 /// Build the standard RAGFS stack.
 ///
 /// Encryption config is forwarded to `MountableFS` so it can wrap individual backends
 /// with `EncryptionWrappedFS` during `mount()`. The top is always `StatsWrappedFS`.
+/// When pathlock is enabled, `PathLockWrappedFS` is inserted between stats and mountable.
 pub async fn build_default_stack(config: RagfsConfig) -> RagfsStack {
     let mountable = Arc::new(MountableFS::new());
+    build_stack_with_mountable(config, mountable).await
+}
+
+/// Build the standard wrapper stack around an existing mount manager.
+///
+/// This is used by the binding's cache-aware mountable so cache and non-cache
+/// construction share identical encryption and pathlock assembly.
+pub async fn build_stack_with_mountable(
+    config: RagfsConfig,
+    mountable: Arc<MountableFS>,
+) -> RagfsStack {
     register_builtin_plugins(&mountable).await;
 
     // Forward encryption config to MountableFS for per-backend wrapping.
@@ -60,11 +82,31 @@ pub async fn build_default_stack(config: RagfsConfig) -> RagfsStack {
             .await;
     }
 
-    // MountableFS is the data entry point; encryption is applied inside mount().
-    let top: Arc<dyn FileSystem> = Arc::new(StatsWrappedFS::with_arc(
-        mountable.clone() as Arc<dyn FileSystem>
-    ));
-    RagfsStack { mountable, top }
+    let (inner, pathlock_manager) = if let Some(pl_config) = &config.pathlock {
+        let provider: Arc<dyn PathLockProvider> = match pl_config.provider.as_str() {
+            "memory" => Arc::new(MemoryPathLockProvider::new()),
+            _ => Arc::new(FilesystemPathLockProvider::new(
+                mountable.clone() as Arc<dyn FileSystem>,
+            )),
+        };
+        let manager = Arc::new(PathLockManager::new(
+            mountable.clone() as Arc<dyn FileSystem>,
+            provider,
+            pl_config.clone(),
+        ));
+        // Inject into MountableFS so EncryptionWrappedFS can use it for dual-path exact lock.
+        mountable.set_pathlock_manager(Some(manager.clone())).await;
+        let wrapped: Arc<dyn FileSystem> = Arc::new(PathLockWrappedFS::new(
+            manager.clone(),
+            mountable.clone() as Arc<dyn FileSystem>,
+        ));
+        (wrapped, Some(manager))
+    } else {
+        (mountable.clone() as Arc<dyn FileSystem>, None)
+    };
+
+    let top: Arc<dyn FileSystem> = Arc::new(StatsWrappedFS::with_arc(inner));
+    RagfsStack { mountable, top, pathlock_manager }
 }
 
 /// The single built-in plugin registration sequence (eliminates drift across call sites).
@@ -82,7 +124,7 @@ pub async fn register_builtin_plugins(fs: &MountableFS) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::context::{FsContextInner, FS_CTX};
+    use crate::core::context::{FsContextInner, PathLockContext, FS_CTX};
     use crate::core::{ConfigValue, PluginConfig, Result, WriteFlag};
     use crate::crypto;
     use std::collections::HashMap;
@@ -94,6 +136,20 @@ mod tests {
             encryption: Some(EncryptionConfig {
                 root_key: [4u8; 32],
                 provider_type: crypto::PROVIDER_LOCAL,
+            }),
+            pathlock: None,
+        }
+    }
+
+    fn enc_pathlock_config() -> RagfsConfig {
+        RagfsConfig {
+            encryption: Some(EncryptionConfig {
+                root_key: [4u8; 32],
+                provider_type: crypto::PROVIDER_LOCAL,
+            }),
+            pathlock: Some(PathLockConfig {
+                provider: "filesystem".to_string(),
+                lock_expire_secs: 300.0,
             }),
         }
     }
@@ -147,6 +203,96 @@ mod tests {
         // Read raw bytes from mountable (bypasses encryption layer) to verify ciphertext.
         let raw = stack.mountable.read_raw("/mem/f", 0, 0).await.unwrap();
         assert!(crypto::is_encrypted(&raw));
+    }
+
+    #[tokio::test]
+    async fn encrypted_stack_with_pathlock_does_not_reacquire_final_lock() {
+        let stack = build_default_stack(enc_pathlock_config()).await;
+        mount_mem(&stack).await;
+
+        let write = FS_CTX.scope(Arc::new(FsContextInner::new("tenant")), async {
+            stack
+                .top
+                .write("/mem/f", b"hello", 0, WriteFlag::Create)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(200), write)
+            .await
+            .expect("encrypted write blocked on its own final-path lock")
+            .unwrap();
+
+        let rewrite = FS_CTX.scope(Arc::new(FsContextInner::new("tenant")), async {
+            stack
+                .top
+                .write("/mem/f", b"updated", 0, WriteFlag::Create)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(200), rewrite)
+            .await
+            .expect("encrypted rewrite blocked on an unreleased lock token")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_write_extends_outer_lease() {
+        let stack = build_default_stack(enc_pathlock_config()).await;
+        mount_mem(&stack).await;
+        let manager = stack.pathlock_manager.as_ref().unwrap();
+        let outer = manager
+            .acquire_exact("/mem/f", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        let ctx = Arc::new(FsContextInner::with_pathlock(
+            "tenant",
+            PathLockContext {
+                lease_ref: Some(outer.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+
+        let write = FS_CTX.scope(ctx, async {
+            stack
+                .top
+                .write("/mem/f", b"hello", 0, WriteFlag::Create)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(200), write)
+            .await
+            .expect("encrypted write blocked on its outer final-path lease")
+            .unwrap();
+
+        manager.release(&outer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_write_rejects_uncovered_outer_lease() {
+        let stack = build_default_stack(enc_pathlock_config()).await;
+        mount_mem(&stack).await;
+        let manager = stack.pathlock_manager.as_ref().unwrap();
+        let outer = manager
+            .acquire_exact("/mem/other", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        let ctx = Arc::new(FsContextInner::with_pathlock(
+            "tenant",
+            PathLockContext {
+                lease_ref: Some(outer.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+
+        let error = FS_CTX
+            .scope(ctx, async {
+                stack
+                    .top
+                    .write("/mem/f", b"hello", 0, WriteFlag::Create)
+                    .await
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not cover final path"));
+        manager.release(&outer).await.unwrap();
     }
 
     #[tokio::test]

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import time
-
 from openviking.metrics.collectors.lock import LockCollector
 from openviking.metrics.collectors.observer_health import ObserverHealthCollector
 from openviking.metrics.collectors.queue import QueueCollector
@@ -234,22 +232,16 @@ def test_model_usage_collector_failure_reuses_last_available_state_with_valid_ze
 
 
 def test_lock_collector_counts_active_and_stale(monkeypatch):
-    class Handle:
-        def __init__(self, locks: int, last_active_at: float) -> None:
-            self.locks = [object()] * locks
-            self.last_active_at = last_active_at
+    class FakeVikingFS:
+        class _AsyncAGFS:
+            async def pathlock_observe(self):
+                return {"active_locks": 3, "waiting_locks": 0, "stale_locks_removed": 1}
 
-    class DummyLockManager:
-        def get_active_handles(self):
-            now = time.time()
-            return {
-                "a": Handle(locks=2, last_active_at=now - 10),
-                "b": Handle(locks=1, last_active_at=now - 1000),
-            }
+        _async_agfs = _AsyncAGFS()
 
     monkeypatch.setattr(
-        "openviking.metrics.datasources.observer_state.get_lock_manager",
-        lambda: DummyLockManager(),
+        "openviking.metrics.datasources.observer_state.get_viking_fs",
+        lambda: FakeVikingFS(),
     )
     registry = MetricRegistry()
     LockCollector(data_source=LockStateDataSource()).collect(registry)

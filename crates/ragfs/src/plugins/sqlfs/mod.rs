@@ -318,11 +318,15 @@ impl FileSystem for SQLFileSystem {
                 return Err(Error::IsADirectory(normalized));
             }
 
+            if matches!(flags, WriteFlag::CreateNew) {
+                return Err(Error::AlreadyExists(normalized));
+            }
+
             // Update existing file
             backend.update_file(&normalized, data)?;
         } else {
             // Create new file
-            if !matches!(flags, WriteFlag::Create) {
+            if !matches!(flags, WriteFlag::Create | WriteFlag::CreateNew) {
                 return Err(Error::not_found(&normalized));
             }
 
@@ -341,6 +345,31 @@ impl FileSystem for SQLFileSystem {
         }
 
         Ok(data.len() as u64)
+    }
+
+    async fn compare_and_write(
+        &self,
+        path: &str,
+        expected: &[u8],
+        new_data: &[u8],
+    ) -> Result<bool> {
+        let normalized = Self::normalize_path(path);
+        let backend = self.backend.read().await;
+        let changed = backend.compare_and_update_file(&normalized, expected, new_data)?;
+        if changed {
+            self.cache.invalidate_parent(&normalized).await;
+        }
+        Ok(changed)
+    }
+
+    async fn compare_and_remove(&self, path: &str, expected: &[u8]) -> Result<bool> {
+        let normalized = Self::normalize_path(path);
+        let backend = self.backend.read().await;
+        let changed = backend.compare_and_delete_file(&normalized, expected)?;
+        if changed {
+            self.cache.invalidate_parent(&normalized).await;
+        }
+        Ok(changed)
     }
 
     async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
@@ -759,6 +788,34 @@ mod tests {
         fs.truncate("/trunc.txt", 5).await.unwrap();
 
         assert_eq!(read_file(&fs, "/trunc.txt").await, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_sqlfs_compare_and_write_remove() {
+        let fs = SQLFileSystem::default();
+
+        write_file(&fs, "/lock", b"owner1:100:E").await;
+        assert!(!fs
+            .compare_and_write("/lock", b"owner2:100:E", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert_eq!(read_file(&fs, "/lock").await, b"owner1:100:E");
+
+        assert!(fs
+            .compare_and_write("/lock", b"owner1:100:E", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert_eq!(read_file(&fs, "/lock").await, b"owner1:200:E");
+
+        assert!(!fs
+            .compare_and_remove("/lock", b"owner1:100:E")
+            .await
+            .unwrap());
+        assert!(fs
+            .compare_and_remove("/lock", b"owner1:200:E")
+            .await
+            .unwrap());
+        assert!(fs.read("/lock", 0, 0).await.is_err());
     }
 
     #[tokio::test]

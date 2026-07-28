@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 from openviking.core.namespace import NamespaceShapeError, canonicalize_uri, context_type_for_uri
 from openviking.resource.watch_storage import is_watch_task_control_uri
@@ -16,10 +16,9 @@ from openviking.session.memory.utils.resource_refs import (
     RESOURCE_REF_SOURCE_CONTENT_WRITE,
     sync_memory_resource_refs,
 )
-from openviking.storage.errors import ResourceBusyError
+from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
-from openviking.storage.transaction import get_lock_manager
 from openviking.storage.viking_fs import VikingFS
 from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
@@ -36,12 +35,19 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-if TYPE_CHECKING:
-    from openviking.storage.transaction.lock_handle import LockHandle
-
 _DERIVED_FILENAMES = frozenset({".abstract.md", ".overview.md", ".relations.json"})
 _CREATE_ALLOWED_EXTENSIONS = frozenset(
-    {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".js", ".ts"}
+    {
+        ".md",
+        ".txt",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".py",
+        ".js",
+        ".ts",
+    }
 )
 
 
@@ -244,16 +250,14 @@ class ContentWriteCoordinator:
         written_bytes: int,
         telemetry_id: str,
     ) -> Dict[str, Any]:
-        lock_manager = get_lock_manager()
-        handle = lock_manager.create_handle()
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
-        acquired = await lock_manager.acquire_exact_path(handle, lock_path)
-        if not acquired:
-            await lock_manager.release(handle)
+        try:
+            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+        except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
-            )
+            ) from exc
 
         previous_content: Optional[str] = None
         content_written = False
@@ -264,13 +268,7 @@ class ContentWriteCoordinator:
                 previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             if wait and telemetry_id:
                 get_request_wait_tracker().register_request(telemetry_id)
-            await self._write_in_place(
-                uri,
-                content,
-                mode=mode,
-                ctx=ctx,
-                lock_handle=handle,
-            )
+            await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             content_written = True
             await self._enqueue_semantic_refresh(
                 root_uri=root_uri,
@@ -280,7 +278,7 @@ class ContentWriteCoordinator:
                 change_type="added" if mode == "create" else "modified",
             )
             semantic_enqueued = True
-            await lock_manager.release(handle)
+            await self._viking_fs._async_agfs.pathlock_release(lease)
             lock_released = True
             queue_status = (
                 await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
@@ -303,10 +301,10 @@ class ContentWriteCoordinator:
                     previous_content=previous_content,
                     mode=mode,
                     ctx=ctx,
-                    lock_handle=handle,
+                    lease_ref=lease,
                 )
             if not lock_released:
-                await lock_manager.release(handle)
+                await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
         finally:
             if wait and telemetry_id:
@@ -319,18 +317,18 @@ class ContentWriteCoordinator:
         previous_content: Optional[str],
         mode: str,
         ctx: RequestContext,
-        lock_handle: Any,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
             if mode == "create":
-                await self._viking_fs.rm(uri, ctx=ctx, lock_handle=lock_handle)
+                await self._viking_fs.rm(uri, ctx=ctx, lease_ref=lease_ref)
                 return
             if previous_content is not None:
                 await self._viking_fs.write_file(
                     uri,
                     previous_content,
                     ctx=ctx,
-                    lock_handle=lock_handle,
+                    lease_ref=lease_ref,
                 )
         except Exception:
             logger.error("Failed to rollback direct content write for %s", uri, exc_info=True)
@@ -440,7 +438,7 @@ class ContentWriteCoordinator:
         *,
         mode: str,
         ctx: RequestContext,
-        lock_handle: Optional["LockHandle"] = None,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> None:
         if context_type_for_uri(uri) == "memory":
             if mode == "replace":
@@ -458,7 +456,7 @@ class ContentWriteCoordinator:
                 uri,
                 MemoryFileUtils.write(mf),
                 ctx=ctx,
-                lock_handle=lock_handle,
+                lease_ref=lease_ref,
             )
             return
 
@@ -467,14 +465,9 @@ class ContentWriteCoordinator:
             mf = MemoryFileUtils.read(existing_raw, uri=uri)
             mf.content = mf.content + content
             updated_raw = MemoryFileUtils.write(mf)
-            await self._viking_fs.write_file(
-                uri,
-                updated_raw,
-                ctx=ctx,
-                lock_handle=lock_handle,
-            )
+            await self._viking_fs.write_file(uri, updated_raw, ctx=ctx, lease_ref=lease_ref)
             return
-        await self._viking_fs.write_file(uri, content, ctx=ctx, lock_handle=lock_handle)
+        await self._viking_fs.write_file(uri, content, ctx=ctx, lease_ref=lease_ref)
 
     async def _enqueue_semantic_refresh(
         self,
@@ -557,28 +550,20 @@ class ContentWriteCoordinator:
         written_bytes: int,
         telemetry_id: str,
     ) -> Dict[str, Any]:
-        lock_manager = get_lock_manager()
-        handle = lock_manager.create_handle()
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
-        acquired = await lock_manager.acquire_exact_path(handle, lock_path)
-        if not acquired:
-            await lock_manager.release(handle)
+        try:
+            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+        except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
-            )
+            ) from exc
 
         released = False
         request_registered = False
         try:
-            await self._write_in_place(
-                uri,
-                content,
-                mode=mode,
-                ctx=ctx,
-                lock_handle=handle,
-            )
-            await lock_manager.release(handle)
+            await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
+            await self._viking_fs._async_agfs.pathlock_release(lease)
             released = True
             if wait and telemetry_id and self._vikingdb_has_queue():
                 get_request_wait_tracker().register_request(telemetry_id)
@@ -621,7 +606,7 @@ class ContentWriteCoordinator:
             )
         except Exception:
             if not released:
-                await lock_manager.release(handle)
+                await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
         finally:
             if request_registered:
