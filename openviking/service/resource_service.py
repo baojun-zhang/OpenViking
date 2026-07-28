@@ -28,6 +28,12 @@ from openviking.resource.feishu_watch_auth import (
     create_feishu_auth_state,
     load_feishu_app_credentials,
 )
+from openviking.resource.processing_mode import (
+    DEFAULT_PROCESSING_MODE,
+    VECTORS_ONLY,
+    ProcessingMode,
+    normalize_processing_mode,
+)
 from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import (
     is_remote_resource_source,
@@ -83,6 +89,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "timeout",
         "build_index",
         "summarize",
+        "processing_mode",
         "watch_interval",
         "skip_watch_management",
         "allow_local_path_resolution",
@@ -201,6 +208,7 @@ class ResourceService:
         instruction: str,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         processor_kwargs: Dict[str, Any],
         watch_auth_state: Optional[Dict[str, Any]],
         ctx: RequestContext,
@@ -251,6 +259,7 @@ class ResourceService:
                         watch_interval=watch_interval,
                         build_index=build_index,
                         summarize=summarize,
+                        processing_mode=processing_mode,
                         processor_kwargs=sanitized,
                         auth_state=watch_auth_state,
                         ctx=ctx,
@@ -424,6 +433,7 @@ class ResourceService:
                 timeout=msg.timeout,
                 build_index=msg.build_index,
                 summarize=msg.summarize,
+                processing_mode=msg.processing_mode,
                 watch_interval=msg.watch_interval,
                 manage_watch=not msg.skip_watch_management,
                 allow_local_path_resolution=msg.allow_local_path_resolution,
@@ -455,6 +465,7 @@ class ResourceService:
                 resource_lock=resource_lock,
                 summarize=msg.summarize,
                 build_index=msg.build_index,
+                processing_mode=msg.processing_mode,
             )
             await request_wait_tracker.wait_for_request(
                 telemetry_id,
@@ -502,6 +513,7 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         manage_watch: bool = True,
         allow_local_path_resolution: bool = True,
@@ -511,6 +523,7 @@ class ResourceService:
     ) -> Dict[str, Any]:
         """Start background ingestion for Git repositories while reserving the target URI."""
         self._ensure_initialized()
+        processing_mode = normalize_processing_mode(processing_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         from openviking.connector.routing import CONNECTOR_CREDENTIAL_ARGS
@@ -580,6 +593,7 @@ class ResourceService:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 watch_interval=watch_interval,
                 skip_watch_management=not manage_watch,
                 allow_local_path_resolution=allow_local_path_resolution,
@@ -709,6 +723,7 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
@@ -733,6 +748,7 @@ class ResourceService:
             timeout=timeout,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             manage_watch=True,
             allow_local_path_resolution=allow_local_path_resolution,
@@ -752,6 +768,7 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
@@ -769,6 +786,7 @@ class ResourceService:
             timeout=timeout,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             manage_watch=False,
             allow_local_path_resolution=allow_local_path_resolution,
@@ -789,6 +807,7 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         manage_watch: bool = True,
         allow_local_path_resolution: bool = True,
@@ -808,6 +827,7 @@ class ResourceService:
             timeout: Wait timeout in seconds
             build_index: Whether to build vector index immediately (default: True)
             summarize: Whether to generate summary (default: False)
+            processing_mode: Post-ingest processing mode for semantic/vector work
             watch_interval: Watch interval in minutes for automatic resource monitoring.
                 - watch_interval > 0: Creates or updates a watch task. The resource will be
                   automatically re-processed at the specified interval by the scheduler.
@@ -832,6 +852,7 @@ class ResourceService:
             InvalidArgumentError: If the URI scope is not 'resources'
         """
         self._ensure_initialized()
+        processing_mode = normalize_processing_mode(processing_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         if watch_interval > 0 and kwargs.get("temp_file_id"):
@@ -867,6 +888,7 @@ class ResourceService:
             instruction=instruction,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             connector_args=args or {},
             kwargs=kwargs,
@@ -891,6 +913,7 @@ class ResourceService:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 watch_interval=watch_interval,
                 manage_watch=manage_watch,
                 allow_local_path_resolution=allow_local_path_resolution,
@@ -909,6 +932,7 @@ class ResourceService:
             timeout=timeout,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             manage_watch=manage_watch,
             allow_local_path_resolution=allow_local_path_resolution,
@@ -930,6 +954,7 @@ class ResourceService:
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         manage_watch: bool = True,
         allow_local_path_resolution: bool = True,
@@ -1108,6 +1133,7 @@ class ResourceService:
                         timeout=timeout,
                         build_index=build_index,
                         summarize=summarize,
+                        processing_mode=processing_mode,
                         strict=bool(kwargs.get("strict", False)),
                         ignore_dirs=kwargs.get("ignore_dirs"),
                         include=kwargs.get("include"),
@@ -1153,6 +1179,7 @@ class ResourceService:
                     instruction=instruction,
                     build_index=build_index,
                     summarize=summarize,
+                    processing_mode=processing_mode,
                     processor_kwargs=kwargs,
                     watch_auth_state=watch_auth_state,
                     ctx=ctx,
@@ -1175,6 +1202,7 @@ class ResourceService:
                 parent=target.parent,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 stage_callback=stage_callback,
                 allow_local_path_resolution=allow_local_path_resolution,
                 prepared_resource=prepared_resource,
@@ -1260,6 +1288,7 @@ class ResourceService:
                     timeout=timeout,
                     build_index=build_index,
                     summarize=summarize,
+                    processing_mode=processing_mode,
                     strict=bool(kwargs.get("strict", False)),
                     ignore_dirs=kwargs.get("ignore_dirs"),
                     include=kwargs.get("include"),
@@ -1292,6 +1321,7 @@ class ResourceService:
                 instruction=instruction,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=kwargs,
                 watch_auth_state=watch_auth_state,
                 ctx=ctx,
@@ -1403,6 +1433,7 @@ class ResourceService:
         instruction: str = "",
         build_index: bool = True,
         summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         watch_interval: float = 0,
         connector_args: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
@@ -1488,6 +1519,7 @@ class ResourceService:
             instruction=instruction,
             build_index=build_index,
             summarize=summarize,
+            processing_mode=processing_mode,
             watch_interval=watch_interval,
             connector_args=connector_args,
             kwargs=kwargs or {},
@@ -1518,6 +1550,7 @@ class ResourceService:
         instruction: str,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         watch_interval: float,
         connector_args: Dict[str, Any],
         kwargs: Dict[str, Any],
@@ -1550,6 +1583,8 @@ class ResourceService:
             unsupported.append("build_index=false")
         if summarize:
             unsupported.append("summarize=true")
+        if processing_mode == VECTORS_ONLY:
+            unsupported.append("processing_mode=vectors_only")
         if kwargs.get("strict"):
             unsupported.append("strict=true (Connector imports fail per file, not all-or-nothing)")
         for field in ("ignore_dirs", "include", "exclude"):
@@ -1869,6 +1904,7 @@ class ResourceService:
         watch_interval: float,
         build_index: bool,
         summarize: bool,
+        processing_mode: ProcessingMode,
         processor_kwargs: Dict[str, Any],
         auth_state: Optional[Dict[str, Any]],
         ctx: RequestContext,
@@ -1917,6 +1953,7 @@ class ResourceService:
                 watch_interval=watch_interval,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=processor_kwargs,
                 auth_state=auth_state,
                 is_active=True,
@@ -1937,6 +1974,7 @@ class ResourceService:
                 watch_interval=watch_interval,
                 build_index=build_index,
                 summarize=summarize,
+                processing_mode=processing_mode,
                 processor_kwargs=processor_kwargs,
                 auth_state=auth_state,
             )

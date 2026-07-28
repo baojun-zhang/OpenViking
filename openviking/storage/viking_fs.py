@@ -676,7 +676,7 @@ class VikingFS:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
 
         try:
-            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx) if is_dir else []
             uris_to_delete.append(target_uri)
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
@@ -788,7 +788,9 @@ class VikingFS:
             )
 
         try:
-            uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
+            uris_to_move = (
+                await self._collect_uris(old_path, recursive=True, ctx=ctx) if is_dir else []
+            )
             uris_to_move.append(target_uri)
 
             # Check if it's temp directory (files already encrypted)
@@ -808,8 +810,15 @@ class VikingFS:
                 )
             except Exception as e:
                 if "not found" in str(e).lower():
-                    await self._delete_from_vector_store(uris_to_move, ctx=ctx)
-                    logger.info(f"[VikingFS] mv source not found, cleaned orphan index: {old_uri}")
+                    try:
+                        await self._delete_from_vector_store(uris_to_move, ctx=ctx)
+                    except Exception:
+                        # Orphan cleanup is best effort here; preserve the copy error.
+                        pass
+                    else:
+                        logger.info(
+                            f"[VikingFS] mv source not found, cleaned orphan index: {old_uri}"
+                        )
                 raise
 
             # Update VectorDB URIs (on failure, clean up the copy)
@@ -1227,19 +1236,15 @@ class VikingFS:
         if exclude_uri:
             excluded_prefix = exclude_uri.rstrip("/")
             self._ensure_access(excluded_prefix, ctx)
-            filter_expr = And(
-                [
-                    filter_expr,
-                    RawDSL(
-                        {
-                            "op": "must_not",
-                            "field": "uri",
-                            "conds": [excluded_prefix],
-                            "para": "-d=-1",
-                        }
-                    ),
-                ]
-            )
+            filter_expr = And([
+                filter_expr,
+                RawDSL({
+                    "op": "must_not",
+                    "field": "uri",
+                    "conds": [excluded_prefix],
+                    "para": "-d=-1",
+                }),
+            ])
 
         # Auto-adapt bm25 recall limit: recall up to 5x requested matches
         # while capping at VikingDB's max limit. If node_limit is unset,
@@ -1409,13 +1414,11 @@ class VikingFS:
 
             files_scanned_set.add(file_uri)
 
-            results.append(
-                {
-                    "line": match.get("line", match.get("line_number", 0)),
-                    "uri": file_uri,
-                    "content": match.get("content", ""),
-                }
-            )
+            results.append({
+                "line": match.get("line", match.get("line_number", 0)),
+                "uri": file_uri,
+                "content": match.get("content", ""),
+            })
 
             if node_limit and len(results) >= node_limit:
                 break
@@ -1585,13 +1588,11 @@ class VikingFS:
             lines = content.split("\n")
             for line_num, line in enumerate(lines, 1):
                 if compiled_pattern.search(line):
-                    matches.append(
-                        {
-                            "line": line_num,
-                            "uri": entry_uri,
-                            "content": line,
-                        }
-                    )
+                    matches.append({
+                        "line": line_num,
+                        "uri": entry_uri,
+                        "content": line,
+                    })
             return matches, 1
         except Exception as e:
             logger.debug(f"Failed to grep {entry_uri}: {e}")
@@ -1874,17 +1875,15 @@ class VikingFS:
         ):
             info = entry["info"]
             new_entry = dict(entry.get("extra", {}))
-            new_entry.update(
-                {
-                    "name": info["name"],
-                    "size": info["size"],
-                    "mode": info["mode"],
-                    "modTime": info["modTime"],
-                    "isDir": info["isDir"],
-                    "rel_path": entry["rel_path"],
-                    "uri": entry_uri,
-                }
-            )
+            new_entry.update({
+                "name": info["name"],
+                "size": info["size"],
+                "mode": info["mode"],
+                "modTime": info["modTime"],
+                "isDir": info["isDir"],
+                "rel_path": entry["rel_path"],
+                "uri": entry_uri,
+            })
             result.append(new_entry)
         return result
 
@@ -1909,15 +1908,13 @@ class VikingFS:
         ):
             info = entry["info"]
             is_dir = info["isDir"]
-            result.append(
-                {
-                    "uri": entry_uri,
-                    "size": 0 if is_dir else info["size"],
-                    "isDir": is_dir,
-                    "modTime": format_iso8601(parse_iso_datetime(info["modTime"])),
-                    "rel_path": entry["rel_path"],
-                }
-            )
+            result.append({
+                "uri": entry_uri,
+                "size": 0 if is_dir else info["size"],
+                "isDir": is_dir,
+                "modTime": format_iso8601(parse_iso_datetime(info["modTime"])),
+                "rel_path": entry["rel_path"],
+            })
 
         await self._batch_fetch_abstracts(result, abs_limit, ctx=ctx)
 
@@ -3016,19 +3013,23 @@ class VikingFS:
 
         async def _collect(p: str):
             try:
-                for entry in await self._ls_entries(p, ctx=ctx):
-                    name = entry.get("name", "")
-                    if name in [".", ".."]:
-                        continue
-                    full_path = f"{p}/{name}".replace("//", "/")
-                    if entry.get("isDir"):
-                        uris.append(self._path_to_uri(full_path, ctx=ctx))
-                        if recursive:
-                            await _collect(full_path)
-                    else:
-                        uris.append(self._path_to_uri(full_path, ctx=ctx))
-            except Exception:
-                pass
+                entries = await self._ls_entries(p, ctx=ctx)
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    return
+                raise
+
+            for entry in entries:
+                name = entry.get("name", "")
+                if name in [".", ".."]:
+                    continue
+                full_path = f"{p}/{name}".replace("//", "/")
+                if entry.get("isDir"):
+                    uris.append(self._path_to_uri(full_path, ctx=ctx))
+                    if recursive:
+                        await _collect(full_path)
+                else:
+                    uris.append(self._path_to_uri(full_path, ctx=ctx))
 
         await _collect(path)
         return uris
@@ -3051,6 +3052,7 @@ class VikingFS:
                 logger.debug(f"[VikingFS] Deleted from vector store: {uri}")
         except Exception as e:
             logger.warning(f"[VikingFS] Failed to delete from vector store: {e}")
+            raise
 
     async def _update_vector_store_uris(
         self,
@@ -3729,16 +3731,14 @@ class VikingFS:
     # crates/ragfs/src/git/enumerate.rs and VikingFS._INTERNAL_NAMES so that
     # callers fail fast in Python with a clear error rather than passing a
     # path that the Rust side will silently drop.
-    _GIT_INTERNAL_FIRST_SEGMENTS = frozenset(
-        {
-            "_system",
-            "tasks",
-            "temp",
-            "queue",
-            "upload",
-            ".path.ovlock",
-        }
-    )
+    _GIT_INTERNAL_FIRST_SEGMENTS = frozenset({
+        "_system",
+        "tasks",
+        "temp",
+        "queue",
+        "upload",
+        ".path.ovlock",
+    })
 
     _DEFAULT_GIT_AUTHOR_NAME = "viking-bot"
     _DEFAULT_GIT_AUTHOR_EMAIL = "bot@viking.local"
@@ -4406,12 +4406,10 @@ class VikingFS:
             from openviking.service.reindex_executor import get_reindex_executor
 
             executor = get_reindex_executor()
-            await asyncio.gather(
-                *[
-                    self._run_vector_rebuild(executor, op, uri, level, ctx)
-                    for (op, uri, level) in tasks
-                ]
-            )
+            await asyncio.gather(*[
+                self._run_vector_rebuild(executor, op, uri, level, ctx)
+                for (op, uri, level) in tasks
+            ])
             await tracker.complete(
                 task_id,
                 {"status": "completed", "task_count": len(tasks)},
