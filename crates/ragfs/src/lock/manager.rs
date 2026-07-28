@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::core::internal_names::PATH_LOCK_FILE;
+use crate::core::internal_names::{EXACT_LOCK_FILE_PREFIX, PATH_LOCK_FILE};
 use crate::core::FileSystem;
 
 use super::metrics::LockMetrics;
@@ -1213,32 +1213,50 @@ impl PathLockManager {
                 "handoff owner_id and lock_paths must not be empty".to_string(),
             ));
         }
-        if handoff.covered_paths.len() != handoff.lock_paths.len() {
+        let legacy_handoff = handoff.covered_paths.is_empty();
+        if !legacy_handoff && handoff.covered_paths.len() != handoff.lock_paths.len() {
             return Err(PathLockError::InvalidRequest(
                 "handoff lock_paths and covered_paths must have equal lengths".to_string(),
             ));
         }
         let now_ns = Self::now_ns();
 
-        // Verify each claimed coverage maps to a live token with the same owner and kind.
-        for (lp, request) in handoff.lock_paths.iter().zip(&handoff.covered_paths) {
-            let expected_paths = match request.kind {
-                PathLockKind::Exact => {
-                    self.resolver.resolve_exact_conflict_paths(&request.path).await?
+        // ponytail: legacy durable handoffs only persisted owner_id/handle_id + lock_paths.
+        // We validate live ownership/kind by the lock file path itself and keep covered_paths empty.
+        // Upgrade path: once old queue payloads are drained, remove this branch and require covered_paths.
+        for (index, lp) in handoff.lock_paths.iter().enumerate() {
+            let expected_kind = if legacy_handoff {
+                let file_name = lp.rsplit('/').next().unwrap_or("");
+                if lp == &format!("/{}", PATH_LOCK_FILE) || lp.ends_with(&format!("/{}", PATH_LOCK_FILE)) {
+                    PathLockKind::Tree
+                } else if file_name.starts_with(EXACT_LOCK_FILE_PREFIX) {
+                    PathLockKind::Exact
+                } else {
+                    return Err(PathLockError::InvalidRequest(format!(
+                        "legacy handoff lock path '{lp}' is not a supported lock file"
+                    )));
                 }
-                PathLockKind::Tree => {
-                    vec![self.resolver.resolve_tree_lock_path(&request.path).await?]
+            } else {
+                let request = &handoff.covered_paths[index];
+                let expected_paths = match request.kind {
+                    PathLockKind::Exact => {
+                        self.resolver.resolve_exact_conflict_paths(&request.path).await?
+                    }
+                    PathLockKind::Tree => {
+                        vec![self.resolver.resolve_tree_lock_path(&request.path).await?]
+                    }
+                };
+                if !expected_paths.contains(lp) {
+                    return Err(PathLockError::InvalidRequest(format!(
+                        "handoff coverage '{}' does not map to lock path '{lp}'",
+                        request.path
+                    )));
                 }
+                request.kind
             };
-            if !expected_paths.contains(lp) {
-                return Err(PathLockError::InvalidRequest(format!(
-                    "handoff coverage '{}' does not map to lock path '{lp}'",
-                    request.path
-                )));
-            }
             match self.provider.read_token(lp).await? {
                 Some(token)
-                    if token.owner_id == handoff.owner_id && token.lock_type == request.kind =>
+                    if token.owner_id == handoff.owner_id && token.lock_type == expected_kind =>
                 {
                     // Still valid — refresh the timestamp.
                     match self
