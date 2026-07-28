@@ -77,7 +77,7 @@ pub async fn build_multi_write_fs(
                 config.name
             )));
         }
-        Arc::new(EncryptionWrappedFS::with_pathlock(
+        Arc::new(EncryptionWrappedFS::new(
             primary_raw.clone(),
             build_ctx
                 .enc_root_key
@@ -140,7 +140,7 @@ pub async fn build_multi_write_fs(
                     item.backend
                 )));
             }
-            Arc::new(EncryptionWrappedFS::with_pathlock(
+            Arc::new(EncryptionWrappedFS::new(
                 backup_raw,
                 build_ctx
                     .enc_root_key

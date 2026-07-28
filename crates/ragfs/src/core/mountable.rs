@@ -365,7 +365,7 @@ impl MountableFS {
                                 .get()
                                 .cloned()
                                 .expect("pathlock manager must be initialized before mount");
-                            Arc::new(EncryptionWrappedFS::with_pathlock(
+                            Arc::new(EncryptionWrappedFS::new(
                                 storage_fs,
                                 rk,
                                 pt,

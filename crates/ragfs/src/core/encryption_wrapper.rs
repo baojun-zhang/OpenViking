@@ -55,7 +55,7 @@ impl EncryptionWrappedFS {
     }
 
     /// Construct an encryption layer with a pathlock manager for dual-path exact lock.
-    pub fn with_pathlock(
+    pub fn new(
         inner: Arc<dyn FileSystem>,
         root_key: [u8; 32],
         provider_type: u8,
@@ -621,7 +621,7 @@ mod tests {
     async fn write_then_read_roundtrip_under_ctx() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [9u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -644,7 +644,7 @@ mod tests {
     async fn on_disk_bytes_are_ciphertext_with_envelope() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner.clone(),
             [9u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -670,7 +670,7 @@ mod tests {
     async fn read_without_account_id_errors() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner.clone(),
             [9u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -694,7 +694,7 @@ mod tests {
     async fn read_offset_size_slicing() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [1u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -717,7 +717,7 @@ mod tests {
     async fn grep_matches_encrypted_files() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [2u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -748,7 +748,7 @@ mod tests {
     async fn write_rejects_nonzero_offset() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [2u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -767,7 +767,7 @@ mod tests {
     async fn create_writes_encrypted_empty_file() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner.clone(),
             [2u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -790,7 +790,7 @@ mod tests {
     async fn cross_account_cannot_decrypt() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [3u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -815,7 +815,7 @@ mod tests {
     async fn write_rejects_append_flag() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [4u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -839,7 +839,7 @@ mod tests {
     async fn write_rejects_non_replacing_none_flag() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [4u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -861,7 +861,7 @@ mod tests {
     async fn rename_rejects_cross_account_paths() {
         let inner = memfs_stack_at("/local").await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner,
             [5u8; 32],
             crypto::PROVIDER_LOCAL,
@@ -886,7 +886,7 @@ mod tests {
     async fn write_replaces_stale_internal_temp_file_before_publish() {
         let inner = memfs_stack().await;
         let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
+        let enc = EncryptionWrappedFS::new(
             inner.clone(),
             [6u8; 32],
             crypto::PROVIDER_LOCAL,
