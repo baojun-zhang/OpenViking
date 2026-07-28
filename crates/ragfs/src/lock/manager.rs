@@ -12,7 +12,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::core::internal_names::{EXACT_LOCK_FILE_PREFIX, PATH_LOCK_FILE};
-use crate::core::FileSystem;
+use crate::core::{FileSystem, FsContextView};
 
 use super::metrics::LockMetrics;
 use super::provider::PathLockProvider;
@@ -39,6 +39,17 @@ impl Default for PathLockConfig {
             lock_expire_secs: 300.0,
         }
     }
+}
+
+/// Decision for one automatic PathLock operation under the current FS context.
+#[derive(Debug, Clone)]
+pub enum AutoPathLockAction {
+    /// The scoped context explicitly disables automatic PathLock.
+    Disabled,
+    /// An active owned lease already covers the operation.
+    Covered(OwnedPathLockLease),
+    /// No lease is supplied, so the caller must acquire locks.
+    Acquire,
 }
 
 /// Internal registry entry for an active lease.
@@ -1434,6 +1445,35 @@ impl PathLockManager {
         }
     }
 
+    /// Resolve automatic PathLock behavior from the current immutable FS context.
+    pub async fn resolve_auto_pathlock_action(
+        &self,
+        requests: &[PathLockRequest],
+    ) -> PathLockResult<AutoPathLockAction> {
+        let view = FsContextView::current();
+        if view.disable_auto_pathlock() {
+            return Ok(AutoPathLockAction::Disabled);
+        }
+        let Some(lease_ref) = view.pathlock_lease_ref() else {
+            return Ok(AutoPathLockAction::Acquire);
+        };
+        let lease = self
+            .get_owned_lease_by_ref(lease_ref)
+            .await
+            .ok_or_else(|| {
+                PathLockError::InvalidRequest(format!(
+                    "unknown pathlock lease ref '{lease_ref}'"
+                ))
+            })?;
+        if requests.iter().all(|request| lease.lease.covers(request)) {
+            Ok(AutoPathLockAction::Covered(lease))
+        } else {
+            Err(PathLockError::InvalidRequest(format!(
+                "pathlock lease ref '{lease_ref}' does not cover the requested operation"
+            )))
+        }
+    }
+
     /// Return a reference to the metrics for external reading.
     pub async fn metrics_snapshot(&self) -> LockMetrics {
         self.metrics.read().await.clone()
@@ -1444,6 +1484,7 @@ impl PathLockManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use crate::core::{FsContextInner, PathLockContext, FS_CTX};
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::atomic::{AtomicBool, Ordering};
 

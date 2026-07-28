@@ -21,7 +21,7 @@ pub mod types;
 pub mod wrapper;
 
 pub use codec::LockTokenCodec;
-pub use manager::{PathLockConfig, PathLockManager};
+pub use manager::{AutoPathLockAction, PathLockConfig, PathLockManager};
 pub use metrics::LockMetrics;
 pub use provider::{FilesystemPathLockProvider, MemoryPathLockProvider, PathLockProvider};
 pub use resolver::LockPathResolver;

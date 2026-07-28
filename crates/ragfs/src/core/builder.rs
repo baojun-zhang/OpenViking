@@ -296,7 +296,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("does not cover final path"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not cover the requested operation")
+        );
         manager.release(&outer).await.unwrap();
     }
 

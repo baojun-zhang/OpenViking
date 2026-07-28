@@ -147,9 +147,9 @@ impl MetaStateStore {
     /// Build the effective context for metadata access.
     fn effective_meta_ctx(dir: &str, ctx: &FsContext) -> FsContext {
         if dir == "/" {
-            Self::system_ctx()
+            Arc::new(Self::system_ctx().with_auto_pathlock_disabled())
         } else {
-            ctx.clone()
+            Arc::new(ctx.with_auto_pathlock_disabled())
         }
     }
 

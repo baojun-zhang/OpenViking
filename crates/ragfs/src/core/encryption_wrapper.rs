@@ -18,7 +18,9 @@ use tracing::warn;
 
 use crate::crypto;
 use crate::core::internal_names::is_hidden_runtime_lock_name;
-use crate::lock::{PathLockKind, PathLockManager, PathLockRequest};
+use crate::lock::{
+    AutoPathLockAction, PathLockKind, PathLockManager, PathLockRequest,
+};
 use crate::shape::SHAPE_MANIFEST_PATH;
 
 use super::context::FsContextView;
@@ -380,39 +382,42 @@ impl FileSystem for EncryptionWrappedFS {
             PathLockRequest { path: temp_lock_path, kind: PathLockKind::Exact },
             final_request.clone(),
         ];
-        let lease_ref = FsContextView::current()
-            .pathlock_lease_ref()
-            .map(str::to_string);
-        let outer_lease = match lease_ref {
-            Some(lease_ref) => {
-                let outer = self
-                    .pathlock_manager
-                    .get_owned_lease_by_ref(&lease_ref)
-                    .await
-                    .ok_or_else(|| {
-                        Error::internal(format!("encrypted write lock lease not found: {lease_ref}"))
-                    })?;
-                if !outer.lease.covers(&final_request) {
-                    return Err(Error::internal(format!(
-                        "encrypted write lock lease '{lease_ref}' does not cover final path '{}'",
-                        final_request.path
-                    )));
-                }
-                Some(outer)
-            }
-            None => None,
-        };
-        let owner_capability = outer_lease.as_ref().map(|lease| {
-            (
-                lease.lease.lease_ref.as_str(),
-                lease.ownership_ref.as_str(),
-            )
-        });
-        let lock_guard = self
+        let action = self
             .pathlock_manager
-            .acquire_batch(&requests, Duration::from_secs(30), owner_capability)
+            .resolve_auto_pathlock_action(&[final_request])
             .await
-            .map_err(|e| Error::internal(format!("encrypted write lock error: {e}")))?;
+            .map_err(|error| {
+                Error::internal(format!("encrypted write lock context error: {error}"))
+            })?;
+        let lock_guard = match action {
+            AutoPathLockAction::Disabled => None,
+            AutoPathLockAction::Covered(outer) => {
+                let owner_capability = (
+                    outer.lease.lease_ref.as_str(),
+                    outer.ownership_ref.as_str(),
+                );
+                Some(
+                    self.pathlock_manager
+                        .acquire_batch(
+                            &requests,
+                            Duration::from_secs(30),
+                            Some(owner_capability),
+                        )
+                        .await
+                        .map_err(|error| {
+                            Error::internal(format!("encrypted write lock error: {error}"))
+                        })?,
+                )
+            }
+            AutoPathLockAction::Acquire => Some(
+                self.pathlock_manager
+                    .acquire_batch(&requests, Duration::from_secs(30), None)
+                    .await
+                    .map_err(|error| {
+                        Error::internal(format!("encrypted write lock error: {error}"))
+                    })?,
+            ),
+        };
 
         // Release lock on error. On success, release after replace.
         let result = self.encrypted_write_inner(path, &temp_path, &envelope).await;
@@ -420,8 +425,11 @@ impl FileSystem for EncryptionWrappedFS {
             Ok(written) => self.inner.replace(&temp_path, path).await.map(|_| written),
             Err(e) => Err(e),
         };
-        // Always release the dual-path lock, even if replace fails.
-        let release_result = self.pathlock_manager.release(&lock_guard).await;
+        // Release an acquired dual-path lock even if replace fails.
+        let release_result = match lock_guard.as_ref() {
+            Some(guard) => self.pathlock_manager.release(guard).await,
+            None => Ok(()),
+        };
         match (replace_result, release_result) {
             (Err(error), _) => Err(error),
             (Ok(written), Ok(())) => Ok(written),

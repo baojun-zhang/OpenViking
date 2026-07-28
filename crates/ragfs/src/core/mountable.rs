@@ -13,14 +13,15 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::lock::{PathLockKind, PathLockManager, PathLockRequest};
+use crate::lock::{
+    AutoPathLockAction, PathLockKind, PathLockManager, PathLockRequest,
+};
 use crate::multibackend::factory::build_multi_write_fs;
 use crate::multibackend::types::MultiBackendBuildContext;
 use crate::shape::validate::ensure_backend_shape;
 
 use super::internal_names::is_hidden_internal_name;
 
-use super::context::FsContextView;
 use super::encryption_wrapper::EncryptionWrappedFS;
 use super::errors::{Error, Result};
 use super::filesystem::{sort_directory_entries, validate_virtual_path, FileSystem};
@@ -605,28 +606,20 @@ impl MountableFS {
             .get()
             .cloned()
             .expect("pathlock manager must be initialized before raw copy");
-        let view = FsContextView::current();
-        let auto_lease = if view.disable_auto_pathlock() {
-            None
-        } else {
-            let request = PathLockRequest {
-                path: dst_path.to_string(),
-                kind: PathLockKind::Exact,
-            };
-            match view.pathlock_lease_ref() {
-                Some(lease_ref) => {
-                    manager
-                        .require_covered_lease_ref(lease_ref, &[request])
-                        .await
-                        .map_err(|error| Error::internal(format!("lock lease error: {error}")))?;
-                    None
-                }
-                None => Some(
-                    manager
-                        .acquire_exact(dst_path, Duration::from_secs(30), None)
-                        .await
-                        .map_err(|error| Error::internal(format!("lock error: {error}")))?,
-                ),
+        let request = PathLockRequest {
+            path: dst_path.to_string(),
+            kind: PathLockKind::Exact,
+        };
+        let auto_lease = match manager.resolve_auto_pathlock_action(&[request]).await {
+            Ok(AutoPathLockAction::Disabled | AutoPathLockAction::Covered(_)) => None,
+            Ok(AutoPathLockAction::Acquire) => Some(
+                manager
+                    .acquire_exact(dst_path, Duration::from_secs(30), None)
+                    .await
+                    .map_err(|error| Error::internal(format!("lock error: {error}")))?,
+            ),
+            Err(error) => {
+                return Err(Error::internal(format!("lock lease error: {error}")));
             }
         };
 

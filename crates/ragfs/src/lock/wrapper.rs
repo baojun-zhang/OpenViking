@@ -12,13 +12,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::core::context::FsContextView;
 use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_hidden_runtime_lock_name;
 use crate::core::types::{FileInfo, GlobPage, GrepResult, TreeEntry, WriteFlag};
 use crate::core::MountableFS;
 
-use super::manager::PathLockManager;
+use super::manager::{AutoPathLockAction, PathLockManager};
 use super::types::{PathLockKind, PathLockRequest};
 
 /// Default timeout for auto-acquired locks.
@@ -57,27 +56,17 @@ impl PathLockWrappedFS {
 
     /// Check if auto-locking should be skipped for the current context.
     ///
-    /// Returns `true` only when the context carries a lease_ref that maps to an
-    /// active owned lease in the manager's registry. A bare string that does not
-    /// correspond to a real lease is rejected.
+    /// Returns `true` when auto-locking is disabled or an active lease covers the operation.
     async fn should_skip_auto_lock(
         &self,
         requests: &[PathLockRequest],
     ) -> crate::core::Result<bool> {
-        let view = FsContextView::current();
-        if view.disable_auto_pathlock() {
-            return Ok(true);
-        }
-        match view.pathlock_lease_ref() {
-            Some(lease_ref) => self
-                .manager
-                .require_covered_lease_ref(lease_ref, requests)
-                .await
-                .map(|_| true)
-                .map_err(|error| {
-                    crate::core::Error::internal(format!("lock lease error: {error}"))
-                }),
-            None => Ok(false),
+        match self.manager.resolve_auto_pathlock_action(requests).await {
+            Ok(AutoPathLockAction::Disabled | AutoPathLockAction::Covered(_)) => Ok(true),
+            Ok(AutoPathLockAction::Acquire) => Ok(false),
+            Err(error) => Err(crate::core::Error::internal(format!(
+                "lock lease error: {error}"
+            ))),
         }
     }
 

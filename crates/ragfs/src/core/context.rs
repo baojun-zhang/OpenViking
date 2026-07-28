@@ -24,7 +24,7 @@ tokio::task_local! {
 pub struct PathLockContext {
     /// Lease reference string for an existing owned lease.
     pub lease_ref: Option<String>,
-    /// When true, `PathLockWrappedFS` skips auto-locking.
+    /// When true, automatic PathLock consumers skip lock validation and acquisition.
     pub disable_auto_pathlock: bool,
 }
 
@@ -63,6 +63,16 @@ impl FsContextInner {
     /// PathLock context, if set.
     pub fn pathlock(&self) -> Option<&PathLockContext> {
         self.pathlock.as_ref()
+    }
+
+    /// Return a context copy that preserves identity and lease while disabling automatic PathLock.
+    pub fn with_auto_pathlock_disabled(&self) -> Self {
+        let mut pathlock = self.pathlock.clone().unwrap_or_default();
+        pathlock.disable_auto_pathlock = true;
+        Self {
+            account_id: self.account_id.clone(),
+            pathlock: Some(pathlock),
+        }
     }
 }
 
