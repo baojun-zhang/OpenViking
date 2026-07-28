@@ -352,33 +352,34 @@ class ResourceService:
         queue_name: str,
         resource_lock: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """Persist a job before its TaskRecord so a crash cannot orphan the task."""
+        """Persist a job and fully own the passed lock until handoff or release completes."""
         from openviking.service.task_tracker import get_task_tracker
         from openviking.storage.queuefs import get_queue_manager
 
+        tracker = get_task_tracker()
         try:
             await get_queue_manager().enqueue(queue_name, msg.to_dict())
             if resource_lock is not None:
                 await self._viking_fs._async_agfs.pathlock_handoff(resource_lock)
+                resource_lock = None
+            task = await tracker.create(
+                "add_resource",
+                resource_id=None if msg.defer_target_resolution else msg.root_uri,
+                account_id=msg.account_id,
+                user_id=msg.user_id,
+                task_id=msg.task_id,
+            )
+            await tracker.update_stage(
+                task.task_id,
+                "queued",
+                account_id=msg.account_id,
+                user_id=msg.user_id,
+            )
         except BaseException:
             if resource_lock is not None:
                 await self._viking_fs._async_agfs.pathlock_release(resource_lock)
             raise
 
-        tracker = get_task_tracker()
-        task = await tracker.create(
-            "add_resource",
-            resource_id=None if msg.defer_target_resolution else msg.root_uri,
-            account_id=msg.account_id,
-            user_id=msg.user_id,
-            task_id=msg.task_id,
-        )
-        await tracker.update_stage(
-            task.task_id,
-            "queued",
-            account_id=msg.account_id,
-            user_id=msg.user_id,
-        )
         return task
 
     async def execute_add_resource_job(
@@ -593,12 +594,13 @@ class ResourceService:
                 source_name=source_name,
                 args=self._sanitize_watch_processor_kwargs(processor_args),
             )
+            enqueue_lock = resource_lock
+            resource_lock = None
             task = await self._enqueue_add_resource_job(
                 msg,
                 queue_name=QueueManager.ADD_RESOURCE,
-                resource_lock=resource_lock,
+                resource_lock=enqueue_lock,
             )
-            resource_lock = None
             return {
                 "status": "success",
                 "root_uri": root_uri,
@@ -1123,16 +1125,17 @@ class ResourceService:
                         understanding_response_id=understanding_response_id,
                     )
                     enqueue_started = True
+                    enqueue_lock = lock_lease
+                    lock_lease = None
                     task = await self._enqueue_add_resource_job(
                         msg,
                         queue_name=QueueManager.EXTERNAL_PARSE,
-                        resource_lock=lock_lease,
+                        resource_lock=enqueue_lock,
                     )
                 except BaseException:
                     if not enqueue_started and lock_lease is not None:
                         await self._viking_fs._async_agfs.pathlock_release(lock_lease)
                     raise
-                lock_lease = None
                 job_enqueued = True
                 logger.info(
                     "[ResourceService] Enqueued AddResourceMsg task_id=%s root_uri=%s",
@@ -1269,12 +1272,13 @@ class ResourceService:
                     source_name=kwargs.get("source_name"),
                     skip_watch_management=True,
                 )
+                enqueue_lock = deferred_lock
+                deferred_lock = None
                 task = await self._enqueue_add_resource_job(
                     msg,
                     queue_name=QueueManager.ADD_RESOURCE,
-                    resource_lock=deferred_lock,
+                    resource_lock=enqueue_lock,
                 )
-                deferred_lock = None
                 result["task_id"] = task.task_id
                 job_enqueued = True
             await self._manage_watch_if_needed(
