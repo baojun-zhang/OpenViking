@@ -154,60 +154,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_existing_dir_uses_path_ovlock() {
+    async fn resolver_uses_path_lock_for_directories_and_sidecars_for_files() {
         let fs = memfs().await;
         fs.mkdir("/data/dir", 0o755).await.unwrap();
-        let resolver = LockPathResolver::new(fs);
-        let paths = resolver.resolve_exact_lock_paths("/data/dir").await.unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], "/data/dir/.path.ovlock");
-    }
-
-    #[tokio::test]
-    async fn exact_existing_file_uses_sidecar() {
-        let fs = memfs().await;
         fs.write("/data/file.txt", b"", 0, WriteFlag::Create)
             .await
             .unwrap();
         let resolver = LockPathResolver::new(fs);
-        let paths = resolver.resolve_exact_lock_paths("/data/file.txt").await.unwrap();
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].starts_with("/data/.exact.ovlock.file.txt."));
-    }
 
-    #[tokio::test]
-    async fn exact_missing_path_uses_sidecar() {
-        let fs = memfs().await;
-        let resolver = LockPathResolver::new(fs);
-        let paths = resolver
-            .resolve_exact_lock_paths("/data/new.txt")
+        assert_eq!(
+            resolver.resolve_exact_lock_paths("/data/dir").await.unwrap(),
+            vec!["/data/dir/.path.ovlock".to_string()]
+        );
+        assert_eq!(
+            resolver.resolve_tree_lock_path("/data/dir").await.unwrap(),
+            "/data/dir/.path.ovlock"
+        );
+
+        let exact_file = resolver
+            .resolve_exact_lock_paths("/data/file.txt")
             .await
             .unwrap();
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].starts_with("/data/.exact.ovlock.new.txt."));
-    }
-
-    #[tokio::test]
-    async fn tree_existing_dir_uses_path_ovlock() {
-        let fs = memfs().await;
-        fs.mkdir("/data/dir", 0o755).await.unwrap();
-        let resolver = LockPathResolver::new(fs);
-        let lock_path = resolver.resolve_tree_lock_path("/data/dir").await.unwrap();
-        assert_eq!(lock_path, "/data/dir/.path.ovlock");
-    }
-
-    #[tokio::test]
-    async fn tree_existing_file_uses_sidecar() {
-        let fs = memfs().await;
-        fs.write("/data/file.txt", b"", 0, WriteFlag::Create)
-            .await
-            .unwrap();
-        let resolver = LockPathResolver::new(fs);
-        let lock_path = resolver
+        assert!(exact_file[0].starts_with("/data/.exact.ovlock.file.txt."));
+        assert!(resolver
             .resolve_tree_lock_path("/data/file.txt")
             .await
-            .unwrap();
-        assert!(lock_path.starts_with("/data/.exact.ovlock.file.txt."));
+            .unwrap()
+            .starts_with("/data/.exact.ovlock.file.txt."));
+        assert!(resolver
+            .resolve_exact_lock_paths("/data/new.txt")
+            .await
+            .unwrap()[0]
+            .starts_with("/data/.exact.ovlock.new.txt."));
     }
 
     #[test]

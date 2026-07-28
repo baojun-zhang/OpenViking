@@ -170,17 +170,16 @@ async def test_register_user(manager: APIKeyManager):
 async def test_concurrent_registry_writes_wait_for_locks(manager: APIKeyManager):
     first_account = _uid()
     second_account = _uid()
-
-    # Block pathlock_acquire_exact to simulate lock contention
     accounts_block = asyncio.Event()
-    _orig_acquire = manager._legacy._async_agfs.pathlock_acquire_exact
+    original_acquire = manager._legacy._async_agfs.pathlock_acquire_exact
 
-    async def _block_accounts(path, timeout_secs=10.0):
+    async def blocked_acquire(path, timeout_secs=10.0, owner_id_hint=None, *, fs_ctx=None):
+        del owner_id_hint, fs_ctx
         if path == ACCOUNTS_PATH:
             await accounts_block.wait()
-        return await _orig_acquire(path, timeout_secs=timeout_secs)
+        return await original_acquire(path, timeout_secs=timeout_secs)
 
-    manager._legacy._async_agfs.pathlock_acquire_exact = _block_accounts
+    manager._legacy._async_agfs.pathlock_acquire_exact = blocked_acquire
 
     account_tasks = [
         asyncio.create_task(manager.create_account(first_account, "alice")),
@@ -194,17 +193,16 @@ async def test_concurrent_registry_writes_wait_for_locks(manager: APIKeyManager)
     accounts = await manager._read_json(ACCOUNTS_PATH)
     assert {first_account, second_account} <= set(accounts["accounts"])
 
-    manager._legacy._async_agfs.pathlock_acquire_exact = _orig_acquire
-
     users_path = f"/local/{first_account}/_system/users.json"
     users_block = asyncio.Event()
 
-    async def _block_users(path, timeout_secs=10.0):
+    async def blocked_users_acquire(path, timeout_secs=10.0, owner_id_hint=None, *, fs_ctx=None):
+        del owner_id_hint, fs_ctx
         if path == users_path:
             await users_block.wait()
-        return await _orig_acquire(path, timeout_secs=timeout_secs)
+        return await original_acquire(path, timeout_secs=timeout_secs)
 
-    manager._legacy._async_agfs.pathlock_acquire_exact = _block_users
+    manager._legacy._async_agfs.pathlock_acquire_exact = blocked_users_acquire
 
     user_tasks = [
         asyncio.create_task(manager.register_user(first_account, "bob")),
@@ -218,7 +216,7 @@ async def test_concurrent_registry_writes_wait_for_locks(manager: APIKeyManager)
     users = await manager._read_json(users_path)
     assert set(users["users"]) == {"alice", "bob", "carol"}
 
-    manager._legacy._async_agfs.pathlock_acquire_exact = _orig_acquire
+    manager._legacy._async_agfs.pathlock_acquire_exact = original_acquire
 
 
 async def test_register_duplicate_user_raises(manager: APIKeyManager):

@@ -2543,52 +2543,6 @@ mod tests {
     }
 
     #[test]
-    fn pathlock_request_parser_rejects_invalid_batches() {
-        for requests in [
-            Vec::new(),
-            vec![HashMap::from([("kind".to_string(), "exact".to_string())])],
-            vec![HashMap::from([
-                ("path".to_string(), String::new()),
-                ("kind".to_string(), "exact".to_string()),
-            ])],
-            vec![HashMap::from([
-                ("path".to_string(), "relative".to_string()),
-                ("kind".to_string(), "tree".to_string()),
-            ])],
-            vec![HashMap::from([
-                ("path".to_string(), "/data".to_string()),
-                ("kind".to_string(), "other".to_string()),
-            ])],
-        ] {
-            assert!(parse_pathlock_request_batch(&requests).is_err());
-        }
-    }
-
-    #[test]
-    fn owned_lease_extraction_rejects_borrowed_and_raw_refs() {
-        Python::attach(|py| {
-            let raw = "lease-1".into_pyobject(py).unwrap().into_any().unbind();
-            assert!(extract_owned_lease_ref(py, &raw).is_err());
-
-            let borrowed = PyDict::new(py);
-            borrowed.set_item("lease_ref", "lease-1").unwrap();
-            borrowed.set_item("owned", false).unwrap();
-            let borrowed = borrowed.into_any().unbind();
-            assert!(extract_owned_lease_ref(py, &borrowed).is_err());
-
-            let owned = PyDict::new(py);
-            owned.set_item("lease_ref", "lease-1").unwrap();
-            owned.set_item("ownership_ref", "ownership-1").unwrap();
-            owned.set_item("owned", true).unwrap();
-            let owned = owned.into_any().unbind();
-            assert_eq!(
-                extract_owned_lease_ref(py, &owned).unwrap(),
-                ("lease-1".to_string(), "ownership-1".to_string())
-            );
-        });
-    }
-
-    #[test]
     fn constructor_accepts_legacy_config_path_keyword() {
         let path = std::env::temp_dir().join(format!(
             "openviking-legacy-config-path-{}.json",

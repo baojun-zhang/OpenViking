@@ -534,7 +534,10 @@ def _print_iterative_real_llm_summary(
 
 
 def _patch_experience_prefetch(monkeypatch, fs: InMemoryVikingFS, experience_uri: str) -> None:
+    """Patch experience prefetch so the test reads from the in-memory filesystem."""
+
     async def search_files(self, query, search_uris=None, limit=5):
+        del self, query, search_uris, limit
         return [experience_uri]
 
     async def read_file(self, uri):

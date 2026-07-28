@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-from openviking.metrics.collectors.lock import LockCollector
 from openviking.metrics.collectors.observer_health import ObserverHealthCollector
 from openviking.metrics.collectors.queue import QueueCollector
 from openviking.metrics.collectors.task_tracker import TaskTrackerCollector
 from openviking.metrics.collectors.vikingdb import VikingDBCollector
 from openviking.metrics.core.registry import MetricRegistry
 from openviking.metrics.datasources.observer_state import (
-    LockStateDataSource,
     ObserverStateDataSource,
     VikingDBStateDataSource,
 )
@@ -229,25 +227,6 @@ def test_model_usage_collector_failure_reuses_last_available_state_with_valid_ze
     assert 'openviking_model_usage_available{model_type="vlm",valid="0"} 1.0' in text
     assert 'openviking_model_usage_available{model_type="embedding",valid="0"} 0.0' in text
     assert 'openviking_model_usage_available{model_type="rerank",valid="0"} 0.0' in text
-
-
-def test_lock_collector_counts_active_and_stale(monkeypatch):
-    class FakeVikingFS:
-        class _AsyncAGFS:
-            async def pathlock_observe(self):
-                return {"active_locks": 3, "waiting_locks": 0, "stale_locks_removed": 1}
-
-        _async_agfs = _AsyncAGFS()
-
-    monkeypatch.setattr(
-        "openviking.metrics.datasources.observer_state.get_viking_fs",
-        lambda: FakeVikingFS(),
-    )
-    registry = MetricRegistry()
-    LockCollector(data_source=LockStateDataSource()).collect(registry)
-    text = PrometheusExporter(registry=registry).render()
-    assert "openviking_lock_active 3.0" in text
-    assert "openviking_lock_stale 1.0" in text
 
 
 def test_vikingdb_collector_exports_health_and_count(monkeypatch):

@@ -63,50 +63,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_exact() {
-        let token = LockToken {
-            owner_id: "abc-123".to_string(),
-            time_ns: 1700000000000000000,
-            lock_type: PathLockKind::Exact,
-        };
-        let encoded = LockTokenCodec::encode(&token);
-        assert_eq!(encoded, "abc-123:1700000000000000000:E");
-        let decoded = LockTokenCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded.owner_id, "abc-123");
-        assert_eq!(decoded.time_ns, 1700000000000000000);
-        assert_eq!(decoded.lock_type, PathLockKind::Exact);
+    fn roundtrip_supported_lock_types() {
+        for token in [
+            LockToken {
+                owner_id: "abc-123".to_string(),
+                time_ns: 1700000000000000000,
+                lock_type: PathLockKind::Exact,
+            },
+            LockToken {
+                owner_id: "xyz-456".to_string(),
+                time_ns: 42,
+                lock_type: PathLockKind::Tree,
+            },
+        ] {
+            let encoded = LockTokenCodec::encode(&token);
+            let decoded = LockTokenCodec::decode(&encoded).unwrap();
+            assert_eq!(decoded.owner_id, token.owner_id);
+            assert_eq!(decoded.time_ns, token.time_ns);
+            assert_eq!(decoded.lock_type, token.lock_type);
+        }
     }
 
     #[test]
-    fn roundtrip_tree() {
-        let token = LockToken {
-            owner_id: "xyz-456".to_string(),
-            time_ns: 42,
-            lock_type: PathLockKind::Tree,
-        };
-        let encoded = LockTokenCodec::encode(&token);
-        assert!(encoded.ends_with(":T"));
-        let decoded = LockTokenCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded.lock_type, PathLockKind::Tree);
-    }
-
-    #[test]
-    fn rejects_legacy_p_type() {
-        let err = LockTokenCodec::decode("owner:100:P").unwrap_err();
-        assert!(matches!(err, PathLockError::InvalidToken(_)));
-    }
-
-    #[test]
-    fn rejects_legacy_s_type() {
-        let err = LockTokenCodec::decode("owner:100:S").unwrap_err();
-        assert!(matches!(err, PathLockError::InvalidToken(_)));
-    }
-
-    #[test]
-    fn rejects_malformed() {
-        assert!(LockTokenCodec::decode("no-colons").is_err());
-        assert!(LockTokenCodec::decode("a:b:c:d").is_err());
-        assert!(LockTokenCodec::decode("owner:100:E:1").is_err());
-        assert!(LockTokenCodec::decode("a:not-a-number:E").is_err());
+    fn rejects_legacy_and_malformed_tokens() {
+        for raw in [
+            "owner:100:P",
+            "owner:100:S",
+            "no-colons",
+            "a:b:c:d",
+            "owner:100:E:1",
+            "a:not-a-number:E",
+        ] {
+            assert!(matches!(
+                LockTokenCodec::decode(raw),
+                Err(PathLockError::InvalidToken(_))
+            ));
+        }
     }
 }

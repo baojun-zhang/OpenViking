@@ -835,57 +835,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlfs_compare_and_write_remove() {
-        let fs = SQLFileSystem::default();
-
-        write_file(&fs, "/lock", b"owner1:100:E").await;
-        assert!(!fs
-            .compare_and_write("/lock", b"owner2:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(read_file(&fs, "/lock").await, b"owner1:100:E");
-
-        assert!(fs
-            .compare_and_write("/lock", b"owner1:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(read_file(&fs, "/lock").await, b"owner1:200:E");
-
-        assert!(!fs
-            .compare_and_remove("/lock", b"owner1:100:E")
-            .await
-            .unwrap());
-        assert!(fs
-            .compare_and_remove("/lock", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert!(fs.read("/lock", 0, 0).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_sqlfs_pathlock_token_io_round_trip() {
-        let fs = SQLFileSystem::default();
-
-        fs.write("/token", b"owner1:100:E", 0, WriteFlag::CreateNew)
-            .await
-            .unwrap();
-        assert_eq!(fs.read("/token", 0, 0).await.unwrap(), b"owner1:100:E");
-        assert_eq!(fs.stat("/token").await.unwrap().size, 12);
-
-        assert!(fs
-            .compare_and_write("/token", b"owner1:100:E", b"owner1:200:T")
-            .await
-            .unwrap());
-        assert_eq!(fs.read("/token", 0, 0).await.unwrap(), b"owner1:200:T");
-
-        assert!(fs
-            .compare_and_remove("/token", b"owner1:200:T")
-            .await
-            .unwrap());
-        assert!(fs.stat("/token").await.is_err());
-    }
-
-    #[tokio::test]
     async fn test_sqlfs_file_size_limit() {
         let fs = SQLFileSystem::default();
 

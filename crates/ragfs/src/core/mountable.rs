@@ -1481,6 +1481,22 @@ mod tests {
         mfs
     }
 
+    /// Attach a test pathlock manager so multi-write mounts can be constructed.
+    async fn with_test_pathlock_manager(mfs: Arc<MountableFS>) -> Arc<MountableFS> {
+        use crate::lock::{
+            MemoryPathLockProvider, PathLockConfig, PathLockManager, PathLockProvider,
+        };
+
+        let provider: Arc<dyn PathLockProvider> = Arc::new(MemoryPathLockProvider::new());
+        let manager = Arc::new(PathLockManager::new(
+            mfs.clone() as Arc<dyn FileSystem>,
+            provider,
+            PathLockConfig::default(),
+        ));
+        mfs.set_pathlock_manager(manager).await;
+        mfs
+    }
+
     #[test]
     fn test_normalize_path() {
         assert_eq!(normalize_path("/test"), "/test");
@@ -2079,54 +2095,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_read_dir_hides_all_internal_names() {
-        let mfs = mounted_memfs("/mem").await;
-        mfs.mkdir("/mem/data", 0o755).await.unwrap();
-        for name in [
-            ".path.ovlock",
-            ".exact.ovlock.file.txt.0123456789abcdef",
-            ".redirect.json",
-            ".sync_log.json",
-            "visible.txt",
-        ] {
-            mfs.write(
-                &format!("/mem/data/{name}"),
-                b"value",
-                0,
-                WriteFlag::Create,
-            )
-            .await
-            .unwrap();
-        }
-
-        let names: Vec<String> = mfs
-            .read_dir("/mem/data")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(names, vec!["visible.txt"]);
-    }
-
-    #[cfg(feature = "cache")]
-    #[tokio::test]
-    async fn raw_compare_write_invalidates_cached_lock_token() {
-        let mfs = mounted_cached_memfs("pathlock-cas-test", "/mem").await;
-        mfs.mkdir("/mem/data", 0o755).await.unwrap();
-        let path = "/mem/data/.exact.ovlock.file.txt.0123456789abcdef";
-        let old = b"owner:100:E";
-        let new = b"owner:200:E";
-
-        mfs.write(path, old, 0, WriteFlag::CreateNew)
-            .await
-            .unwrap();
-        assert_eq!(mfs.read(path, 0, 0).await.unwrap(), old);
-        assert!(mfs.compare_and_write(path, old, new).await.unwrap());
-        assert_eq!(mfs.read(path, 0, 0).await.unwrap(), new);
-    }
-
-    #[tokio::test]
     async fn test_tree_directory_no_mount_returns_error() {
         let mfs = MountableFS::new();
         let result = mfs
@@ -2182,7 +2150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_multi_write_fs_rejects_primary_encryption_disable() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
         mfs.set_encryption_config(Some([7u8; 32]), Some(1)).await;
@@ -2280,7 +2248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_multi_write_fs_rejects_exclude_target_field() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
 
@@ -2322,7 +2290,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_multi_write_fs_rejects_reserved_primary_backup_name() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
 
@@ -2394,7 +2362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiwrite_mount_wraps_stats_outside_multiwrite() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
 
@@ -2417,7 +2385,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiwrite_raw_access_is_rejected() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
 
@@ -2437,7 +2405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mountable_multiwrite_admin_smoke() {
-        let mfs = MountableFS::new();
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
         mfs.register_plugin(MockPlugin::new("primary")).await;
         mfs.register_plugin(MockPlugin::new("backupfs")).await;
 

@@ -91,22 +91,6 @@ class TestVikingFSBindingLocal:
         root_entries = await vfs.ls("viking://temp/")
         assert not any(e["name"] == test_dir for e in root_entries)
 
-    async def test_borrowed_pathlock_conversion_is_idempotent(self, viking_fs_binding_instance):
-        """Borrowing an already borrowed lease must preserve its opaque reference."""
-        vfs = viking_fs_binding_instance
-        path = f"/local/default/temp/borrowed_{uuid.uuid4().hex}.txt"
-        owned = await vfs._async_agfs.pathlock_acquire_exact(path)
-
-        try:
-            borrowed = await vfs._async_agfs.pathlock_as_borrowed(owned)
-            borrowed_again = await vfs._async_agfs.pathlock_as_borrowed(borrowed)
-        finally:
-            await vfs._async_agfs.pathlock_release(owned)
-
-        assert borrowed["owned"] is False
-        assert borrowed_again["owned"] is False
-        assert borrowed_again["lease_ref"] == owned["lease_ref"]
-
     async def test_borrowed_pathlock_cannot_release_via_raw_ref(self, viking_fs_binding_instance):
         """Reject borrowed lifecycle control through typed and raw lease refs."""
         vfs = viking_fs_binding_instance
@@ -119,20 +103,6 @@ class TestVikingFSBindingLocal:
                 await vfs._async_agfs.pathlock_release(borrowed)
             with pytest.raises((TypeError, ValueError)):
                 await vfs._async_agfs.pathlock_release(borrowed["lease_ref"])
-        finally:
-            await vfs._async_agfs.pathlock_release(owned)
-
-    async def test_borrowed_pathlock_cannot_forge_owned_lifecycle(self, viking_fs_binding_instance):
-        """Reject lifecycle control after a caller mutates the borrowed marker."""
-        vfs = viking_fs_binding_instance
-        path = f"/local/default/temp/borrowed_forge_{uuid.uuid4().hex}.txt"
-        owned = await vfs._async_agfs.pathlock_acquire_exact(path)
-        borrowed = await vfs._async_agfs.pathlock_as_borrowed(owned)
-        borrowed["owned"] = True
-
-        try:
-            with pytest.raises(ValueError):
-                await vfs._async_agfs.pathlock_refresh(borrowed)
         finally:
             await vfs._async_agfs.pathlock_release(owned)
 

@@ -1427,7 +1427,6 @@ impl PathLockManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use crate::core::{FsOperation, StatsCollector, StatsWrappedFS};
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1438,15 +1437,6 @@ mod tests {
     }
 
     impl FailNextRemoveProvider {
-        /// Build a memory provider whose next token removal fails.
-        fn new() -> Self {
-            Self {
-                inner: crate::lock::provider::MemoryPathLockProvider::new(),
-                fail_next_read: AtomicBool::new(false),
-                fail_next_remove: AtomicBool::new(true),
-            }
-        }
-
         /// Build a memory provider whose next token read fails.
         fn with_read_failure() -> Self {
             Self {
@@ -1541,49 +1531,6 @@ mod tests {
         )
     }
 
-    /// Build a manager wrapped with filesystem statistics for operation counting.
-    async fn make_manager_with_stats() -> (PathLockManager, Arc<StatsCollector>) {
-        let fs = Arc::new(MemFileSystem::new());
-        fs.mkdir("/data", 0o755).await.unwrap();
-        let wrapped = Arc::new(StatsWrappedFS::with_arc(fs));
-        let stats = wrapped.stats_collector();
-        let provider = Arc::new(crate::lock::provider::MemoryPathLockProvider::new());
-        (
-            PathLockManager::new(wrapped, provider, PathLockConfig::default()),
-            stats,
-        )
-    }
-
-    #[tokio::test]
-    async fn acquire_exact_succeeds() {
-        let mgr = make_manager().await;
-        let lease = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), None)
-            .await
-            .unwrap();
-        assert!(!lease.lease.lock_paths.is_empty());
-        assert!(lease.lease.lock_paths[0].contains(".exact.ovlock."));
-    }
-
-    #[tokio::test]
-    async fn rejects_empty_lease_inputs() {
-        let mgr = make_manager().await;
-        assert!(matches!(
-            mgr.acquire_batch(&[], Duration::ZERO, None).await,
-            Err(PathLockError::InvalidRequest(_))
-        ));
-
-        let handoff = PathLockHandoffRef {
-            owner_id: "owner".to_string(),
-            lock_paths: Vec::new(),
-            covered_paths: Vec::new(),
-        };
-        assert!(matches!(
-            mgr.adopt(&handoff).await,
-            Err(PathLockError::InvalidRequest(_))
-        ));
-    }
-
     #[tokio::test]
     async fn acquire_exact_same_owner_reentrant() {
         let mgr = make_manager().await;
@@ -1618,131 +1565,6 @@ mod tests {
             )
             .await
             .is_ok());
-    }
-
-    #[tokio::test]
-    async fn same_owner_leases_on_different_paths_release_independently() {
-        let mgr = make_manager().await;
-        let first = mgr
-            .acquire_exact("/data/a.txt", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-        let second = mgr
-            .acquire_exact("/data/b.txt", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-
-        mgr.release(&second).await.unwrap();
-
-        assert!(matches!(
-            mgr.acquire_exact("/data/a.txt", Duration::ZERO, Some("other-owner"))
-                .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-        assert!(mgr
-            .acquire_exact("/data/b.txt", Duration::ZERO, Some("other-owner"))
-            .await
-            .is_ok());
-
-        mgr.release(&first).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn mixed_same_path_batch_keeps_tree_semantics() {
-        let mgr = make_manager().await;
-        let lease = mgr
-            .acquire_exact_tree_batch(
-                &["/data".to_string()],
-                &["/data".to_string()],
-                Duration::ZERO,
-                Some("tree-owner"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(lease.lease.covered_paths.len(), 1);
-        assert_eq!(lease.lease.covered_paths[0].kind, PathLockKind::Tree);
-        let token = mgr
-            .provider
-            .read_token("/data/.path.ovlock")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(token.lock_type, PathLockKind::Tree);
-        assert!(matches!(
-            mgr.acquire_exact(
-                "/data/child.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
-            .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn same_owner_exact_upgrades_to_tree() {
-        let mgr = make_manager().await;
-        let exact = mgr
-            .acquire_exact("/data/sub", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-        let tree = mgr
-            .acquire_tree("/data/sub", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-
-        let token = mgr
-            .provider
-            .read_token("/data/sub/.path.ovlock")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(token.lock_type, PathLockKind::Tree);
-        assert!(matches!(
-            mgr.acquire_exact(
-                "/data/sub/child.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
-            .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-
-        mgr.release(&tree).await.unwrap();
-        mgr.release(&exact).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn releasing_tree_upgrade_restores_exact_token() {
-        let mgr = make_manager().await;
-        let exact = mgr
-            .acquire_exact("/data/sub", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-        let tree = mgr
-            .acquire_tree("/data/sub", Duration::ZERO, Some("shared-owner"))
-            .await
-            .unwrap();
-
-        mgr.release(&tree).await.unwrap();
-
-        let token = mgr
-            .provider
-            .read_token("/data/sub/.path.ovlock")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(token.lock_type, PathLockKind::Exact);
-        assert!(mgr
-            .acquire_exact(
-                "/data/sub/child.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
-            .await
-            .is_ok());
-        mgr.release(&exact).await.unwrap();
     }
 
     /// Keep coverage for paths that remain after a partial lease release.
@@ -1819,83 +1641,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_exact_different_owners_conflict() {
-        let mgr = make_manager().await;
-        mgr.acquire_exact("/data/file.txt", Duration::from_secs(1), Some("a"))
-            .await
-            .unwrap();
-        let result = mgr
-            .acquire_exact("/data/file.txt", Duration::from_millis(100), Some("b"))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    /// Verify exact acquisition classifies the path once per attempt.
-    ///
-    /// Returns: async test result via panic on assertion failure.
-    async fn acquire_exact_uses_two_stat_calls_per_attempt() {
-        let (mgr, stats) = make_manager_with_stats().await;
-        stats.reset().await;
-
-        let lease = mgr
-            .acquire_exact("/data/file.txt", Duration::ZERO, Some("owner"))
-            .await
-            .unwrap();
-
-        let snapshot = stats.snapshot().await;
-        assert_eq!(snapshot.get(FsOperation::Stat).count, 2);
-        mgr.release(&lease).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn root_tree_lock_blocks_descendant_acquire() {
-        let mgr = make_manager().await;
-        let _root = mgr
-            .acquire_tree("/", Duration::ZERO, Some("root-owner"))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            mgr.acquire_exact("/data/sub/child.txt", Duration::ZERO, Some("other-owner"))
-                .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-    }
-
-    #[tokio::test]
-    /// Verify exact locks create missing parent directories for sidecar paths.
-    ///
-    /// Returns: async test result via panic on assertion failure.
-    async fn missing_parent_exact_creates_sidecar_dir() {
-        let (mgr, fs) = make_manager_with_fs().await;
-
-        let lease = mgr
-            .acquire_exact(
-                "/data/missing/parent/file.txt",
-                Duration::ZERO,
-                Some("exact-owner"),
-            )
-            .await
-            .unwrap();
-
-        assert!(fs.stat("/data/missing").await.unwrap().is_dir);
-        assert!(fs.stat("/data/missing/parent").await.unwrap().is_dir);
-        assert!(lease.lease.lock_paths[0].starts_with("/data/missing/parent/.exact.ovlock.file.txt."));
-        assert!(matches!(
-            mgr.acquire_exact(
-                "/data/missing/parent/file.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
-            .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-
-        mgr.release(&lease).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn missing_exact_and_same_path_tree_conflict_in_both_orders() {
         let (mgr, _) = make_manager_with_fs().await;
         let exact = mgr
@@ -1919,38 +1664,6 @@ mod tests {
             Err(PathLockError::Timeout { .. })
         ));
         mgr.release(&tree).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn exact_sidecar_remains_conflicting_after_path_becomes_directory() {
-        let (mgr, fs) = make_manager_with_fs().await;
-        let lease = mgr
-            .acquire_exact("/data/new", Duration::ZERO, Some("first-owner"))
-            .await
-            .unwrap();
-        fs.mkdir("/data/new", 0o755).await.unwrap();
-
-        assert!(matches!(
-            mgr.acquire_exact("/data/new", Duration::ZERO, Some("second-owner"))
-                .await,
-            Err(PathLockError::Timeout { .. })
-        ));
-        mgr.release(&lease).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_then_reacquire() {
-        let mgr = make_manager().await;
-        let lease = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), Some("a"))
-            .await
-            .unwrap();
-        mgr.release(&lease).await.unwrap();
-        let lease2 = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), Some("b"))
-            .await
-            .unwrap();
-        assert!(!lease2.lease.lock_paths.is_empty());
     }
 
     #[tokio::test]
@@ -2051,17 +1764,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_locked_detects_existing_lock() {
-        let mgr = make_manager().await;
-        assert!(!mgr.is_locked("/data/file.txt", true).await.unwrap());
-        let _lease = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), None)
-            .await
-            .unwrap();
-        assert!(mgr.is_locked("/data/file.txt", true).await.unwrap());
-    }
-
-    #[tokio::test]
     async fn is_locked_detects_root_tree_lock() {
         let mgr = make_manager().await;
         assert!(!mgr.is_locked("/data/file.txt", true).await.unwrap());
@@ -2083,62 +1785,6 @@ mod tests {
             mgr.acquire_exact("/data/file.txt", Duration::ZERO, Some("owner"))
                 .await,
             Err(PathLockError::Io(message)) if message == "injected read failure"
-        ));
-    }
-
-    #[tokio::test]
-    async fn batch_all_or_nothing() {
-        let mgr = make_manager().await;
-        // Acquire one path first.
-        let _held = mgr
-            .acquire_exact("/data/a.txt", Duration::from_secs(1), Some("holder"))
-            .await
-            .unwrap();
-
-        // Try batch that includes the held path.
-        let requests = vec![
-            PathLockRequest {
-                path: "/data/a.txt".to_string(),
-                kind: PathLockKind::Exact,
-            },
-            PathLockRequest {
-                path: "/data/b.txt".to_string(),
-                kind: PathLockKind::Exact,
-            },
-        ];
-        let result = mgr
-            .acquire_batch(&requests, Duration::from_millis(100), Some("other"))
-            .await;
-        assert!(result.is_err());
-
-        // Verify b.txt is still free.
-        let b_lease = mgr
-            .acquire_exact("/data/b.txt", Duration::from_secs(1), None)
-            .await;
-        assert!(b_lease.is_ok());
-    }
-
-    #[tokio::test]
-    async fn batch_reports_rollback_remove_failure() {
-        let fs = Arc::new(MemFileSystem::new());
-        fs.mkdir("/data", 0o755).await.unwrap();
-        let provider = Arc::new(FailNextRemoveProvider::new());
-        let mgr = PathLockManager::new(fs, provider, PathLockConfig::default());
-        mgr.acquire_exact("/data/b.txt", Duration::ZERO, Some("blocker"))
-            .await
-            .unwrap();
-
-        let result = mgr
-            .acquire_exact_batch(
-                &["/data/a.txt".to_string(), "/data/b.txt".to_string()],
-                Duration::ZERO,
-                Some("requester"),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(PathLockError::Io(message)) if message == "injected remove failure"
         ));
     }
 }

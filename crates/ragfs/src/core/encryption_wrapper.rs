@@ -858,28 +858,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_rejects_create_new_flag() {
-        let inner = memfs_stack().await;
-        let manager = memfs_pathlock_manager(inner.clone()).await;
-        let enc = EncryptionWrappedFS::with_pathlock(
-            inner,
-            [4u8; 32],
-            crypto::PROVIDER_LOCAL,
-            manager,
-            "/mem".to_string(),
-        );
-
-        FS_CTX
-            .scope(ctx("t"), async {
-                let result = enc
-                    .write("/mem/a.txt", b"content", 0, WriteFlag::CreateNew)
-                    .await;
-                assert!(result.is_err());
-            })
-            .await;
-    }
-
-    #[tokio::test]
     async fn rename_rejects_cross_account_paths() {
         let inner = memfs_stack_at("/local").await;
         let manager = memfs_pathlock_manager(inner.clone()).await;

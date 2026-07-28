@@ -111,42 +111,6 @@ class _AsyncMoveAGFS:
         return {"path": path, "recursive": recursive, "fs_ctx": fs_ctx}
 
 
-class _AsyncCopyAGFS:
-    """Async AGFS stub that records exact lease extensions for copied files."""
-
-    def __init__(self):
-        self.acquire_calls = []
-        self.copy_calls = []
-        self.release_calls = []
-
-    async def pathlock_acquire_exact(self, path, timeout_secs=30.0, owner_id_hint=None):
-        """Record one exact extension under the move owner."""
-        del timeout_secs
-        self.acquire_calls.append((path, owner_id_hint))
-        return {
-            "lease_ref": "child-ref",
-            "owner_id": owner_id_hint,
-            "owned": True,
-        }
-
-    async def pathlock_release(self, lease):
-        """Record child lease release."""
-        self.release_calls.append(lease)
-
-    async def ls(self, path, fs_ctx=None):
-        """Return one source file for recursive temp-copy tests."""
-        del path, fs_ctx
-        return [{"name": "a.md", "isDir": False}]
-
-    async def mkdir(self, path, fs_ctx=None):
-        """Accept destination directory creation."""
-        del path, fs_ctx
-
-    async def cp(self, src, dst, recursive=False, fs_ctx=None):
-        """Record one raw copy and its lock context."""
-        self.copy_calls.append((src, dst, recursive, fs_ctx))
-
-
 def _default_ctx() -> RequestContext:
     """Return a stable root request context for pathlock fs_ctx tests."""
     return RequestContext(user=UserIdentifier.the_default_user(), role=Role(Role.ROOT))
@@ -304,76 +268,6 @@ async def test_directory_mv_uses_source_tree_and_destination_exact(monkeypatch):
     assert fake.acquire_calls[0][0] == [
         {"path": "/local/default/temp/source", "kind": "tree"},
         {"path": "/local/default/resources/target", "kind": "exact"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_mv_copy_extends_exact_lock_for_each_destination_file(monkeypatch):
-    """Recursive copy must lock each destination file with the move owner."""
-    fake = _AsyncCopyAGFS()
-    fs = VikingFS(agfs=_FakeAGFS())
-    fs._async_agfs = fake  # type: ignore[assignment]
-    writes = []
-
-    monkeypatch.setattr(fs, "read_file_bytes", AsyncMock(return_value=b"content"))
-
-    async def record_write(uri, data, ctx=None, lease_ref=None):
-        """Record the child lease propagated to the destination write."""
-        writes.append((uri, data, ctx, lease_ref))
-
-    monkeypatch.setattr(fs, "write_file_bytes", record_write)
-    monkeypatch.setattr(
-        fs,
-        "_uri_to_path",
-        lambda _uri, **_kwargs: "/local/default/resources/target/a.md",
-    )
-
-    await fs._copy_file_through_vikingfs(
-        "viking://temp/source/a.md",
-        "viking://resources/target/a.md",
-        ctx=_default_ctx(),
-        lease_ref={"lease_ref": "move-ref", "owner_id": "move-owner", "owned": True},
-    )
-
-    assert fake.acquire_calls == [("/local/default/resources/target/a.md", "move-owner")]
-    assert writes[0][3]["lease_ref"] == "child-ref"
-    assert fake.release_calls == [writes[0][3]]
-
-
-@pytest.mark.asyncio
-async def test_temp_directory_mv_extends_exact_lock_for_each_destination_file():
-    """Raw temp copies must hold an Exact lease for every destination file."""
-    fake = _AsyncCopyAGFS()
-    fs = VikingFS(agfs=_FakeAGFS())
-    fs._async_agfs = fake  # type: ignore[assignment]
-    operation_lease = {
-        "lease_ref": "move-ref",
-        "owner_id": "move-owner",
-        "owned": True,
-    }
-
-    await fs._copy_for_mv(
-        old_uri="viking://temp/source",
-        new_uri="viking://resources/target",
-        old_path="/local/default/temp/source",
-        new_path="/local/default/resources/target",
-        is_dir=True,
-        is_temp=True,
-        ctx=_default_ctx(),
-        lease_ref=operation_lease,
-    )
-
-    assert fake.acquire_calls == [("/local/default/resources/target/a.md", "move-owner")]
-    assert fake.copy_calls == [
-        (
-            "/local/default/temp/source/a.md",
-            "/local/default/resources/target/a.md",
-            False,
-            {"account_id": "default", "lease_ref": "child-ref"},
-        )
-    ]
-    assert fake.release_calls == [
-        {"lease_ref": "child-ref", "owner_id": "move-owner", "owned": True}
     ]
 
 

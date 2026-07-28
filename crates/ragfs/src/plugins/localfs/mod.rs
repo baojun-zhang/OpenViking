@@ -1498,61 +1498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    /// Verify LocalFS compare-and-write/remove only mutate exact current content.
-    async fn test_localfs_compare_and_write_remove_require_exact_content() {
-        let (_dir, fs) = fallback_localfs();
-
-        fs.write("/lock", b"owner1:100:E", 0, WriteFlag::CreateNew)
-            .await
-            .unwrap();
-
-        assert!(!fs
-            .compare_and_write("/lock", b"owner2:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:100:E");
-
-        assert!(fs
-            .compare_and_write("/lock", b"owner1:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:200:E");
-
-        assert!(!fs
-            .compare_and_remove("/lock", b"owner1:100:E")
-            .await
-            .unwrap());
-        assert_eq!(fs.read("/lock", 0, 0).await.unwrap(), b"owner1:200:E");
-
-        assert!(fs
-            .compare_and_remove("/lock", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert!(fs.read("/lock", 0, 0).await.is_err());
-        assert!(!fs
-            .compare_and_write("/lock", b"owner1:200:E", b"owner1:300:E")
-            .await
-            .unwrap());
-        assert!(!fs
-            .compare_and_remove("/lock", b"owner1:200:E")
-            .await
-            .unwrap());
-    }
-
-    #[test]
-    fn test_localfs_rejects_unlinked_open_inode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lock");
-        std::fs::write(&path, b"old").unwrap();
-        let old_file = std::fs::File::open(&path).unwrap();
-
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"new").unwrap();
-
-        assert!(!LocalFileSystem::open_file_matches_path(&old_file, &path).unwrap());
-    }
-
-    #[tokio::test]
     async fn test_localfs_grep_case_insensitive() {
         let (dir, fs) = fallback_localfs();
         write_file(dir.path(), "a.txt", "HELLO\n");

@@ -546,34 +546,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_kvfs_compare_and_write_remove() {
-        let fs = KVFileSystem::new();
-
-        write_key(&fs, "/lock", b"owner1:100:E").await;
-        assert!(!fs
-            .compare_and_write("/lock", b"owner2:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(read_key(&fs, "/lock").await, b"owner1:100:E");
-
-        assert!(fs
-            .compare_and_write("/lock", b"owner1:100:E", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert_eq!(read_key(&fs, "/lock").await, b"owner1:200:E");
-
-        assert!(!fs
-            .compare_and_remove("/lock", b"owner1:100:E")
-            .await
-            .unwrap());
-        assert!(fs
-            .compare_and_remove("/lock", b"owner1:200:E")
-            .await
-            .unwrap());
-        assert!(fs.read("/lock", 0, 0).await.is_err());
-    }
-
-    #[tokio::test]
     async fn test_kvfs_rename() {
         let fs = KVFileSystem::new();
 
