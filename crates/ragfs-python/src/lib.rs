@@ -1057,8 +1057,8 @@ struct RAGFSBindingClient {
     rt: tokio::runtime::Runtime,
     git_service: Option<Arc<ragfs::git::GitService>>,
     git_backend: Option<String>,
-    /// PathLock manager, if pathlock is enabled.
-    pathlock_manager: Option<Arc<PathLockManager>>,
+    /// PathLock manager. OpenViking always builds ragfs with PathLock enabled.
+    pathlock_manager: Arc<PathLockManager>,
 }
 
 impl RAGFSBindingClient {
@@ -1076,6 +1076,11 @@ impl RAGFSBindingClient {
             self.rt
                 .block_on(FS_CTX.scope(ctx, async move { f().await }))
         })
+    }
+
+    /// Clone the PathLock manager shared by this binding client.
+    fn clone_pathlock_manager(&self) -> Arc<PathLockManager> {
+        self.pathlock_manager.clone()
     }
 }
 
@@ -1100,10 +1105,7 @@ impl RAGFSBindingClient {
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
 
         // Phase A (holding GIL): parse the sectioned config into an owned RagfsConfig.
-        let mut ragfs_cfg = RagfsConfig {
-            pathlock: Some(PathLockConfig::default()),
-            ..RagfsConfig::default()
-        };
+        let mut ragfs_cfg = RagfsConfig::default();
         let mut runtime_cache_config = None;
         let mut inline_git_cfg: Option<ragfs::git::GitConfig> = None;
         if let Some(cfg) = config {
@@ -1156,10 +1158,10 @@ impl RAGFSBindingClient {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(300.0),
                 )?;
-                ragfs_cfg.pathlock = Some(PathLockConfig {
+                ragfs_cfg.pathlock = PathLockConfig {
                     provider: provider.to_string(),
                     lock_expire_secs,
-                });
+                };
             }
         }
 
@@ -2015,10 +2017,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
         let lease = self.run_scoped(py, fs_ctx, move || {
@@ -2043,10 +2042,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
         let lease = self.run_scoped(py, fs_ctx, move || {
@@ -2071,10 +2067,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
         let lease = self.run_scoped(py, fs_ctx, move || {
@@ -2099,10 +2092,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
         let lease = self.run_scoped(py, fs_ctx, move || {
@@ -2128,10 +2118,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
         let lease = self.run_scoped(py, fs_ctx, move || {
@@ -2158,10 +2145,7 @@ impl RAGFSBindingClient {
         timeout_secs: f64,
         owner_id_hint: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
 
@@ -2187,9 +2171,7 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         owned_lease_ref: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
+        let mgr = self.clone_pathlock_manager();
         let mgr2 = mgr.clone();
         let fs_ctx = build_fs_context(ctx);
         let lease_ref = extract_lease_ref(py, &owned_lease_ref)?;
@@ -2215,10 +2197,7 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         owned_lease_ref: Py<PyAny>,
     ) -> PyResult<String> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let (lease_ref, ownership_ref) = extract_owned_lease_ref(py, &owned_lease_ref)?;
         let status = self.run_scoped(py, fs_ctx, move || {
@@ -2249,10 +2228,7 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         owned_lease_ref: Py<PyAny>,
     ) -> PyResult<()> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let (lease_ref, ownership_ref) = extract_owned_lease_ref(py, &owned_lease_ref)?;
         self.run_scoped(py, fs_ctx, move || {
@@ -2284,10 +2260,7 @@ impl RAGFSBindingClient {
         owned_lease_ref: Py<PyAny>,
         lock_paths: Vec<String>,
     ) -> PyResult<()> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let (lease_ref, ownership_ref) = extract_owned_lease_ref(py, &owned_lease_ref)?;
         self.run_scoped(py, fs_ctx, move || {
@@ -2319,10 +2292,7 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         owned_lease_ref: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let (lease_ref, ownership_ref) = extract_owned_lease_ref(py, &owned_lease_ref)?;
         let handoff = self.run_scoped(py, fs_ctx, move || {
@@ -2353,10 +2323,7 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         owned_lease_ref: Py<PyAny>,
     ) -> PyResult<()> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let (lease_ref, ownership_ref) = extract_owned_lease_ref(py, &owned_lease_ref)?;
         self.run_scoped(py, fs_ctx, move || {
@@ -2387,14 +2354,14 @@ impl RAGFSBindingClient {
         ctx: Option<HashMap<String, String>>,
         handoff_ref: HashMap<String, Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let owner_id: String = handoff_ref
             .get("owner_id")
-            .ok_or_else(|| PyValueError::new_err("handoff_ref.owner_id required"))?
+            .or_else(|| handoff_ref.get("handle_id"))
+            .ok_or_else(|| {
+                PyValueError::new_err("handoff_ref.owner_id or handoff_ref.handle_id required")
+            })?
             .extract(py)?;
         let lock_paths: Vec<String> = handoff_ref
             .get("lock_paths")
@@ -2405,7 +2372,7 @@ impl RAGFSBindingClient {
             || lock_paths.iter().any(|path| !path.starts_with('/'))
         {
             return Err(PyValueError::new_err(
-                "handoff_ref owner_id and absolute lock_paths are required",
+                "handoff_ref owner_id/handle_id and absolute lock_paths are required",
             ));
         }
         let covered_paths: Vec<PathLockRequest> = handoff_ref
@@ -2439,10 +2406,7 @@ impl RAGFSBindingClient {
         path: String,
         ignore_stale: bool,
     ) -> PyResult<bool> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
@@ -2459,10 +2423,7 @@ impl RAGFSBindingClient {
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
     ) -> PyResult<Py<PyAny>> {
-        let mgr = self.pathlock_manager.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("pathlock not enabled")
-        })?;
-        let mgr = mgr.clone();
+        let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let snapshot = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();

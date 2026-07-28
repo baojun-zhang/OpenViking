@@ -175,7 +175,10 @@ impl FilesystemPathLockProvider {
         match self.fs.read(lock_path, 0, 0).await {
             Ok(data) => Ok(Some(data)),
             Err(e) => {
-                if matches!(e, crate::core::Error::NotFound(_)) {
+                if matches!(
+                    e,
+                    crate::core::Error::NotFound(_) | crate::core::Error::MountPointNotFound(_)
+                ) {
                     Ok(None)
                 } else {
                     Err(PathLockError::Io(format!(

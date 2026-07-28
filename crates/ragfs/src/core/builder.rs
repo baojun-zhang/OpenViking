@@ -29,12 +29,20 @@ use crate::plugins::{
 ///
 /// New capabilities are added as new optional sections here, without changing
 /// `build_default_stack`'s signature.
-#[derive(Default)]
 pub struct RagfsConfig {
     /// Encryption section: `None` → plaintext stack; `Some` → per-backend encryption wrapping.
     pub encryption: Option<EncryptionConfig>,
-    /// PathLock section: `None` → no automatic locking; `Some` → enable PathLockWrappedFS.
-    pub pathlock: Option<PathLockConfig>,
+    /// PathLock configuration. OpenViking always requires PathLock to be present.
+    pub pathlock: PathLockConfig,
+}
+
+impl Default for RagfsConfig {
+    fn default() -> Self {
+        Self {
+            encryption: None,
+            pathlock: PathLockConfig::default(),
+        }
+    }
 }
 
 /// Encryption section: root key fixed and immutable at construction time.
@@ -49,17 +57,17 @@ pub struct EncryptionConfig {
 pub struct RagfsStack {
     /// Mount manager (mount/unmount/list/stats/register_plugin live here).
     pub mountable: Arc<MountableFS>,
-    /// Data entry point: `Stats(PathLock?(Mountable))`.
+    /// Data entry point: `Stats(PathLock(Mountable))`.
     pub top: Arc<dyn FileSystem>,
-    /// PathLock manager, if pathlock is enabled.
-    pub pathlock_manager: Option<Arc<PathLockManager>>,
+    /// PathLock manager. OpenViking always constructs the stack with PathLock enabled.
+    pub pathlock_manager: Arc<PathLockManager>,
 }
 
 /// Build the standard RAGFS stack.
 ///
 /// Encryption config is forwarded to `MountableFS` so it can wrap individual backends
 /// with `EncryptionWrappedFS` during `mount()`. The top is always `StatsWrappedFS`.
-/// When pathlock is enabled, `PathLockWrappedFS` is inserted between stats and mountable.
+/// PathLockWrappedFS is always inserted between stats and mountable.
 pub async fn build_default_stack(config: RagfsConfig) -> RagfsStack {
     let mountable = Arc::new(MountableFS::new());
     build_stack_with_mountable(config, mountable).await
@@ -82,28 +90,25 @@ pub async fn build_stack_with_mountable(
             .await;
     }
 
-    let (inner, pathlock_manager) = if let Some(pl_config) = &config.pathlock {
-        let provider: Arc<dyn PathLockProvider> = match pl_config.provider.as_str() {
-            "memory" => Arc::new(MemoryPathLockProvider::new()),
-            _ => Arc::new(FilesystemPathLockProvider::new(
-                mountable.clone() as Arc<dyn FileSystem>,
-            )),
-        };
-        let manager = Arc::new(PathLockManager::new(
+    let provider: Arc<dyn PathLockProvider> = match config.pathlock.provider.as_str() {
+        "memory" => Arc::new(MemoryPathLockProvider::new()),
+        _ => Arc::new(FilesystemPathLockProvider::new(
             mountable.clone() as Arc<dyn FileSystem>,
-            provider,
-            pl_config.clone(),
-        ));
-        // Inject into MountableFS so EncryptionWrappedFS can use it for dual-path exact lock.
-        mountable.set_pathlock_manager(Some(manager.clone())).await;
-        let wrapped: Arc<dyn FileSystem> = Arc::new(PathLockWrappedFS::new(
-            manager.clone(),
-            mountable.clone() as Arc<dyn FileSystem>,
-        ));
-        (wrapped, Some(manager))
-    } else {
-        (mountable.clone() as Arc<dyn FileSystem>, None)
+        )),
     };
+    let pathlock_manager = Arc::new(PathLockManager::new(
+        mountable.clone() as Arc<dyn FileSystem>,
+        provider,
+        config.pathlock.clone(),
+    ));
+    // Inject into MountableFS so EncryptionWrappedFS can use it for dual-path exact lock.
+    mountable
+        .set_pathlock_manager(pathlock_manager.clone())
+        .await;
+    let inner: Arc<dyn FileSystem> = Arc::new(PathLockWrappedFS::new(
+        pathlock_manager.clone(),
+        mountable.clone() as Arc<dyn FileSystem>,
+    ));
 
     let top: Arc<dyn FileSystem> = Arc::new(StatsWrappedFS::with_arc(inner));
     RagfsStack { mountable, top, pathlock_manager }
@@ -137,7 +142,7 @@ mod tests {
                 root_key: [4u8; 32],
                 provider_type: crypto::PROVIDER_LOCAL,
             }),
-            pathlock: None,
+            ..RagfsConfig::default()
         }
     }
 
@@ -147,10 +152,10 @@ mod tests {
                 root_key: [4u8; 32],
                 provider_type: crypto::PROVIDER_LOCAL,
             }),
-            pathlock: Some(PathLockConfig {
+            pathlock: PathLockConfig {
                 provider: "filesystem".to_string(),
                 lock_expire_secs: 300.0,
-            }),
+            },
         }
     }
 
@@ -237,7 +242,7 @@ mod tests {
     async fn encrypted_write_extends_outer_lease() {
         let stack = build_default_stack(enc_pathlock_config()).await;
         mount_mem(&stack).await;
-        let manager = stack.pathlock_manager.as_ref().unwrap();
+        let manager = &stack.pathlock_manager;
         let outer = manager
             .acquire_exact("/mem/f", std::time::Duration::ZERO, None)
             .await
@@ -268,7 +273,7 @@ mod tests {
     async fn encrypted_write_rejects_uncovered_outer_lease() {
         let stack = build_default_stack(enc_pathlock_config()).await;
         mount_mem(&stack).await;
-        let manager = stack.pathlock_manager.as_ref().unwrap();
+        let manager = &stack.pathlock_manager;
         let outer = manager
             .acquire_exact("/mem/other", std::time::Duration::ZERO, None)
             .await
@@ -293,6 +298,13 @@ mod tests {
 
         assert!(error.to_string().contains("does not cover final path"));
         manager.release(&outer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_stack_initializes_pathlock_manager() {
+        let stack = build_default_stack(RagfsConfig::default()).await;
+        let snapshot = stack.pathlock_manager.observe().await;
+        assert_eq!(snapshot.active_locks, 0);
     }
 
     #[tokio::test]

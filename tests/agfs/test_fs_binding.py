@@ -153,6 +153,29 @@ class TestVikingFSBindingLocal:
                 await vfs._async_agfs.pathlock_release(adopted)
             await vfs._async_agfs.pathlock_release(owned)
 
+    async def test_pathlock_adopt_accepts_legacy_handle_id_handoff(
+        self, viking_fs_binding_instance
+    ):
+        """Accept legacy durable handoffs that use handle_id instead of owner_id."""
+        vfs = viking_fs_binding_instance
+        path = f"/local/default/temp/handoff_legacy_{uuid.uuid4().hex}.txt"
+        owned = await vfs._async_agfs.pathlock_acquire_exact(path)
+        handoff = await vfs._async_agfs.pathlock_to_handoff(owned)
+        legacy_handoff = {
+            "handle_id": handoff["owner_id"],
+            "lock_paths": handoff["lock_paths"],
+        }
+        adopted = None
+
+        try:
+            adopted = await vfs._async_agfs.pathlock_adopt(legacy_handoff)
+            assert adopted["owner_id"] == owned["owner_id"]
+            assert adopted["owned"] is True
+        finally:
+            if adopted is not None:
+                await vfs._async_agfs.pathlock_release(adopted)
+            await vfs._async_agfs.pathlock_release(owned)
+
     @pytest.mark.parametrize(
         "requests",
         [

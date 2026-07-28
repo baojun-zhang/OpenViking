@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use radix_trie::{Trie, TrieCommon};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -76,8 +76,8 @@ pub struct MountableFS {
     encryption_root_key: RwLock<Option<[u8; 32]>>,
     encryption_provider_type: RwLock<Option<u8>>,
 
-    /// Optional pathlock manager, injected into EncryptionWrappedFS for dual-path exact lock.
-    pathlock_manager: RwLock<Option<Arc<PathLockManager>>>,
+    /// PathLock manager, injected once before the stack starts serving requests.
+    pathlock_manager: OnceLock<Arc<PathLockManager>>,
 
     /// Optional cache configuration shared by mounted filesystems.
     #[cfg(feature = "cache")]
@@ -151,8 +151,8 @@ impl MountableFS {
     /// Return whether a mounted wrapper chain contains encryption-owned pathlock.
     fn encryption_handles_pathlock_ref(fs: &dyn FileSystem) -> bool {
         let any = fs as &dyn std::any::Any;
-        if let Some(enc) = any.downcast_ref::<EncryptionWrappedFS>() {
-            return enc.handles_pathlock();
+        if any.downcast_ref::<EncryptionWrappedFS>().is_some() {
+            return true;
         }
         if let Some(multiwrite) = any.downcast_ref::<MultiWriteWrappedFS>() {
             return multiwrite.encryption_handles_pathlock();
@@ -216,7 +216,7 @@ impl MountableFS {
             registry: Arc::new(RwLock::new(HashMap::new())),
             encryption_root_key: RwLock::new(None),
             encryption_provider_type: RwLock::new(None),
-            pathlock_manager: RwLock::new(None),
+            pathlock_manager: OnceLock::new(),
             #[cfg(feature = "cache")]
             cache: None,
         }
@@ -237,7 +237,7 @@ impl MountableFS {
             registry: Arc::new(RwLock::new(HashMap::new())),
             encryption_root_key: RwLock::new(None),
             encryption_provider_type: RwLock::new(None),
-            pathlock_manager: RwLock::new(None),
+            pathlock_manager: OnceLock::new(),
             cache: Some(MountCacheConfig {
                 provider,
                 namespace,
@@ -257,8 +257,10 @@ impl MountableFS {
     }
 
     /// Set the pathlock manager for dual-path exact lock in EncryptionWrappedFS.
-    pub async fn set_pathlock_manager(&self, manager: Option<Arc<PathLockManager>>) {
-        *self.pathlock_manager.write().await = manager;
+    pub async fn set_pathlock_manager(&self, manager: Arc<PathLockManager>) {
+        if self.pathlock_manager.set(manager).is_err() {
+            panic!("pathlock manager must only be initialized once");
+        }
     }
 
     /// Get the encryption root key and provider type.
@@ -358,7 +360,11 @@ impl MountableFS {
                                       config.name
                                   )));
                             }
-                            let pl_mgr = self.pathlock_manager.read().await.clone();
+                            let pl_mgr = self
+                                .pathlock_manager
+                                .get()
+                                .cloned()
+                                .expect("pathlock manager must be initialized before mount");
                             Arc::new(EncryptionWrappedFS::with_pathlock(
                                 storage_fs,
                                 rk,
@@ -438,7 +444,11 @@ impl MountableFS {
         bc: &BackendsConfig,
     ) -> Result<MultiWriteWrappedFS> {
         let (enc_root_key, enc_provider_type) = self.get_encryption_config().await;
-        let pathlock_manager = self.pathlock_manager.read().await.clone();
+        let pathlock_manager = self
+            .pathlock_manager
+            .get()
+            .cloned()
+            .expect("pathlock manager must be initialized before multi-write mount");
         build_multi_write_fs(
             &self.registry,
             config,
@@ -590,11 +600,15 @@ impl MountableFS {
             return Ok(false);
         }
 
-        let manager = self.pathlock_manager.read().await.clone();
+        let manager = self
+            .pathlock_manager
+            .get()
+            .cloned()
+            .expect("pathlock manager must be initialized before raw copy");
         let view = FsContextView::current();
         let auto_lease = if view.disable_auto_pathlock() {
             None
-        } else if let Some(manager) = manager.as_ref() {
+        } else {
             let request = PathLockRequest {
                 path: dst_path.to_string(),
                 kind: PathLockKind::Exact,
@@ -614,8 +628,6 @@ impl MountableFS {
                         .map_err(|error| Error::internal(format!("lock error: {error}")))?,
                 ),
             }
-        } else {
-            None
         };
 
         let result = if let Some(multiwrite) = multiwrite {
@@ -639,9 +651,9 @@ impl MountableFS {
             }
         };
 
-        let release = match (manager, auto_lease) {
-            (Some(manager), Some(lease)) => manager.release(&lease).await,
-            _ => Ok(()),
+        let release = match auto_lease {
+            Some(lease) => manager.release(&lease).await,
+            None => Ok(()),
         };
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -1480,7 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mountable_fs_creation() {
-        let mfs = MountableFS::new();
+        let mfs = Arc::new(MountableFS::new());
         let mounts = mfs.list_mounts().await;
         assert!(mounts.is_empty());
     }
@@ -1611,7 +1623,7 @@ mod tests {
             provider,
             PathLockConfig::default(),
         ));
-        mfs.set_pathlock_manager(Some(manager.clone())).await;
+        mfs.set_pathlock_manager(manager.clone()).await;
         let outer = manager
             .acquire_exact("/local/dst", std::time::Duration::ZERO, None)
             .await
@@ -1694,16 +1706,26 @@ mod tests {
     async fn encrypted_mount_caches_ciphertext_below_account_validation() {
         use crate::cache::{CacheNamespace, CachePolicy, CacheProvider, MemoryCacheProvider};
         use crate::core::{FsContextInner, FS_CTX};
+        use crate::lock::{
+            MemoryPathLockProvider, PathLockConfig, PathLockManager, PathLockProvider,
+        };
         use crate::plugins::MemFSPlugin;
 
         let provider = Arc::new(MemoryCacheProvider::new());
-        let mfs = MountableFS::with_cache(
+        let mfs = Arc::new(MountableFS::with_cache(
             provider.clone(),
             CacheNamespace::new("encrypted-mount-test"),
             CachePolicy::default(),
-        );
+        ));
         mfs.register_plugin(MemFSPlugin).await;
         mfs.set_encryption_config(Some([9u8; 32]), Some(1)).await;
+        let provider: Arc<dyn PathLockProvider> = Arc::new(MemoryPathLockProvider::new());
+        let manager = Arc::new(PathLockManager::new(
+            mfs.clone() as Arc<dyn FileSystem>,
+            provider,
+            PathLockConfig::default(),
+        ));
+        mfs.set_pathlock_manager(manager).await;
         mfs.mount(test_config("memfs", "/local")).await.unwrap();
         mfs.mkdir("/local/shared", 0o755).await.unwrap();
 
@@ -1769,15 +1791,25 @@ mod tests {
     #[tokio::test]
     async fn encrypted_multiwrite_mount_does_not_install_plaintext_cache() {
         use crate::cache::{CacheNamespace, CachePolicy, MemoryCacheProvider};
+        use crate::lock::{
+            MemoryPathLockProvider, PathLockConfig, PathLockManager, PathLockProvider,
+        };
         use crate::plugins::MemFSPlugin;
 
-        let mfs = MountableFS::with_cache(
+        let mfs = Arc::new(MountableFS::with_cache(
             Arc::new(MemoryCacheProvider::new()),
             CacheNamespace::new("encrypted-multiwrite-test"),
             CachePolicy::default(),
-        );
+        ));
         mfs.register_plugin(MemFSPlugin).await;
         mfs.set_encryption_config(Some([9u8; 32]), Some(1)).await;
+        let provider: Arc<dyn PathLockProvider> = Arc::new(MemoryPathLockProvider::new());
+        let manager = Arc::new(PathLockManager::new(
+            mfs.clone() as Arc<dyn FileSystem>,
+            provider,
+            PathLockConfig::default(),
+        ));
+        mfs.set_pathlock_manager(manager).await;
 
         let mut config = multiwrite_test_config("memfs", "memfs", "/local");
         config.server_encryption_enabled = true;
@@ -1848,7 +1880,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mount_duplicate_error() {
-        let mfs = MountableFS::new();
+        let mfs = Arc::new(MountableFS::new());
         mfs.register_plugin(MockPlugin::new("mock")).await;
 
         let config = test_config("mock", "/mock");
@@ -2206,7 +2238,7 @@ mod tests {
             provider,
             PathLockConfig::default(),
         ));
-        mfs.set_pathlock_manager(Some(manager.clone())).await;
+        mfs.set_pathlock_manager(manager.clone()).await;
 
         let mut config = multiwrite_test_config("memfs", "memfs", "/local");
         config.server_encryption_enabled = true;
@@ -2215,8 +2247,13 @@ mod tests {
 
         assert!(mfs.encryption_handles_pathlock("/local/file.txt").await);
 
-        let outer = manager
-            .acquire_exact("/local/tenant/file.txt", std::time::Duration::ZERO, None)
+        let outer_ctx = Arc::new(FsContextInner::new("tenant"));
+        let outer = FS_CTX
+            .scope(outer_ctx, async {
+                manager
+                    .acquire_exact("/local/tenant/file.txt", std::time::Duration::ZERO, None)
+                    .await
+            })
             .await
             .unwrap();
         let ctx = Arc::new(FsContextInner::with_pathlock(
@@ -2324,11 +2361,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_backend_mount_wraps_stats_outside_encryption() {
+        use crate::lock::{
+            MemoryPathLockProvider, PathLockConfig, PathLockManager, PathLockProvider,
+        };
         use crate::plugins::MemFSPlugin;
 
-        let mfs = MountableFS::new();
+        let mfs = Arc::new(MountableFS::new());
         mfs.register_plugin(MemFSPlugin).await;
         mfs.set_encryption_config(Some([9u8; 32]), Some(1)).await;
+        let provider: Arc<dyn PathLockProvider> = Arc::new(MemoryPathLockProvider::new());
+        let manager = Arc::new(PathLockManager::new(
+            mfs.clone() as Arc<dyn FileSystem>,
+            provider,
+            PathLockConfig::default(),
+        ));
+        mfs.set_pathlock_manager(manager).await;
 
         mfs.mount(test_config("memfs", "/mock")).await.unwrap();
 

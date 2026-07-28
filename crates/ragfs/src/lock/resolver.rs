@@ -9,6 +9,15 @@ use crate::core::FileSystem;
 
 use super::types::PathLockResult;
 
+/// Exact-lock paths resolved from one real path classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedExactPaths {
+    /// Lock path used for the actual exact token creation.
+    pub acquire_lock_path: String,
+    /// Conservative conflict set checked before and after token creation.
+    pub conflict_paths: Vec<String>,
+}
+
 /// Computes lock-file paths for exact and tree locks.
 pub struct LockPathResolver {
     /// Filesystem used for `stat` calls to determine is_dir.
@@ -34,22 +43,30 @@ impl LockPathResolver {
         &self,
         path: &str,
     ) -> PathLockResult<Vec<String>> {
-        let primary = self.resolve_exact_lock_path(path).await?;
-        let prefixed = prefixed_exact_lock_path(path);
-        if primary == prefixed {
-            Ok(vec![primary])
-        } else {
-            Ok(vec![primary, prefixed])
-        }
+        Ok(self.resolve_exact_paths(path).await?.conflict_paths)
     }
 
     /// Compute the primary lock-file path used when acquiring one exact lock.
     pub async fn resolve_exact_lock_path(&self, path: &str) -> PathLockResult<String> {
+        Ok(self.resolve_exact_paths(path).await?.acquire_lock_path)
+    }
+
+    /// Resolve the exact acquire path and its conservative conflict set using one `stat`.
+    pub(crate) async fn resolve_exact_paths(&self, path: &str) -> PathLockResult<ResolvedExactPaths> {
         let stat_result = self.fs.stat(path).await;
-        match stat_result {
-            Ok(info) if info.is_dir => Ok(path_lock_path(path)),
-            _ => Ok(prefixed_exact_lock_path(path)),
-        }
+        let acquire_lock_path = match stat_result {
+            Ok(info) if info.is_dir => path_lock_path(path),
+            _ => prefixed_exact_lock_path(path),
+        };
+        let conflict_paths = if acquire_lock_path == path_lock_path(path) {
+            vec![acquire_lock_path.clone(), prefixed_exact_lock_path(path)]
+        } else {
+            vec![acquire_lock_path.clone(), path_lock_path(path)]
+        };
+        Ok(ResolvedExactPaths {
+            acquire_lock_path,
+            conflict_paths,
+        })
     }
 
     /// Compute the tree lock path for `path`.

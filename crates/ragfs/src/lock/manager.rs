@@ -16,7 +16,7 @@ use crate::core::FileSystem;
 
 use super::metrics::LockMetrics;
 use super::provider::PathLockProvider;
-use super::resolver::LockPathResolver;
+use super::resolver::{LockPathResolver, ResolvedExactPaths};
 use super::types::{
     BorrowedPathLockLease, LockToken, OwnedPathLockLease, PathLockConflict, PathLockHandoffRef,
     PathLockKind, PathLockLease, PathLockObserveSnapshot, PathLockRequest, PathLockResult,
@@ -507,6 +507,7 @@ impl PathLockManager {
 
         loop {
             let mut conflict: Option<PathLockError> = None;
+            let mut exact_resolutions: HashMap<String, ResolvedExactPaths> = HashMap::new();
 
             for req in &sorted {
                 match req.kind {
@@ -517,24 +518,25 @@ impl PathLockManager {
                             conflict = Some(e);
                             break;
                         }
-                        let candidates = self
+                        let resolved = self
                             .resolver
-                            .resolve_exact_conflict_paths(&req.path)
+                            .resolve_exact_paths(&req.path)
                             .await?;
-                        let tree_path = self.resolver.resolve_tree_lock_path(&req.path).await?;
-                        if let Err(e) = self.check_lock_paths(&candidates, &owner_id).await {
+                        if let Err(e) = self
+                            .check_lock_paths(&resolved.conflict_paths, &owner_id)
+                            .await
+                        {
                             conflict = Some(e);
                             break;
                         }
-                        if !candidates.contains(&tree_path) {
-                            if let Err(e) =
-                                self.check_lock_paths(std::slice::from_ref(&tree_path), &owner_id).await
-                            {
-                                conflict = Some(e);
-                                break;
-                            }
+                        let lock_path = resolved.acquire_lock_path.clone();
+                        exact_resolutions.insert(req.path.clone(), resolved);
+                        if let Err(e) = self.ensure_lock_dir(&lock_path).await {
+                            conflict = Some(PathLockError::Io(format!(
+                                "failed to create lock dir: {e}"
+                            )));
+                            break;
                         }
-                        let lock_path = self.resolver.resolve_exact_lock_path(&req.path).await?;
                         match self
                             .try_acquire_one(&lock_path, &owner_id, PathLockKind::Exact)
                             .await
@@ -665,22 +667,18 @@ impl PathLockManager {
                             post_conflict = Some(e);
                             break;
                         }
-                        let candidates = self
-                            .resolver
-                            .resolve_exact_conflict_paths(&req.path)
-                            .await?;
-                        let tree_path = self.resolver.resolve_tree_lock_path(&req.path).await?;
-                        if let Err(e) = self.check_lock_paths(&candidates, &owner_id).await {
+                        let resolved = exact_resolutions.get(&req.path).ok_or_else(|| {
+                            PathLockError::Io(format!(
+                                "missing cached exact resolution for '{}'",
+                                req.path
+                            ))
+                        })?;
+                        if let Err(e) = self
+                            .check_lock_paths(&resolved.conflict_paths, &owner_id)
+                            .await
+                        {
                             post_conflict = Some(e);
                             break;
-                        }
-                        if !candidates.contains(&tree_path) {
-                            if let Err(e) =
-                                self.check_lock_paths(std::slice::from_ref(&tree_path), &owner_id).await
-                            {
-                                post_conflict = Some(e);
-                                break;
-                            }
                         }
                     }
                     PathLockKind::Tree => {
@@ -900,10 +898,15 @@ impl PathLockManager {
         loop {
             let parent = match current.rsplit_once('/') {
                 Some((p, _)) if !p.is_empty() => p.to_string(),
+                Some(_) if current != "/" => "/".to_string(),
                 _ => break,
             };
 
-            let ancestor_lock = format!("{}/{}", parent, PATH_LOCK_FILE);
+            let ancestor_lock = if parent == "/" {
+                format!("/{}", PATH_LOCK_FILE)
+            } else {
+                format!("{}/{}", parent, PATH_LOCK_FILE)
+            };
             if let Some(token) = self.provider.read_token(&ancestor_lock).await? {
                 // Only Tree locks propagate to descendants; an Exact lock on
                 // /a must not block /a/b.
@@ -1310,9 +1313,14 @@ impl PathLockManager {
         loop {
             let parent = match current.rsplit_once('/') {
                 Some((p, _)) if !p.is_empty() => p.to_string(),
+                Some(_) if current != "/" => "/".to_string(),
                 _ => break,
             };
-            let ancestor_lock = format!("{}/{}", parent, PATH_LOCK_FILE);
+            let ancestor_lock = if parent == "/" {
+                format!("/{}", PATH_LOCK_FILE)
+            } else {
+                format!("{}/{}", parent, PATH_LOCK_FILE)
+            };
             if let Ok(Some(token)) = self.provider.read_token(&ancestor_lock).await {
                 // Only Tree locks propagate to descendants.
                 if token.lock_type == PathLockKind::Tree
@@ -1401,6 +1409,7 @@ impl PathLockManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use crate::core::{FsOperation, StatsCollector, StatsWrappedFS};
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1511,6 +1520,19 @@ mod tests {
         (
             PathLockManager::new(fs.clone(), provider, PathLockConfig::default()),
             fs,
+        )
+    }
+
+    /// Build a manager wrapped with filesystem statistics for operation counting.
+    async fn make_manager_with_stats() -> (PathLockManager, Arc<StatsCollector>) {
+        let fs = Arc::new(MemFileSystem::new());
+        fs.mkdir("/data", 0o755).await.unwrap();
+        let wrapped = Arc::new(StatsWrappedFS::with_arc(fs));
+        let stats = wrapped.stats_collector();
+        let provider = Arc::new(crate::lock::provider::MemoryPathLockProvider::new());
+        (
+            PathLockManager::new(wrapped, provider, PathLockConfig::default()),
+            stats,
         )
     }
 
@@ -1791,6 +1813,71 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify exact acquisition classifies the path once per attempt.
+    ///
+    /// Returns: async test result via panic on assertion failure.
+    async fn acquire_exact_uses_two_stat_calls_per_attempt() {
+        let (mgr, stats) = make_manager_with_stats().await;
+        stats.reset().await;
+
+        let lease = mgr
+            .acquire_exact("/data/file.txt", Duration::ZERO, Some("owner"))
+            .await
+            .unwrap();
+
+        let snapshot = stats.snapshot().await;
+        assert_eq!(snapshot.get(FsOperation::Stat).count, 2);
+        mgr.release(&lease).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_tree_lock_blocks_descendant_acquire() {
+        let mgr = make_manager().await;
+        let _root = mgr
+            .acquire_tree("/", Duration::ZERO, Some("root-owner"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            mgr.acquire_exact("/data/sub/child.txt", Duration::ZERO, Some("other-owner"))
+                .await,
+            Err(PathLockError::Timeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    /// Verify exact locks create missing parent directories for sidecar paths.
+    ///
+    /// Returns: async test result via panic on assertion failure.
+    async fn missing_parent_exact_creates_sidecar_dir() {
+        let (mgr, fs) = make_manager_with_fs().await;
+
+        let lease = mgr
+            .acquire_exact(
+                "/data/missing/parent/file.txt",
+                Duration::ZERO,
+                Some("exact-owner"),
+            )
+            .await
+            .unwrap();
+
+        assert!(fs.stat("/data/missing").await.unwrap().is_dir);
+        assert!(fs.stat("/data/missing/parent").await.unwrap().is_dir);
+        assert!(lease.lease.lock_paths[0].starts_with("/data/missing/parent/.exact.ovlock.file.txt."));
+        assert!(matches!(
+            mgr.acquire_exact(
+                "/data/missing/parent/file.txt",
+                Duration::ZERO,
+                Some("other-owner")
+            )
+            .await,
+            Err(PathLockError::Timeout { .. })
+        ));
+
+        mgr.release(&lease).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn missing_exact_and_same_path_tree_conflict_in_both_orders() {
         let (mgr, _) = make_manager_with_fs().await;
         let exact = mgr
@@ -1951,6 +2038,17 @@ mod tests {
         assert!(!mgr.is_locked("/data/file.txt", true).await.unwrap());
         let _lease = mgr
             .acquire_exact("/data/file.txt", Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        assert!(mgr.is_locked("/data/file.txt", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_locked_detects_root_tree_lock() {
+        let mgr = make_manager().await;
+        assert!(!mgr.is_locked("/data/file.txt", true).await.unwrap());
+        let _root = mgr
+            .acquire_tree("/", Duration::ZERO, Some("root-owner"))
             .await
             .unwrap();
         assert!(mgr.is_locked("/data/file.txt", true).await.unwrap());

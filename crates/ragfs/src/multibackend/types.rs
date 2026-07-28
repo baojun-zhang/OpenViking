@@ -12,7 +12,7 @@ pub struct MultiBackendBuildContext {
     /// Global provider type, if server-side encryption is enabled.
     pub enc_provider_type: Option<u8>,
     /// Shared manager used by encrypted backends for dual-path locking.
-    pub pathlock_manager: Option<Arc<PathLockManager>>,
+    pub pathlock_manager: Arc<PathLockManager>,
     /// Mount prefix used to restore manager-visible backend paths.
     pub backend_prefix: String,
 }

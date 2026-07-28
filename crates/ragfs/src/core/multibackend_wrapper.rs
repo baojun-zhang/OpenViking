@@ -592,8 +592,7 @@ impl MultiWriteWrappedFS {
     /// Return whether encrypted backends own dual-path PathLock acquisition.
     pub(crate) fn encryption_handles_pathlock(&self) -> bool {
         let any = self.inner.primary().backend.as_ref() as &dyn std::any::Any;
-        any.downcast_ref::<EncryptionWrappedFS>()
-            .is_some_and(EncryptionWrappedFS::handles_pathlock)
+        any.downcast_ref::<EncryptionWrappedFS>().is_some()
     }
 }
 
