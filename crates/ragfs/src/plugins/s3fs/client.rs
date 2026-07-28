@@ -620,11 +620,7 @@ impl S3Client {
 
         request.send().await.map_err(|e| {
             let message = e.to_string();
-            if message.contains("PreconditionFailed")
-                || message.contains("ConditionalRequestConflict")
-                || message.contains("status: 412")
-                || message.contains("status=412")
-            {
+            if is_s3_conditional_failure(&message) {
                 Error::already_exists(key)
             } else {
                 format_sdk_s3_error(

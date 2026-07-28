@@ -383,7 +383,7 @@ impl FileSystem for EncryptionWrappedFS {
         let lease_ref = FsContextView::current()
             .pathlock_lease_ref()
             .map(str::to_string);
-        let owner_id_hint = match lease_ref {
+        let outer_lease = match lease_ref {
             Some(lease_ref) => {
                 let outer = self
                     .pathlock_manager
@@ -398,13 +398,19 @@ impl FileSystem for EncryptionWrappedFS {
                         final_request.path
                     )));
                 }
-                Some(outer.lease.owner_id)
+                Some(outer)
             }
             None => None,
         };
+        let owner_capability = outer_lease.as_ref().map(|lease| {
+            (
+                lease.lease.lease_ref.as_str(),
+                lease.ownership_ref.as_str(),
+            )
+        });
         let lock_guard = self
             .pathlock_manager
-            .acquire_batch(&requests, Duration::from_secs(30), owner_id_hint.as_deref())
+            .acquire_batch(&requests, Duration::from_secs(30), owner_capability)
             .await
             .map_err(|e| Error::internal(format!("encrypted write lock error: {e}")))?;
 

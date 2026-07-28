@@ -76,13 +76,14 @@ class _AsyncMoveAGFS:
         self,
         requests,
         timeout_secs=30.0,
-        owner_id_hint=None,
+        owner_lease_ref=None,
     ):
         """Record the operation lease request."""
-        self.acquire_calls.append((requests, owner_id_hint))
+        self.acquire_calls.append((requests, owner_lease_ref))
         return {
             "lease_ref": "operation-ref",
-            "owner_id": owner_id_hint or "operation-owner",
+            "owner_id": (owner_lease_ref["owner_id"] if owner_lease_ref else "operation-owner"),
+            "ownership_ref": "operation-ownership",
             "owned": True,
         }
 
@@ -90,14 +91,15 @@ class _AsyncMoveAGFS:
         self,
         path,
         timeout_secs=30.0,
-        owner_id_hint=None,
+        owner_lease_ref=None,
     ):
         """Record a temporary Tree extension used only for cleanup."""
         del timeout_secs
-        self.tree_calls.append((path, owner_id_hint))
+        self.tree_calls.append((path, owner_lease_ref))
         return {
             "lease_ref": "cleanup-ref",
-            "owner_id": owner_id_hint,
+            "owner_id": owner_lease_ref["owner_id"],
+            "ownership_ref": "cleanup-ownership",
             "owned": True,
         }
 
@@ -191,15 +193,16 @@ async def test_append_file_holds_exact_lease_across_read_and_write(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mv_extends_outer_lease_with_same_owner(monkeypatch):
-    """Move must acquire uncovered source locks with the outer lease owner."""
+async def test_mv_extends_outer_lease_with_owned_capability(monkeypatch):
+    """Move must acquire uncovered source locks with the outer owned capability."""
     fake = _AsyncMoveAGFS()
     fs = VikingFS(agfs=_FakeAGFS())
     fs._async_agfs = fake  # type: ignore[assignment]
     outer = {
         "lease_ref": "outer-ref",
         "owner_id": "outer-owner",
-        "owned": False,
+        "ownership_ref": "outer-ownership",
+        "owned": True,
     }
     copied_with = []
 
@@ -231,7 +234,7 @@ async def test_mv_extends_outer_lease_with_same_owner(monkeypatch):
         lease_ref=outer,
     )
 
-    assert fake.acquire_calls[0][1] == "outer-owner"
+    assert fake.acquire_calls[0][1] == outer
     assert copied_with[0]["lease_ref"] == "operation-ref"
     assert fake.release_calls == [copied_with[0]]
 
@@ -305,17 +308,29 @@ async def test_directory_mv_uses_temporary_tree_only_for_failed_copy_cleanup(mon
             ctx=_default_ctx(),
         )
 
-    assert fake.tree_calls == [("/local/default/resources/target", "operation-owner")]
+    assert fake.tree_calls == [
+        (
+            "/local/default/resources/target",
+            {
+                "lease_ref": "operation-ref",
+                "owner_id": "operation-owner",
+                "ownership_ref": "operation-ownership",
+                "owned": True,
+            },
+        )
+    ]
     assert fake.rm_calls[0][2]["lease_ref"] == "cleanup-ref"
     assert fake.release_calls == [
         {
             "lease_ref": "cleanup-ref",
             "owner_id": "operation-owner",
+            "ownership_ref": "cleanup-ownership",
             "owned": True,
         },
         {
             "lease_ref": "operation-ref",
             "owner_id": "operation-owner",
+            "ownership_ref": "operation-ownership",
             "owned": True,
         },
     ]

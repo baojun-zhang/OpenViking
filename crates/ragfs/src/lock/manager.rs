@@ -390,6 +390,25 @@ impl PathLockManager {
         now_ns.saturating_sub(token.time_ns) > expire_ns
     }
 
+    /// Resolve a trusted reentrant owner from an active local lease capability.
+    async fn resolve_owner_id(
+        &self,
+        owner_capability: Option<(&str, &str)>,
+    ) -> PathLockResult<String> {
+        match owner_capability {
+            Some((lease_ref, ownership_ref)) => self
+                .get_owned_lease_by_capability(lease_ref, ownership_ref)
+                .await
+                .map(|lease| lease.lease.owner_id)
+                .ok_or_else(|| {
+                    PathLockError::InvalidRequest(format!(
+                        "owned lease capability does not match ref '{lease_ref}'"
+                    ))
+                }),
+            None => Ok(Self::new_owner_id()),
+        }
+    }
+
     // ── Public API ──
 
     /// Acquire an exact lock on a single path.
@@ -397,13 +416,13 @@ impl PathLockManager {
         &self,
         path: &str,
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         let request = PathLockRequest {
             path: path.to_string(),
             kind: PathLockKind::Exact,
         };
-        self.acquire_batch(&[request], timeout, owner_id_hint)
+        self.acquire_batch(&[request], timeout, owner_capability)
             .await
     }
 
@@ -412,13 +431,13 @@ impl PathLockManager {
         &self,
         path: &str,
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         let request = PathLockRequest {
             path: path.to_string(),
             kind: PathLockKind::Tree,
         };
-        self.acquire_batch(&[request], timeout, owner_id_hint)
+        self.acquire_batch(&[request], timeout, owner_capability)
             .await
     }
 
@@ -427,7 +446,7 @@ impl PathLockManager {
         &self,
         paths: &[String],
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         let requests: Vec<PathLockRequest> = paths
             .iter()
@@ -436,7 +455,7 @@ impl PathLockManager {
                 kind: PathLockKind::Exact,
             })
             .collect();
-        self.acquire_batch(&requests, timeout, owner_id_hint)
+        self.acquire_batch(&requests, timeout, owner_capability)
             .await
     }
 
@@ -445,7 +464,7 @@ impl PathLockManager {
         &self,
         paths: &[String],
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         let requests: Vec<PathLockRequest> = paths
             .iter()
@@ -454,7 +473,7 @@ impl PathLockManager {
                 kind: PathLockKind::Tree,
             })
             .collect();
-        self.acquire_batch(&requests, timeout, owner_id_hint)
+        self.acquire_batch(&requests, timeout, owner_capability)
             .await
     }
 
@@ -464,7 +483,7 @@ impl PathLockManager {
         exact_paths: &[String],
         tree_paths: &[String],
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         let mut requests: Vec<PathLockRequest> = exact_paths
             .iter()
@@ -477,7 +496,7 @@ impl PathLockManager {
             path: p.clone(),
             kind: PathLockKind::Tree,
         }));
-        self.acquire_batch(&requests, timeout, owner_id_hint)
+        self.acquire_batch(&requests, timeout, owner_capability)
             .await
     }
 
@@ -488,7 +507,7 @@ impl PathLockManager {
         &self,
         requests: &[PathLockRequest],
         timeout: Duration,
-        owner_id_hint: Option<&str>,
+        owner_capability: Option<(&str, &str)>,
     ) -> PathLockResult<OwnedPathLockLease> {
         if requests.is_empty() {
             return Err(PathLockError::InvalidRequest(
@@ -497,9 +516,7 @@ impl PathLockManager {
         }
         let sorted = Self::normalize_requests(requests);
 
-        let owner_id = owner_id_hint
-            .map(str::to_string)
-            .unwrap_or_else(Self::new_owner_id);
+        let owner_id = self.resolve_owner_id(owner_capability).await?;
 
         let start = Instant::now();
         let mut acquired_lock_paths: Vec<(String, AcquisitionChange)> = Vec::new();
@@ -1532,37 +1549,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_exact_same_owner_reentrant() {
+    async fn acquire_exact_reentrant_requires_local_owned_capability() {
         let mgr = make_manager().await;
-        let owner = "test-owner";
         let lease1 = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), Some(owner))
+            .acquire_exact("/data/file.txt", Duration::from_secs(1), None)
             .await
             .unwrap();
+        let capability = (
+            lease1.lease.lease_ref.as_str(),
+            lease1.ownership_ref.as_str(),
+        );
         let lease2 = mgr
-            .acquire_exact("/data/file.txt", Duration::from_secs(1), Some(owner))
+            .acquire_exact("/data/file.txt", Duration::from_secs(1), Some(capability))
             .await
             .unwrap();
         assert_eq!(lease1.lease.lock_paths, lease2.lease.lock_paths);
 
         mgr.release(&lease2).await.unwrap();
         assert!(matches!(
-            mgr.acquire_exact(
-                "/data/file.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
-            .await,
+            mgr.acquire_exact("/data/file.txt", Duration::ZERO, None).await,
             Err(PathLockError::Timeout { .. })
         ));
 
         mgr.release(&lease1).await.unwrap();
         assert!(mgr
-            .acquire_exact(
-                "/data/file.txt",
-                Duration::ZERO,
-                Some("other-owner")
-            )
+            .acquire_exact("/data/file.txt", Duration::ZERO, None)
             .await
             .is_ok());
     }
@@ -1575,7 +1586,7 @@ mod tests {
             .acquire_exact_batch(
                 &["/data/a.txt".to_string(), "/data/b.txt".to_string()],
                 Duration::ZERO,
-                Some("shared-owner"),
+                None,
             )
             .await
             .unwrap();
@@ -1602,13 +1613,17 @@ mod tests {
     async fn failed_batch_rolls_back_same_owner_tree_upgrade() {
         let mgr = make_manager().await;
         let exact = mgr
-            .acquire_exact("/data/sub", Duration::ZERO, Some("shared-owner"))
+            .acquire_exact("/data/sub", Duration::ZERO, None)
             .await
             .unwrap();
         let blocker = mgr
-            .acquire_exact("/data/z.txt", Duration::ZERO, Some("blocker"))
+            .acquire_exact("/data/z.txt", Duration::ZERO, None)
             .await
             .unwrap();
+        let capability = (
+            exact.lease.lease_ref.as_str(),
+            exact.ownership_ref.as_str(),
+        );
 
         let result = mgr
             .acquire_batch(
@@ -1623,7 +1638,7 @@ mod tests {
                     },
                 ],
                 Duration::ZERO,
-                Some("shared-owner"),
+                Some(capability),
             )
             .await;
 
@@ -1644,23 +1659,21 @@ mod tests {
     async fn missing_exact_and_same_path_tree_conflict_in_both_orders() {
         let (mgr, _) = make_manager_with_fs().await;
         let exact = mgr
-            .acquire_exact("/data/new", Duration::ZERO, Some("exact-owner"))
+            .acquire_exact("/data/new", Duration::ZERO, None)
             .await
             .unwrap();
         assert!(matches!(
-            mgr.acquire_tree("/data/new", Duration::ZERO, Some("tree-owner"))
-                .await,
+            mgr.acquire_tree("/data/new", Duration::ZERO, None).await,
             Err(PathLockError::Timeout { .. })
         ));
         mgr.release(&exact).await.unwrap();
 
         let tree = mgr
-            .acquire_tree("/data/other", Duration::ZERO, Some("tree-owner"))
+            .acquire_tree("/data/other", Duration::ZERO, None)
             .await
             .unwrap();
         assert!(matches!(
-            mgr.acquire_exact("/data/other", Duration::ZERO, Some("exact-owner"))
-                .await,
+            mgr.acquire_exact("/data/other", Duration::ZERO, None).await,
             Err(PathLockError::Timeout { .. })
         ));
         mgr.release(&tree).await.unwrap();
@@ -1670,14 +1683,14 @@ mod tests {
     async fn handoff_and_adopt() {
         let mgr = make_manager().await;
         let lease = mgr
-            .acquire_tree("/data/sub", Duration::from_secs(1), Some("owner-x"))
+            .acquire_tree("/data/sub", Duration::from_secs(1), None)
             .await
             .unwrap();
         let handoff = mgr.to_handoff(&lease);
         mgr.handoff(&lease).await.unwrap();
 
         let adopted = mgr.adopt(&handoff).await.unwrap();
-        assert_eq!(adopted.lease.owner_id, "owner-x");
+        assert_eq!(adopted.lease.owner_id, lease.lease.owner_id);
         assert_eq!(adopted.lease.lock_paths, handoff.lock_paths);
     }
 
@@ -1685,7 +1698,7 @@ mod tests {
     async fn opaque_lease_ref_must_cover_requested_path() {
         let mgr = make_manager().await;
         let lease = mgr
-            .acquire_tree("/data", Duration::from_secs(1), Some("owner-x"))
+            .acquire_tree("/data", Duration::from_secs(1), None)
             .await
             .unwrap();
 
@@ -1730,7 +1743,7 @@ mod tests {
         })
         .await;
         let lease = mgr
-            .acquire_tree("/data/sub", Duration::from_secs(1), Some("owner-x"))
+            .acquire_tree("/data/sub", Duration::from_secs(1), None)
             .await
             .unwrap();
         let lock_path = lease.lease.lock_paths[0].clone();
@@ -1768,7 +1781,7 @@ mod tests {
         let mgr = make_manager().await;
         assert!(!mgr.is_locked("/data/file.txt", true).await.unwrap());
         let _root = mgr
-            .acquire_tree("/", Duration::ZERO, Some("root-owner"))
+            .acquire_tree("/", Duration::ZERO, None)
             .await
             .unwrap();
         assert!(mgr.is_locked("/data/file.txt", true).await.unwrap());
@@ -1782,7 +1795,7 @@ mod tests {
         let mgr = PathLockManager::new(fs, provider, PathLockConfig::default());
 
         assert!(matches!(
-            mgr.acquire_exact("/data/file.txt", Duration::ZERO, Some("owner"))
+            mgr.acquire_exact("/data/file.txt", Duration::ZERO, None)
                 .await,
             Err(PathLockError::Io(message)) if message == "injected read failure"
         ));

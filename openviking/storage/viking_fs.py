@@ -770,19 +770,13 @@ class VikingFS:
         old_uri = canonicalize_uri(old_uri, real_ctx)
         new_uri = canonicalize_uri(new_uri, real_ctx)
 
-        owner_id_hint = None
-        if lease_ref is not None:
-            owner_id_hint = lease_ref.get("owner_id")
-            if not isinstance(owner_id_hint, str) or not owner_id_hint:
-                raise ValueError("mv lease_ref must contain a non-empty owner_id")
-
         if is_dir:
             lease = await self._async_agfs.pathlock_acquire_batch(
                 [
                     {"path": old_path, "kind": "tree"},
                     {"path": new_path, "kind": "exact"},
                 ],
-                owner_id_hint=owner_id_hint,
+                owner_lease_ref=lease_ref,
             )
         else:
             lease = await self._async_agfs.pathlock_acquire_batch(
@@ -790,7 +784,7 @@ class VikingFS:
                     {"path": old_path, "kind": "exact"},
                     {"path": new_path, "kind": "exact"},
                 ],
-                owner_id_hint=owner_id_hint,
+                owner_lease_ref=lease_ref,
             )
 
         try:
@@ -826,7 +820,7 @@ class VikingFS:
                     if is_dir:
                         cleanup_lease = await self._async_agfs.pathlock_acquire_tree(
                             new_path,
-                            owner_id_hint=lease["owner_id"],
+                            owner_lease_ref=lease,
                         )
                         try:
                             await self._async_agfs.rm(
@@ -933,10 +927,6 @@ class VikingFS:
         """
         if lease_ref is None:
             raise ValueError("temp directory copy requires a pathlock lease")
-        owner_id = lease_ref.get("owner_id")
-        if not isinstance(owner_id, str) or not owner_id:
-            raise ValueError("temp directory copy lease must contain a non-empty owner_id")
-
         fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
         await self._async_agfs.mkdir(new_path, fs_ctx=fs_ctx)
         entries = await self._async_agfs.ls(old_path, fs_ctx=fs_ctx)
@@ -948,7 +938,7 @@ class VikingFS:
             new_child = f"{new_path.rstrip('/')}/{name}"
             child_lease = await self._async_agfs.pathlock_acquire_exact(
                 new_child,
-                owner_id_hint=owner_id,
+                owner_lease_ref=lease_ref,
             )
             try:
                 if entry.get("isDir", False):
@@ -1013,13 +1003,10 @@ class VikingFS:
             await self.write_file_bytes(to_uri, content_bytes, ctx=ctx)
             return
 
-        owner_id = lease_ref.get("owner_id")
-        if not isinstance(owner_id, str) or not owner_id:
-            raise ValueError("mv lease_ref must contain a non-empty owner_id")
         child_path = self._uri_to_path(to_uri, ctx=ctx)
         child_lease = await self._async_agfs.pathlock_acquire_exact(
             child_path,
-            owner_id_hint=owner_id,
+            owner_lease_ref=lease_ref,
         )
         try:
             await self.write_file_bytes(to_uri, content_bytes, ctx=ctx, lease_ref=child_lease)

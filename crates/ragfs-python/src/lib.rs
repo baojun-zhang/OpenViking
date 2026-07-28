@@ -988,6 +988,16 @@ fn extract_owned_lease_ref(
     require_owned_lease_ref(py, &ref_dict)
 }
 
+/// Extract an optional owned lease capability used for reentrant acquisition.
+fn extract_optional_owned_lease_ref(
+    py: Python<'_>,
+    lease_ref: Option<&Py<PyAny>>,
+) -> PyResult<Option<(String, String)>> {
+    lease_ref
+        .map(|value| extract_owned_lease_ref(py, value))
+        .transpose()
+}
+
 /// Convert a PathLockHandoffRef to a Python dict.
 fn handoff_ref_to_py_dict(py: Python<'_>, handoff: &PathLockHandoffRef) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
@@ -2008,24 +2018,31 @@ impl RAGFSBindingClient {
     // ── PathLock API ──
 
     /// Acquire an exact lock on a single path.
-    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact(
         &self,
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
         path: String,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let path = path.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_exact(&path, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_exact(&path, timeout, capability).await
             }
         })
         .map_err(pathlock_err_to_py)?;
@@ -2033,24 +2050,31 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire exact locks on multiple paths.
-    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact_batch(
         &self,
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
         paths: Vec<String>,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let paths = paths.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_exact_batch(&paths, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_exact_batch(&paths, timeout, capability).await
             }
         })
         .map_err(pathlock_err_to_py)?;
@@ -2058,24 +2082,31 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire a tree lock on a single path.
-    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_tree(
         &self,
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
         path: String,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let path = path.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_tree(&path, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_tree(&path, timeout, capability).await
             }
         })
         .map_err(pathlock_err_to_py)?;
@@ -2083,24 +2114,31 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire tree locks on multiple paths.
-    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_tree_batch(
         &self,
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
         paths: Vec<String>,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let paths = paths.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_tree_batch(&paths, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_tree_batch(&paths, timeout, capability).await
             }
         })
         .map_err(pathlock_err_to_py)?;
@@ -2108,7 +2146,7 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire a mixed batch of exact and tree locks.
-    #[pyo3(signature = (ctx, exact_paths, tree_paths, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, exact_paths, tree_paths, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact_tree_batch(
         &self,
         py: Python<'_>,
@@ -2116,18 +2154,26 @@ impl RAGFSBindingClient {
         exact_paths: Vec<String>,
         tree_paths: Vec<String>,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let exact = exact_paths.clone();
             let tree = tree_paths.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_exact_tree_batch(&exact, &tree, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_exact_tree_batch(&exact, &tree, timeout, capability)
+                    .await
             }
         })
         .map_err(pathlock_err_to_py)?;
@@ -2136,27 +2182,34 @@ impl RAGFSBindingClient {
 
     /// Acquire a batch of locks from a list of request dicts.
     /// Each request dict: {"path": str, "kind": "exact"|"tree"}
-    #[pyo3(signature = (ctx, requests, timeout_secs=30.0, owner_id_hint=None))]
+    #[pyo3(signature = (ctx, requests, timeout_secs=30.0, owner_lease_ref=None))]
     fn pathlock_acquire_batch(
         &self,
         py: Python<'_>,
         ctx: Option<HashMap<String, String>>,
         requests: Vec<HashMap<String, String>>,
         timeout_secs: f64,
-        owner_id_hint: Option<String>,
+        owner_lease_ref: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let mgr = self.clone_pathlock_manager();
         let fs_ctx = build_fs_context(ctx);
         let timeout = validate_timeout_secs(timeout_secs)?;
+        let owner_capability =
+            extract_optional_owned_lease_ref(py, owner_lease_ref.as_ref())?;
 
         let lock_requests = parse_pathlock_request_batch(&requests)?;
 
         let lease = self.run_scoped(py, fs_ctx, move || {
             let mgr = mgr.clone();
             let reqs = lock_requests.clone();
-            let hint = owner_id_hint.clone();
+            let capability = owner_capability.clone();
             async move {
-                mgr.acquire_batch(&reqs, timeout, hint.as_deref()).await
+                let capability = capability
+                    .as_ref()
+                    .map(|(lease_ref, ownership_ref)| {
+                        (lease_ref.as_str(), ownership_ref.as_str())
+                    });
+                mgr.acquire_batch(&reqs, timeout, capability).await
             }
         })
         .map_err(pathlock_err_to_py)?;
