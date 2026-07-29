@@ -155,10 +155,15 @@ impl LocalFileSystem {
             Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),
         };
-        let mut lock = fd_lock::RwLock::new(file);
-        let mut file = lock
-            .write()
+        let mut lock = filelocks::LockOptions::new()
+            .backend(filelocks::LockBackend::Fcntl)
+            .lock(
+                file,
+                filelocks::LockKind::Exclusive,
+                filelocks::LockMode::NonBlocking,
+            )
             .map_err(|e| Error::plugin(format!("failed to lock for compare_and_write: {}", e)))?;
+        let file = lock.file_mut();
         if !Self::open_file_matches_path(&file, &local_path)? {
             return Ok(false);
         }
@@ -203,10 +208,15 @@ impl LocalFileSystem {
             Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),
         };
-        let mut lock = fd_lock::RwLock::new(file);
-        let mut file = lock
-            .write()
+        let mut lock = filelocks::LockOptions::new()
+            .backend(filelocks::LockBackend::Fcntl)
+            .lock(
+                file,
+                filelocks::LockKind::Exclusive,
+                filelocks::LockMode::NonBlocking,
+            )
             .map_err(|e| Error::plugin(format!("failed to lock for compare_and_remove: {}", e)))?;
+        let file = lock.file_mut();
         if !Self::open_file_matches_path(&file, &local_path)? {
             return Ok(false);
         }
