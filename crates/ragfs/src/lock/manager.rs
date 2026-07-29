@@ -286,20 +286,20 @@ impl PathLockManager {
             loop {
                 tokio::time::sleep(refresh_interval).await;
                 let now_ns = Self::now_ns();
-                let entries: Vec<(String, String, Vec<String>)> = {
+                let lease_refs: Vec<String> = {
                     let reg = refresh_registry.read().await;
                     reg.entries
                         .iter()
-                        .map(|(lease_ref, entry)| {
-                            (
-                                lease_ref.clone(),
-                                entry.lease.owner_id.clone(),
-                                entry.lease.lock_paths.clone(),
-                            )
-                        })
+                        .map(|(lease_ref, _)| lease_ref.clone())
                         .collect()
                 };
-                for (lease_ref, owner_id, lock_paths) in entries {
+                for lease_ref in lease_refs {
+                    let refresh_guard = refresh_registry.read().await;
+                    let Some(entry) = refresh_guard.entries.get(&lease_ref) else {
+                        continue;
+                    };
+                    let owner_id = entry.lease.owner_id.clone();
+                    let lock_paths = entry.lease.lock_paths.clone();
                     let mut all_ok = true;
                     for lp in &lock_paths {
                         match refresh_provider.refresh_token(lp, &owner_id, now_ns).await {
@@ -307,6 +307,7 @@ impl PathLockManager {
                             _ => all_ok = false,
                         }
                     }
+                    drop(refresh_guard);
                     if all_ok {
                         refresh_registry.write().await.touch(&lease_ref);
                     }
@@ -346,6 +347,28 @@ impl PathLockManager {
             lease_registry: registry,
             config,
             metrics,
+        }
+    }
+
+    /// Build one release error when the provider reports the token changed underneath us.
+    fn release_changed_error(lock_path: &str) -> PathLockError {
+        PathLockError::Io(format!("lock path '{lock_path}' changed while releasing"))
+    }
+
+    /// Best-effort resolve the conflicting lock kind for observability.
+    async fn conflicting_kind_for_path(&self, lock_path: &str) -> PathLockKind {
+        if let Ok(Some(token)) = self.provider.read_token(lock_path).await {
+            return token.lock_type;
+        }
+        let file_name = lock_path.rsplit('/').next().unwrap_or("");
+        if lock_path == format!("/{}", PATH_LOCK_FILE)
+            || lock_path.ends_with(&format!("/{}", PATH_LOCK_FILE))
+        {
+            PathLockKind::Tree
+        } else if file_name.starts_with(EXACT_LOCK_FILE_PREFIX) {
+            PathLockKind::Exact
+        } else {
+            PathLockKind::Tree
         }
     }
 
@@ -646,7 +669,7 @@ impl PathLockManager {
                         metrics.record_conflict(PathLockConflict {
                             lock_path: lock_path.clone(),
                             conflicting_owner: owner.clone(),
-                            conflicting_kind: PathLockKind::Tree, // ponytail: approximate — exact resolution would require reading the token
+                            conflicting_kind: self.conflicting_kind_for_path(lock_path).await,
                         });
                     }
                 }
@@ -764,7 +787,7 @@ impl PathLockManager {
                         metrics.record_conflict(PathLockConflict {
                             lock_path: lock_path.clone(),
                             conflicting_owner: owner.clone(),
-                            conflicting_kind: PathLockKind::Tree,
+                            conflicting_kind: self.conflicting_kind_for_path(lock_path).await,
                         });
                     }
                 }
@@ -1058,14 +1081,23 @@ impl PathLockManager {
             let mut failed_paths = Vec::new();
             let mut first_error = None;
             for lock_path in release_paths {
-                if let Err(error) = self
+                match self
                     .provider
                     .remove_token(&lock_path, &entry.lease.owner_id)
                     .await
                 {
-                    failed_paths.push(lock_path);
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                    Ok(true) => {}
+                    Ok(false) => {
+                        failed_paths.push(lock_path.clone());
+                        if first_error.is_none() {
+                            first_error = Some(Self::release_changed_error(&lock_path));
+                        }
+                    }
+                    Err(error) => {
+                        failed_paths.push(lock_path);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
             }
@@ -1126,10 +1158,19 @@ impl PathLockManager {
             let mut failed_paths = Vec::new();
             let mut first_error = None;
             for lock_path in release_paths {
-                if let Err(error) = self.provider.remove_token(&lock_path, &owner_id).await {
-                    failed_paths.push(lock_path);
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                match self.provider.remove_token(&lock_path, &owner_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        failed_paths.push(lock_path.clone());
+                        if first_error.is_none() {
+                            first_error = Some(Self::release_changed_error(&lock_path));
+                        }
+                    }
+                    Err(error) => {
+                        failed_paths.push(lock_path);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
             }
@@ -1487,11 +1528,13 @@ mod tests {
     use crate::core::{FsContextInner, PathLockContext, FS_CTX};
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
 
     struct FailNextRemoveProvider {
         inner: crate::lock::provider::MemoryPathLockProvider,
         fail_next_read: AtomicBool,
         fail_next_remove: AtomicBool,
+        return_false_next_remove: AtomicBool,
     }
 
     impl FailNextRemoveProvider {
@@ -1501,6 +1544,17 @@ mod tests {
                 inner: crate::lock::provider::MemoryPathLockProvider::new(),
                 fail_next_read: AtomicBool::new(true),
                 fail_next_remove: AtomicBool::new(false),
+                return_false_next_remove: AtomicBool::new(false),
+            }
+        }
+
+        /// Build a memory provider whose next token remove reports "not removed".
+        fn with_remove_false() -> Self {
+            Self {
+                inner: crate::lock::provider::MemoryPathLockProvider::new(),
+                fail_next_read: AtomicBool::new(false),
+                fail_next_remove: AtomicBool::new(false),
+                return_false_next_remove: AtomicBool::new(true),
             }
         }
     }
@@ -1553,6 +1607,9 @@ mod tests {
             lock_path: &str,
             owner_id: &str,
         ) -> PathLockResult<bool> {
+            if self.return_false_next_remove.swap(false, Ordering::SeqCst) {
+                return Ok(false);
+            }
             if self.fail_next_remove.swap(false, Ordering::SeqCst) {
                 return Err(PathLockError::Io("injected remove failure".to_string()));
             }
@@ -1587,6 +1644,17 @@ mod tests {
             PathLockManager::new(fs.clone(), provider, PathLockConfig::default()),
             fs,
         )
+    }
+
+    /// Build a manager backed by a custom provider.
+    async fn make_manager_with_provider(
+        provider: Arc<dyn PathLockProvider>,
+        config: PathLockConfig,
+    ) -> PathLockManager {
+        let fs = Arc::new(MemFileSystem::new());
+        fs.mkdir("/data", 0o755).await.unwrap();
+        fs.mkdir("/data/sub", 0o755).await.unwrap();
+        PathLockManager::new(fs, provider, config)
     }
 
     #[tokio::test]
