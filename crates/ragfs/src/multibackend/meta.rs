@@ -501,7 +501,6 @@ pub fn current_required_ctx() -> Result<FsContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::context::PathLockContext;
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::Arc;
 
