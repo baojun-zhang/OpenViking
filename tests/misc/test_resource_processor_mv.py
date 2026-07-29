@@ -50,7 +50,7 @@ class _FakePathLock:
         self._next_id += 1
         return {"id": f"lock-{self._next_id}"}
 
-    async def pathlock_acquire_tree(self, path, timeout_secs=30.0):
+    async def pathlock_acquire_tree(self, path, timeout_secs=0.0):
         from openviking.storage.errors import LockAcquisitionError
 
         self.tree_attempts.append((path, timeout_secs))

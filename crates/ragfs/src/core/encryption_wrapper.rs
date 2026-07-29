@@ -400,7 +400,7 @@ impl FileSystem for EncryptionWrappedFS {
                     self.pathlock_manager
                         .acquire_batch(
                             &requests,
-                            Duration::from_secs(30),
+                            Duration::from_secs(1),
                             Some(owner_capability),
                         )
                         .await
@@ -411,7 +411,7 @@ impl FileSystem for EncryptionWrappedFS {
             }
             AutoPathLockAction::Acquire => Some(
                 self.pathlock_manager
-                    .acquire_batch(&requests, Duration::from_secs(30), None)
+                    .acquire_batch(&requests, Duration::from_secs(1), None)
                     .await
                     .map_err(|error| {
                         Error::internal(format!("encrypted write lock error: {error}"))

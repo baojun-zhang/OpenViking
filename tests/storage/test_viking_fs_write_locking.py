@@ -75,7 +75,7 @@ class _AsyncMoveAGFS:
     async def pathlock_acquire_batch(
         self,
         requests,
-        timeout_secs=30.0,
+        timeout_secs=0.0,
         owner_lease_ref=None,
     ):
         """Record the operation lease request."""
@@ -90,7 +90,7 @@ class _AsyncMoveAGFS:
     async def pathlock_acquire_tree(
         self,
         path,
-        timeout_secs=30.0,
+        timeout_secs=0.0,
         owner_lease_ref=None,
     ):
         """Record a temporary Tree extension used only for cleanup."""

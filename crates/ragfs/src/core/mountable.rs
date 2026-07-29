@@ -614,7 +614,7 @@ impl MountableFS {
             Ok(AutoPathLockAction::Disabled | AutoPathLockAction::Covered(_)) => None,
             Ok(AutoPathLockAction::Acquire) => Some(
                 manager
-                    .acquire_exact(dst_path, Duration::from_secs(30), None)
+                    .acquire_exact(dst_path, Duration::ZERO, None)
                     .await
                     .map_err(|error| Error::internal(format!("lock error: {error}")))?,
             ),

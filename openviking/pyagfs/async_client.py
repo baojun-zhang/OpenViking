@@ -259,7 +259,7 @@ class AsyncAGFSClient:
     async def pathlock_acquire_exact(
         self,
         path: str,
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,
@@ -276,7 +276,7 @@ class AsyncAGFSClient:
     async def pathlock_acquire_exact_batch(
         self,
         paths: list[str],
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,
@@ -293,7 +293,7 @@ class AsyncAGFSClient:
     async def pathlock_acquire_tree(
         self,
         path: str,
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,
@@ -310,7 +310,7 @@ class AsyncAGFSClient:
     async def pathlock_acquire_tree_batch(
         self,
         paths: list[str],
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,
@@ -328,7 +328,7 @@ class AsyncAGFSClient:
         self,
         exact_paths: list[str],
         tree_paths: list[str],
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,
@@ -347,7 +347,7 @@ class AsyncAGFSClient:
     async def pathlock_acquire_batch(
         self,
         requests: list[Dict[str, str]],
-        timeout_secs: float = 30.0,
+        timeout_secs: float = 0.0,
         owner_lease_ref: Dict[str, Any] | None = None,
         *,
         fs_ctx: Dict[str, str] | None = None,

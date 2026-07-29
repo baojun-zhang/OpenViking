@@ -552,13 +552,11 @@ class ResourceProcessor:
                 await self.vikingdb.delete(ids, ctx=ctx)
         for uri in dict.fromkeys(dirs):
             records = await self.vikingdb.filter(
-                filter=And(
-                    [
-                        PathScope("uri", uri, depth=-1),
-                        Eq("level", int(ContextLevel.DETAIL)),
-                        Eq("account_id", ctx.account_id),
-                    ]
-                ),
+                filter=And([
+                    PathScope("uri", uri, depth=-1),
+                    Eq("level", int(ContextLevel.DETAIL)),
+                    Eq("account_id", ctx.account_id),
+                ]),
                 limit=VECTORDB_MAX_QUERY_LIMIT,
                 output_fields=["id"],
                 ctx=ctx,
@@ -640,7 +638,7 @@ class ResourceProcessor:
         path: str,
         *,
         uri: str = "",
-        timeout: float = 30.0,
+        timeout: float = 0.0,
     ) -> Dict[str, Any]:
         """Acquire the per-resource TreeLock or raise a structured conflict."""
         from openviking.storage.errors import ResourceBusyError

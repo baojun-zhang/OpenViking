@@ -21,7 +21,7 @@ use super::manager::{AutoPathLockAction, PathLockManager};
 use super::types::{PathLockKind, PathLockRequest};
 
 /// Default timeout for auto-acquired locks.
-const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTO_LOCK_TIMEOUT: Duration = Duration::ZERO;
 
 /// A `FileSystem` wrapper that auto-acquires path locks for mutating operations.
 pub struct PathLockWrappedFS {

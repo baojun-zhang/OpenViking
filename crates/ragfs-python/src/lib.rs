@@ -2018,7 +2018,7 @@ impl RAGFSBindingClient {
     // ── PathLock API ──
 
     /// Acquire an exact lock on a single path.
-    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, path, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact(
         &self,
         py: Python<'_>,
@@ -2050,7 +2050,7 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire exact locks on multiple paths.
-    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, paths, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact_batch(
         &self,
         py: Python<'_>,
@@ -2082,7 +2082,7 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire a tree lock on a single path.
-    #[pyo3(signature = (ctx, path, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, path, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_tree(
         &self,
         py: Python<'_>,
@@ -2114,7 +2114,7 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire tree locks on multiple paths.
-    #[pyo3(signature = (ctx, paths, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, paths, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_tree_batch(
         &self,
         py: Python<'_>,
@@ -2146,7 +2146,7 @@ impl RAGFSBindingClient {
     }
 
     /// Acquire a mixed batch of exact and tree locks.
-    #[pyo3(signature = (ctx, exact_paths, tree_paths, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, exact_paths, tree_paths, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_exact_tree_batch(
         &self,
         py: Python<'_>,
@@ -2182,7 +2182,7 @@ impl RAGFSBindingClient {
 
     /// Acquire a batch of locks from a list of request dicts.
     /// Each request dict: {"path": str, "kind": "exact"|"tree"}
-    #[pyo3(signature = (ctx, requests, timeout_secs=30.0, owner_lease_ref=None))]
+    #[pyo3(signature = (ctx, requests, timeout_secs=0.0, owner_lease_ref=None))]
     fn pathlock_acquire_batch(
         &self,
         py: Python<'_>,
