@@ -164,6 +164,8 @@ pub enum PathLockError {
         lock_path: String,
         /// Owner of the conflicting lock.
         owner: String,
+        /// Kind of the conflicting lock from the original read snapshot.
+        kind: PathLockKind,
     },
 
     /// Timeout waiting for lock acquisition.

@@ -355,23 +355,6 @@ impl PathLockManager {
         PathLockError::Io(format!("lock path '{lock_path}' changed while releasing"))
     }
 
-    /// Best-effort resolve the conflicting lock kind for observability.
-    async fn conflicting_kind_for_path(&self, lock_path: &str) -> PathLockKind {
-        if let Ok(Some(token)) = self.provider.read_token(lock_path).await {
-            return token.lock_type;
-        }
-        let file_name = lock_path.rsplit('/').next().unwrap_or("");
-        if lock_path == format!("/{}", PATH_LOCK_FILE)
-            || lock_path.ends_with(&format!("/{}", PATH_LOCK_FILE))
-        {
-            PathLockKind::Tree
-        } else if file_name.starts_with(EXACT_LOCK_FILE_PREFIX) {
-            PathLockKind::Exact
-        } else {
-            PathLockKind::Tree
-        }
-    }
-
     /// Current nanosecond timestamp.
     fn now_ns() -> u128 {
         SystemTime::now()
@@ -665,11 +648,16 @@ impl PathLockManager {
                         is_waiting = true;
                         metrics.waiting_lock_count += 1;
                     }
-                    if let PathLockError::Conflict { ref lock_path, ref owner } = &err {
+                    if let PathLockError::Conflict {
+                        ref lock_path,
+                        ref owner,
+                        kind,
+                    } = &err
+                    {
                         metrics.record_conflict(PathLockConflict {
                             lock_path: lock_path.clone(),
                             conflicting_owner: owner.clone(),
-                            conflicting_kind: self.conflicting_kind_for_path(lock_path).await,
+                            conflicting_kind: *kind,
                         });
                     }
                 }
@@ -782,12 +770,13 @@ impl PathLockManager {
                     if let PathLockError::Conflict {
                         ref lock_path,
                         ref owner,
+                        kind,
                     } = &err
                     {
                         metrics.record_conflict(PathLockConflict {
                             lock_path: lock_path.clone(),
                             conflicting_owner: owner.clone(),
-                            conflicting_kind: self.conflicting_kind_for_path(lock_path).await,
+                            conflicting_kind: *kind,
                         });
                     }
                 }
@@ -899,6 +888,7 @@ impl PathLockManager {
                     return Err(PathLockError::Conflict {
                         lock_path: lock_path.to_string(),
                         owner: owner_id.to_string(),
+                        kind: existing.lock_type,
                     });
                 }
                 return Ok(AcquisitionChange::Reentrant);
@@ -907,6 +897,7 @@ impl PathLockManager {
                 return Err(PathLockError::Conflict {
                     lock_path: lock_path.to_string(),
                     owner: existing.owner_id,
+                    kind: existing.lock_type,
                 });
             }
             // Stale — remove it.
@@ -930,6 +921,7 @@ impl PathLockManager {
                     return Err(PathLockError::Conflict {
                         lock_path: lock_path.clone(),
                         owner: token.owner_id,
+                        kind: token.lock_type,
                     });
                 }
             }
@@ -968,6 +960,7 @@ impl PathLockManager {
                     return Err(PathLockError::Conflict {
                         lock_path: ancestor_lock,
                         owner: token.owner_id,
+                        kind: token.lock_type,
                     });
                 }
             }
@@ -998,6 +991,7 @@ impl PathLockManager {
                     return Err(PathLockError::Conflict {
                         lock_path: lp,
                         owner: token.owner_id,
+                        kind: token.lock_type,
                     });
                 }
             }
@@ -1225,6 +1219,7 @@ impl PathLockManager {
                 return Err(PathLockError::Conflict {
                     lock_path: lock_path.to_string(),
                     owner: current.owner_id,
+                    kind: current.lock_type,
                 });
             }
             if current.lock_type == PathLockKind::Exact {
@@ -1525,10 +1520,8 @@ impl PathLockManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use crate::core::{FsContextInner, PathLockContext, FS_CTX};
     use crate::plugins::memfs::MemFileSystem;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::Notify;
 
     struct FailNextRemoveProvider {
         inner: crate::lock::provider::MemoryPathLockProvider,
@@ -1548,15 +1541,6 @@ mod tests {
             }
         }
 
-        /// Build a memory provider whose next token remove reports "not removed".
-        fn with_remove_false() -> Self {
-            Self {
-                inner: crate::lock::provider::MemoryPathLockProvider::new(),
-                fail_next_read: AtomicBool::new(false),
-                fail_next_remove: AtomicBool::new(false),
-                return_false_next_remove: AtomicBool::new(true),
-            }
-        }
     }
 
     #[async_trait]
@@ -1644,17 +1628,6 @@ mod tests {
             PathLockManager::new(fs.clone(), provider, PathLockConfig::default()),
             fs,
         )
-    }
-
-    /// Build a manager backed by a custom provider.
-    async fn make_manager_with_provider(
-        provider: Arc<dyn PathLockProvider>,
-        config: PathLockConfig,
-    ) -> PathLockManager {
-        let fs = Arc::new(MemFileSystem::new());
-        fs.mkdir("/data", 0o755).await.unwrap();
-        fs.mkdir("/data/sub", 0o755).await.unwrap();
-        PathLockManager::new(fs, provider, config)
     }
 
     #[tokio::test]

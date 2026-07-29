@@ -91,6 +91,7 @@ impl PathLockProvider for MemoryPathLockProvider {
             return Err(PathLockError::Conflict {
                 lock_path: lock_path.to_string(),
                 owner: tokens[lock_path].owner_id.clone(),
+                kind: tokens[lock_path].lock_type,
             });
         }
         tokens.insert(lock_path.to_string(), token.clone());
@@ -226,6 +227,7 @@ impl PathLockProvider for FilesystemPathLockProvider {
                     Some(t) => Err(PathLockError::Conflict {
                         lock_path: lock_path.to_string(),
                         owner: t.owner_id,
+                        kind: t.lock_type,
                     }),
                     None => Err(PathLockError::Io(format!(
                         "failed to create lock token at {lock_path}"
