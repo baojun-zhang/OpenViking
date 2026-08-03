@@ -7,10 +7,12 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyType};
+use pyo3::wrap_pyfunction;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::Level;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -20,6 +22,61 @@ use tracing_appender::non_blocking::WorkerGuard;
 static LOCK_ACQUISITION_ERROR_TYPE: OnceLock<Py<PyType>> = OnceLock::new();
 static RUST_TRACING_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 static RUST_TRACING_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+static RUST_TRACING_FILE_STATE: OnceLock<TracingFileState> = OnceLock::new();
+
+#[derive(Clone)]
+struct SharedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl Write for SharedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
+        file.flush()
+    }
+}
+
+struct TracingFileState {
+    path: PathBuf,
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+/// Open the configured Rust tracing log file.
+fn open_tracing_log_file(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create Rust tracing log dir: {e}"))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open Rust tracing log file: {e}"))
+}
+
+/// Swap the shared Rust tracing file handle to the current active log file.
+fn replace_tracing_log_file(
+    shared: &Arc<Mutex<std::fs::File>>,
+    path: &Path,
+) -> Result<(), String> {
+    let new_file = open_tracing_log_file(path)?;
+    let mut file = shared
+        .lock()
+        .map_err(|_| "shared tracing log file lock poisoned".to_string())?;
+    *file = new_file;
+    Ok(())
+}
 
 /// Parse the configured OpenViking log level into a Rust tracing level.
 fn parse_tracing_level(log_level: &str) -> Result<Level, String> {
@@ -28,6 +85,7 @@ fn parse_tracing_level(log_level: &str) -> Result<Level, String> {
         "DEBUG" => Ok(Level::DEBUG),
         "INFO" => Ok(Level::INFO),
         "WARN" | "WARNING" => Ok(Level::WARN),
+        "CRITICAL" => Ok(Level::ERROR),
         "ERROR" => Ok(Level::ERROR),
         other => Err(format!("unsupported Rust tracing level: {other}")),
     }
@@ -46,19 +104,32 @@ fn build_tracing_writer(log_output: &str) -> Result<(BoxMakeWriter, WorkerGuard)
         }
         path => {
             let path = Path::new(path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create Rust tracing log dir: {e}"))?;
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("failed to open Rust tracing log file: {e}"))?;
-            let (writer, guard) = tracing_appender::non_blocking(file);
+            let shared = Arc::new(Mutex::new(open_tracing_log_file(path)?));
+            let state = TracingFileState {
+                path: path.to_path_buf(),
+                file: shared.clone(),
+            };
+            RUST_TRACING_FILE_STATE
+                .set(state)
+                .map_err(|_| "Rust tracing file state already initialized".to_string())?;
+            let (writer, guard) = tracing_appender::non_blocking(SharedFileWriter { file: shared });
             Ok((BoxMakeWriter::new(writer), guard))
         }
     }
+}
+
+/// Reopen the Rust tracing file writer after Python log rotation.
+fn reopen_tracing_file_impl() -> Result<(), String> {
+    let Some(state) = RUST_TRACING_FILE_STATE.get() else {
+        return Ok(());
+    };
+    replace_tracing_log_file(&state.file, &state.path)
+}
+
+/// Reopen the Rust tracing log file after Python rotates the active log file.
+#[pyfunction]
+fn reopen_tracing_file() -> PyResult<()> {
+    reopen_tracing_file_impl().map_err(PyRuntimeError::new_err)
 }
 
 /// Initialize Rust tracing once for the embedded ragfs binding process.
@@ -2666,6 +2737,7 @@ impl RAGFSBindingClient {
 #[pymodule]
 fn ragfs_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RAGFSBindingClient>()?;
+    m.add_function(wrap_pyfunction!(reopen_tracing_file, m)?)?;
 
     // Import the Python business exception so native code raises the same type
     // that `openviking.storage.errors` defines, enabling `except LockAcquisitionError`.
@@ -2752,6 +2824,42 @@ mod tests {
         });
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parse_tracing_level_accepts_critical_as_error() {
+        assert_eq!(parse_tracing_level("CRITICAL").unwrap(), Level::ERROR);
+    }
+
+    #[test]
+    fn replace_tracing_log_file_switches_shared_writer_to_new_active_file() {
+        let active = std::env::temp_dir().join(format!(
+            "openviking-rust-tracing-active-{}.log",
+            std::process::id()
+        ));
+        let rotated = std::env::temp_dir().join(format!(
+            "openviking-rust-tracing-rotated-{}.log",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&active);
+        let _ = fs::remove_file(&rotated);
+
+        let shared = Arc::new(Mutex::new(open_tracing_log_file(&active).unwrap()));
+        let mut writer = SharedFileWriter { file: shared.clone() };
+        writer.write_all(b"before-rotate\n").unwrap();
+        writer.flush().unwrap();
+
+        fs::rename(&active, &rotated).unwrap();
+        replace_tracing_log_file(&shared, &active).unwrap();
+
+        writer.write_all(b"after-rotate\n").unwrap();
+        writer.flush().unwrap();
+
+        assert!(fs::read_to_string(&rotated).unwrap().contains("before-rotate"));
+        assert!(fs::read_to_string(&active).unwrap().contains("after-rotate"));
+
+        let _ = fs::remove_file(&active);
+        let _ = fs::remove_file(&rotated);
     }
 
     #[tokio::test]
