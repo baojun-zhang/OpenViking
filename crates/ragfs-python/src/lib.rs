@@ -9,39 +9,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyType};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tracing::Level;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_appender::non_blocking::WorkerGuard;
 
 /// Cached reference to the Python `openviking.storage.errors.LockAcquisitionError` class,
 /// imported at module init so that native and Python code share the same exception type.
 static LOCK_ACQUISITION_ERROR_TYPE: OnceLock<Py<PyType>> = OnceLock::new();
 static RUST_TRACING_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-
-#[derive(Clone)]
-struct SharedFileWriter {
-    file: Arc<Mutex<std::fs::File>>,
-}
-
-impl Write for SharedFileWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
-        file.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
-        file.flush()
-    }
-}
+static RUST_TRACING_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 /// Parse the configured OpenViking log level into a Rust tracing level.
 fn parse_tracing_level(log_level: &str) -> Result<Level, String> {
@@ -56,10 +34,16 @@ fn parse_tracing_level(log_level: &str) -> Result<Level, String> {
 }
 
 /// Build the tracing writer from the configured OpenViking log output target.
-fn build_tracing_writer(log_output: &str) -> Result<BoxMakeWriter, String> {
+fn build_tracing_writer(log_output: &str) -> Result<(BoxMakeWriter, WorkerGuard), String> {
     match log_output {
-        "stdout" => Ok(BoxMakeWriter::new(std::io::stdout)),
-        "stderr" => Ok(BoxMakeWriter::new(std::io::stderr)),
+        "stdout" => {
+            let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+            Ok((BoxMakeWriter::new(writer), guard))
+        }
+        "stderr" => {
+            let (writer, guard) = tracing_appender::non_blocking(std::io::stderr());
+            Ok((BoxMakeWriter::new(writer), guard))
+        }
         path => {
             let path = Path::new(path);
             if let Some(parent) = path.parent() {
@@ -71,12 +55,8 @@ fn build_tracing_writer(log_output: &str) -> Result<BoxMakeWriter, String> {
                 .append(true)
                 .open(path)
                 .map_err(|e| format!("failed to open Rust tracing log file: {e}"))?;
-            let shared = Arc::new(Mutex::new(file));
-            Ok(BoxMakeWriter::new(move || {
-                SharedFileWriter {
-                    file: shared.clone(),
-                }
-            }))
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            Ok((BoxMakeWriter::new(writer), guard))
         }
     }
 }
@@ -85,7 +65,7 @@ fn build_tracing_writer(log_output: &str) -> Result<BoxMakeWriter, String> {
 fn init_tracing(log_level: &str, log_output: &str) -> PyResult<()> {
     let result = RUST_TRACING_INIT_RESULT.get_or_init(|| {
         let max_level = parse_tracing_level(log_level)?;
-        let writer = build_tracing_writer(log_output)?;
+        let (writer, guard) = build_tracing_writer(log_output)?;
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(max_level)
             .with_target(true)
@@ -96,6 +76,9 @@ fn init_tracing(log_level: &str, log_output: &str) -> PyResult<()> {
             .finish();
         tracing::subscriber::set_global_default(subscriber)
             .map_err(|e| format!("failed to install Rust tracing subscriber: {e}"))?;
+        RUST_TRACING_GUARD
+            .set(guard)
+            .map_err(|_| "failed to retain Rust tracing worker guard".to_string())?;
         Ok(())
     });
     result
