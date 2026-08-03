@@ -8,11 +8,101 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyType};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+use tracing::Level;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 /// Cached reference to the Python `openviking.storage.errors.LockAcquisitionError` class,
 /// imported at module init so that native and Python code share the same exception type.
 static LOCK_ACQUISITION_ERROR_TYPE: OnceLock<Py<PyType>> = OnceLock::new();
+static RUST_TRACING_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[derive(Clone)]
+struct SharedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl Write for SharedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("shared tracing log file lock poisoned"))?;
+        file.flush()
+    }
+}
+
+/// Parse the configured OpenViking log level into a Rust tracing level.
+fn parse_tracing_level(log_level: &str) -> Result<Level, String> {
+    match log_level.to_ascii_uppercase().as_str() {
+        "TRACE" => Ok(Level::TRACE),
+        "DEBUG" => Ok(Level::DEBUG),
+        "INFO" => Ok(Level::INFO),
+        "WARN" | "WARNING" => Ok(Level::WARN),
+        "ERROR" => Ok(Level::ERROR),
+        other => Err(format!("unsupported Rust tracing level: {other}")),
+    }
+}
+
+/// Build the tracing writer from the configured OpenViking log output target.
+fn build_tracing_writer(log_output: &str) -> Result<BoxMakeWriter, String> {
+    match log_output {
+        "stdout" => Ok(BoxMakeWriter::new(std::io::stdout)),
+        "stderr" => Ok(BoxMakeWriter::new(std::io::stderr)),
+        path => {
+            let path = Path::new(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create Rust tracing log dir: {e}"))?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("failed to open Rust tracing log file: {e}"))?;
+            let shared = Arc::new(Mutex::new(file));
+            Ok(BoxMakeWriter::new(move || {
+                SharedFileWriter {
+                    file: shared.clone(),
+                }
+            }))
+        }
+    }
+}
+
+/// Initialize Rust tracing once for the embedded ragfs binding process.
+fn init_tracing(log_level: &str, log_output: &str) -> PyResult<()> {
+    let result = RUST_TRACING_INIT_RESULT.get_or_init(|| {
+        let max_level = parse_tracing_level(log_level)?;
+        let writer = build_tracing_writer(log_output)?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_target(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|e| format!("failed to install Rust tracing subscriber: {e}"))?;
+        Ok(())
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|err| PyRuntimeError::new_err(err.clone()))
+}
 
 /// Map a PathLockError to the appropriate Python exception.
 fn pathlock_err_to_py(err: PathLockError) -> PyErr {
@@ -37,7 +127,6 @@ fn pathlock_err_to_py(err: PathLockError) -> PyErr {
 }
 use std::fs;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Validate and convert a wait timeout from Python.
@@ -1123,6 +1212,20 @@ impl RAGFSBindingClient {
         let mut runtime_cache_config = None;
         let mut inline_git_cfg: Option<ragfs::git::GitConfig> = None;
         if let Some(cfg) = config {
+            if let Some(log_obj) = cfg.get("log") {
+                let log_cfg: HashMap<String, Py<PyAny>> = log_obj.extract(py)?;
+                let log_level = log_cfg
+                    .get("level")
+                    .map(|value| value.extract::<String>(py))
+                    .transpose()?
+                    .unwrap_or_else(|| "INFO".to_string());
+                let log_output = log_cfg
+                    .get("output")
+                    .map(|value| value.extract::<String>(py))
+                    .transpose()?
+                    .unwrap_or_else(|| "stderr".to_string());
+                init_tracing(&log_level, &log_output)?;
+            }
             if let Some(enc_obj) = cfg.get("encryption") {
                 let enc: HashMap<String, Py<PyAny>> = enc_obj.extract(py)?;
                 let rk: Vec<u8> = enc
