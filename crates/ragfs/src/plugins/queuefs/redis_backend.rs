@@ -537,8 +537,8 @@ impl RedisQueueBackend {
             heartbeat_stop: None,
             heartbeat_thread: None,
         };
-        backend.recover_stale()?;
         backend.start_heartbeat(heartbeat_key);
+        backend.recover_stale()?;
         Ok(backend)
     }
 
@@ -558,12 +558,12 @@ impl RedisQueueBackend {
         self.heartbeat_stop = Some(sender);
         self.heartbeat_thread = Some(std::thread::spawn(move || {
             loop {
+                if let Err(error) = refresh_heartbeat(&pool, &key) {
+                    tracing::warn!("queuefs redis heartbeat failed: {error}");
+                }
                 match receiver.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
-                }
-                if let Err(error) = refresh_heartbeat(&pool, &key) {
-                    tracing::warn!("queuefs redis heartbeat failed: {error}");
                 }
             }
         }));
