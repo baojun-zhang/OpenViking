@@ -1088,7 +1088,7 @@ QueueFS Redis 参数：
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `mode` | str | Redis 拓扑模式：`"singleton"`、`"cluster"` 或 `"sentinel"` | `"singleton"` |
-| `endpoints` | array[str] | Singleton 的唯一数据节点、Cluster 初始节点或 Sentinel 节点 | `["redis://127.0.0.1:6379"]` |
+| `endpoints` | array[str] | Singleton 的唯一数据节点、Cluster 初始节点或 Sentinel 节点；仅允许协议、主机和端口，认证与 DB 使用独立字段 | `["redis://127.0.0.1:6379"]` |
 | `master_name` | str（可选） | Sentinel master 名称；Sentinel 模式必须配置 | `null` |
 | `username` | str（可选） | Redis ACL 用户名 | `null` |
 | `password` | str（可选） | Redis ACL 密码 | `null` |

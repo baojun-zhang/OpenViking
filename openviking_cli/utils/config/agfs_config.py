@@ -151,6 +151,17 @@ class QueueFSRedisConfig(BaseModel):
                 raise ValueError("queuefs redis endpoint port is invalid") from error
             if port == 0:
                 raise ValueError("queuefs redis endpoint port is invalid")
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "queuefs redis endpoints must not include credentials, database paths, "
+                    "query parameters, or fragments; use dedicated redis fields"
+                )
         if self.mode == "singleton" and len(self.endpoints) != 1:
             raise ValueError("queuefs redis singleton mode requires exactly one endpoint")
         if self.mode == "cluster" and self.db != 0:

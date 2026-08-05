@@ -19,6 +19,7 @@ const HEARTBEAT_TTL_SECS: u64 = 30;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const REDIS_POOL_MAX_SIZE: u32 = 2;
 const REDIS_POOL_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(5);
+const SENTINEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CREATE_QUEUE_SCRIPT: &str = r#"
 if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
@@ -279,20 +280,26 @@ impl ManageConnection for SingletonPoolManager {
 
 struct SentinelPoolManager {
     client: Mutex<SentinelClient>,
+    discovery_runtime: tokio::runtime::Runtime,
     connect_timeout: Duration,
     command_timeout: Duration,
     generation: ConnectionGeneration,
 }
 
 impl SentinelPoolManager {
-    /// Build a Sentinel manager that rediscovers the master for every new connection.
-    fn new(client: SentinelClient, options: &RedisQueueOptions) -> Self {
-        Self {
+    /// Build a Sentinel manager from `client` and `options`, returning an initialization error.
+    fn new(client: SentinelClient, options: &RedisQueueOptions) -> RedisResult<Self> {
+        let discovery_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(RedisError::from)?;
+        Ok(Self {
             client: Mutex::new(client),
+            discovery_runtime,
             connect_timeout: Duration::from_millis(options.connect_timeout_ms),
             command_timeout: Duration::from_millis(options.command_timeout_ms),
             generation: ConnectionGeneration::default(),
-        }
+        })
     }
 }
 
@@ -302,16 +309,28 @@ impl ManageConnection for SentinelPoolManager {
 
     /// Discover the current Sentinel master and open one data connection.
     fn connect(&self) -> RedisResult<Self::Connection> {
-        let client = self
-            .client
-            .lock()
-            .map_err(|_| {
+        let client = {
+            let mut sentinel = self.client.lock().map_err(|_| {
                 RedisError::from((
                     redis::ErrorKind::Client,
                     "redis sentinel client lock poisoned",
                 ))
-            })?
-            .get_client()?;
+            })?;
+            self.discovery_runtime.block_on(async {
+                match tokio::time::timeout(
+                    SENTINEL_DISCOVERY_TIMEOUT,
+                    sentinel.async_get_client(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(RedisError::from(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "redis sentinel discovery timed out",
+                    ))),
+                }
+            })
+        }?;
         let connection = client.get_connection_with_timeout(self.connect_timeout)?;
         configure_connection(&connection, self.command_timeout)?;
         Ok(SentinelConnection::new(
@@ -365,6 +384,7 @@ impl RedisPool {
                     .collect::<RedisResult<Vec<_>>>()
                     .map_err(config_error)?;
                 let mut builder = ClusterClient::builder(nodes)
+                    .retries(0)
                     .connection_timeout(Duration::from_millis(options.connect_timeout_ms))
                     .response_timeout(Duration::from_millis(options.command_timeout_ms));
                 if let Some(username) = &options.username {
@@ -416,7 +436,8 @@ impl RedisPool {
                         .set_client_to_sentinel_tls_mode(mode);
                 }
                 let client = builder.build().map_err(config_error)?;
-                build_pool(SentinelPoolManager::new(client, options)).map(Self::Sentinel)
+                let manager = SentinelPoolManager::new(client, options).map_err(config_error)?;
+                build_pool(manager).map(Self::Sentinel)
             }
         }
     }

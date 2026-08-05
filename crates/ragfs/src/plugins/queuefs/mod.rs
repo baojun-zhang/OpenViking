@@ -183,6 +183,20 @@ impl RedisQueueOptions {
             let info = redis::IntoConnectionInfo::into_connection_info(value.as_str()).map_err(|_| {
                 Error::config("queuefs redis endpoints must use valid redis:// or rediss:// URLs".to_string())
             })?;
+            let endpoint = value
+                .split_once("://")
+                .map(|(_, endpoint)| endpoint)
+                .unwrap_or_default();
+            let options_start = endpoint
+                .find(|character| matches!(character, '/' | '?' | '#'))
+                .unwrap_or(endpoint.len());
+            if endpoint[..options_start].contains('@')
+                || !matches!(&endpoint[options_start..], "" | "/")
+            {
+                return Err(Error::config(
+                    "queuefs redis endpoints must not include credentials, database paths, query parameters, or fragments; use dedicated redis fields".to_string(),
+                ));
+            }
             if matches!(
                 info.addr(),
                 redis::ConnectionAddr::Tcp(_, 0) | redis::ConnectionAddr::TcpTls { port: 0, .. }
@@ -740,20 +754,19 @@ impl QueueFSPlugin {
         };
         let redis_options = match kind {
             BackendKind::Redis => {
-                let value = config.params.get("redis").ok_or_else(|| {
-                    Error::config("queuefs redis config is required when backend=redis".to_string())
-                })?;
-                let value = match value {
-                    crate::core::types::ConfigValue::Json(value) => value.clone(),
-                    _ => {
+                let options = match config.params.get("redis") {
+                    Some(crate::core::types::ConfigValue::Json(value)) => {
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            Error::config(format!("invalid queuefs redis config: {error}"))
+                        })?
+                    }
+                    Some(_) => {
                         return Err(Error::config(
                             "queuefs redis config must be a JSON object".to_string(),
                         ))
                     }
+                    None => RedisQueueOptions::default(),
                 };
-                let options: RedisQueueOptions = serde_json::from_value(value).map_err(|error| {
-                    Error::config(format!("invalid queuefs redis config: {error}"))
-                })?;
                 options.validate()?;
                 Some(options)
             }
