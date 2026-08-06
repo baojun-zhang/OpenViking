@@ -521,6 +521,8 @@ pub(super) struct RedisQueueBackend {
     instance_id: String,
     heartbeat_stop: Option<Sender<()>>,
     heartbeat_thread: Option<JoinHandle<()>>,
+    startup_recovery_stop: Option<Sender<()>>,
+    startup_recovery_thread: Option<JoinHandle<()>>,
 }
 
 impl RedisQueueBackend {
@@ -537,8 +539,11 @@ impl RedisQueueBackend {
             instance_id,
             heartbeat_stop: None,
             heartbeat_thread: None,
+            startup_recovery_stop: None,
+            startup_recovery_thread: None,
         };
         backend.start_heartbeat(heartbeat_key);
+        backend.start_startup_recovery();
         Ok(backend)
     }
 
@@ -552,24 +557,14 @@ impl RedisQueueBackend {
     }
 
     /// Start the heartbeat thread using a separate pool checkout for every renewal.
+    /// `key` is this instance's heartbeat key in Redis.
+    /// Returns no value; the spawned thread is stored on `self`.
     fn start_heartbeat(&mut self, key: String) {
         let (sender, receiver) = mpsc::channel();
         let pool = self.pool.clone();
-        let key_prefix = self.key_prefix.clone();
         self.heartbeat_stop = Some(sender);
         self.heartbeat_thread = Some(std::thread::spawn(move || {
-            // ponytail: run only three startup sweeps; upgrade
-            // to continuous recovery if shared multi-replica consumers need steady-state handoff.
-            let mut startup_recovery_sweeps_left = STARTUP_RECOVERY_SWEEPS;
-            let mut next_startup_recovery_at =
-                Instant::now() + Duration::from_secs(HEARTBEAT_TTL_SECS);
             loop {
-                Self::run_startup_recovery_sweep(
-                    &pool,
-                    &key_prefix,
-                    &mut startup_recovery_sweeps_left,
-                    &mut next_startup_recovery_at,
-                );
                 if let Err(error) = refresh_heartbeat(&pool, &key) {
                     tracing::warn!("queuefs redis heartbeat failed: {error}");
                 }
@@ -581,19 +576,46 @@ impl RedisQueueBackend {
         }));
     }
 
-    /// Run at most one scheduled startup recovery sweep and update the next deadline.
-    fn run_startup_recovery_sweep(
-        pool: &RedisPool,
-        key_prefix: &str,
-        startup_recovery_sweeps_left: &mut usize,
-        next_startup_recovery_at: &mut Instant,
-    ) {
-        if *startup_recovery_sweeps_left == 0
-            || (*startup_recovery_sweeps_left != STARTUP_RECOVERY_SWEEPS
-                && Instant::now() < *next_startup_recovery_at)
-        {
-            return;
-        }
+    /// Start a bounded startup recovery thread.
+    /// The thread runs at offsets 0, 30, and 60 seconds from startup unless stopped early.
+    /// Returns no value; the spawned thread is stored on `self`.
+    fn start_startup_recovery(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        let pool = self.pool.clone();
+        let key_prefix = self.key_prefix.clone();
+        self.startup_recovery_stop = Some(sender);
+        self.startup_recovery_thread = Some(std::thread::spawn(move || {
+            // ponytail: keep startup recovery bounded to the restart TTL window;
+            // upgrade to steady-state scanning only if deployments need long-lived handoff.
+            let started_at = Instant::now();
+            for sweep_index in 0..STARTUP_RECOVERY_SWEEPS {
+                let deadline = started_at + Self::startup_recovery_delay_before_sweep(sweep_index);
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                Self::run_startup_recovery_sweep(&pool, &key_prefix);
+            }
+        }));
+    }
+
+    /// Return the delay before one bounded startup recovery sweep.
+    /// `sweep_index` is zero-based and maps to the documented 0/30/60-second schedule.
+    /// Returns the sweep offset from startup.
+    fn startup_recovery_delay_before_sweep(sweep_index: usize) -> Duration {
+        Duration::from_secs(HEARTBEAT_TTL_SECS * sweep_index as u64)
+    }
+
+    /// Run one startup recovery sweep.
+    /// `pool` provides Redis connections and `key_prefix` selects the queue namespace.
+    /// Returns no value; recovery results are emitted through logs.
+    fn run_startup_recovery_sweep(pool: &RedisPool, key_prefix: &str) {
         match Self::recover_stale(pool, key_prefix) {
             Ok(recovered) => {
                 if recovered > 0 {
@@ -601,10 +623,6 @@ impl RedisQueueBackend {
                 }
             }
             Err(error) => tracing::warn!("queuefs redis startup recover_stale failed: {error}"),
-        }
-        *startup_recovery_sweeps_left -= 1;
-        if *startup_recovery_sweeps_left > 0 {
-            *next_startup_recovery_at += Duration::from_secs(HEARTBEAT_TTL_SECS);
         }
     }
 
@@ -668,7 +686,13 @@ impl Drop for RedisQueueBackend {
         if let Some(sender) = self.heartbeat_stop.take() {
             let _ = sender.send(());
         }
+        if let Some(sender) = self.startup_recovery_stop.take() {
+            let _ = sender.send(());
+        }
         if let Some(thread) = self.heartbeat_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.startup_recovery_thread.take() {
             let _ = thread.join();
         }
         let _ = self.pool.try_execute(|connection| {
