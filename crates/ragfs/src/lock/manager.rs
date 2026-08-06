@@ -39,7 +39,7 @@ impl Default for PathLockConfig {
         Self {
             provider: "filesystem".to_string(),
             lock_timeout_secs: 0.0,
-            lock_expire_secs: 1800.0,
+            lock_expire_secs: 30.0,
         }
     }
 }

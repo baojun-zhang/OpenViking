@@ -1641,10 +1641,10 @@ class Session:
             return False
 
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_tree(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
+        async with self._viking_fs._async_agfs.hold_pathlock_tree(
+            session_path,
+            timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
+        ) as lease:
             marker = await self._read_phase1_meta(archive_uri)
             if marker.get("status") == "ready":
                 return True
@@ -1715,8 +1715,6 @@ class Session:
             await self._write_phase1_ready_marker(archive_uri, lease_ref=lease)
             logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
             return True
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     def commit(
         self,
@@ -1844,10 +1842,10 @@ class Session:
         # can hold stale Session objects, so in-memory emptiness is never a
         # correctness boundary.
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_tree(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
+        async with self._viking_fs._async_agfs.hold_pathlock_tree(
+            session_path,
+            timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
+        ) as lease:
             self._messages = await self._read_live_messages_strict()
             try:
                 meta_content = await self._viking_fs.read_file(
@@ -2103,8 +2101,6 @@ class Session:
                 self._messages = original_messages
                 self._compression.compression_index -= 1
                 raise
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
         # Lock released; Phase 1 intent, queue item, retained root, metadata and
         # ready metadata are all durable.
 

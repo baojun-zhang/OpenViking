@@ -1,10 +1,14 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import asyncio
+from unittest.mock import AsyncMock
+
 import pytest
 
 import openviking.pyagfs.async_client as async_client
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.pyagfs.async_client import PathLockKeepaliveError
 
 
 class _SyncAGFS:
@@ -67,3 +71,47 @@ async def test_async_agfs_client_hides_threadpool(monkeypatch):
             {"recursive": True, "ctx": {"account_id": "_system"}},
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_hold_pathlock_tree_refreshes_and_releases():
+    """Keepalive helper should refresh in the background and always release."""
+    agfs = AsyncAGFSClient(_SyncAGFS())
+    lease = {"lease_ref": "lease-1", "owner_id": "owner-1", "owned": True}
+    refreshed = asyncio.Event()
+    agfs.pathlock_acquire_tree = AsyncMock(return_value=lease)
+    agfs.pathlock_release = AsyncMock()
+
+    async def _refresh(_lease):
+        refreshed.set()
+        return "refreshed"
+
+    agfs.pathlock_refresh = AsyncMock(side_effect=_refresh)
+
+    async with agfs.hold_pathlock_tree(
+        "/local/default/data/session", refresh_interval_secs=0.01
+    ) as held:
+        assert held == lease
+        await asyncio.wait_for(refreshed.wait(), timeout=0.2)
+
+    agfs.pathlock_acquire_tree.assert_awaited_once()
+    agfs.pathlock_release.assert_awaited_once_with(lease)
+
+
+@pytest.mark.asyncio
+async def test_hold_pathlock_tree_raises_when_refresh_fails():
+    """Keepalive helper should abort the guarded block after refresh failure."""
+    agfs = AsyncAGFSClient(_SyncAGFS())
+    lease = {"lease_ref": "lease-1", "owner_id": "owner-1", "owned": True}
+    agfs.pathlock_acquire_tree = AsyncMock(return_value=lease)
+    agfs.pathlock_release = AsyncMock()
+    agfs.pathlock_refresh = AsyncMock(return_value="failed")
+
+    with pytest.raises(PathLockKeepaliveError, match="failed"):
+        async with agfs.hold_pathlock_tree(
+            "/local/default/data/session",
+            refresh_interval_secs=0.01,
+        ):
+            await asyncio.sleep(0.05)
+
+    agfs.pathlock_release.assert_awaited_once_with(lease)
