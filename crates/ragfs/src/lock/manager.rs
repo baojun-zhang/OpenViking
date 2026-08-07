@@ -311,8 +311,17 @@ impl PathLockManager {
                     let mut all_ok = true;
                     for lp in &lock_paths {
                         match refresh_provider.refresh_token(lp, &owner_id, now_ns).await {
-                            Ok(true) => {}
-                            _ => all_ok = false,
+                            Ok(true) => {
+                                info!(lease_ref = %lease_ref, owner_id = %owner_id, lock_path = %lp, "pathlock lease automatically refreshed");
+                            }
+                            Ok(false) => {
+                                all_ok = false;
+                                info!(lease_ref = %lease_ref, owner_id = %owner_id, lock_path = %lp, "pathlock lease automatic refresh failed");
+                            }
+                            Err(error) => {
+                                all_ok = false;
+                                info!(lease_ref = %lease_ref, owner_id = %owner_id, lock_path = %lp, error = %error, "pathlock lease automatic refresh failed");
+                            }
                         }
                     }
                     drop(refresh_guard);
@@ -1108,7 +1117,7 @@ impl PathLockManager {
         }
 
         let result = if all_ok && any_ok { "refreshed" } else if any_ok { "lost" } else { "failed" };
-        debug!(lease_ref = %lease.lease.lease_ref, owner_id = %lease.lease.owner_id, lock_paths = ?lease.lease.lock_paths, result = %result, "pathlock refresh completed");
+        info!(lease_ref = %lease.lease.lease_ref, owner_id = %lease.lease.owner_id, lock_paths = ?lease.lease.lock_paths, result = %result, "pathlock refresh completed");
         Ok(result.to_string())
     }
 

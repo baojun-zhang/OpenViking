@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -48,45 +47,6 @@ class TestCommit:
         assert result.get("task_id") is not None
         assert "memory_diff_uri" not in result
         assert "memories_extracted" not in result
-
-    async def test_commit_phase1_uses_keepalive_helper(self, session_with_messages: Session):
-        """Commit Phase 1 should use the keepalive helper instead of raw lock calls."""
-        agfs = session_with_messages._viking_fs._async_agfs
-        calls = []
-        original_hold_pathlock_tree = agfs.hold_pathlock_tree
-
-        @asynccontextmanager
-        async def _hold_pathlock_tree(
-            path,
-            timeout_secs=0.0,
-            refresh_interval_secs=10.0,
-            owner_lease_ref=None,
-            **kwargs,
-        ):
-            calls.append(
-                {
-                    "path": path,
-                    "timeout_secs": timeout_secs,
-                    "refresh_interval_secs": refresh_interval_secs,
-                    "kwargs": kwargs,
-                }
-            )
-            async with original_hold_pathlock_tree(
-                path,
-                timeout_secs=timeout_secs,
-                refresh_interval_secs=refresh_interval_secs,
-                owner_lease_ref=owner_lease_ref,
-                **kwargs,
-            ) as lease:
-                yield lease
-
-        agfs.hold_pathlock_tree = _hold_pathlock_tree
-
-        result = await session_with_messages.commit_async()
-
-        assert result["status"] == "accepted"
-        assert calls
-        assert calls[0]["timeout_secs"] == 30.0
 
     async def test_commit_extracts_memories(
         self, session_with_messages: Session, client: AsyncOpenViking

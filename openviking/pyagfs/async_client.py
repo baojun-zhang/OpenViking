@@ -5,17 +5,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
-from typing import Any, Awaitable, BinaryIO, Callable, Dict, List, TypeVar, Union
+from typing import Any, BinaryIO, Dict, List, Union
 
 from .protocols import AGFSSyncClientProtocol
 
 _SYSTEM_ACCOUNT_ID = "_system"
-_DEFAULT_PATHLOCK_KEEPALIVE_INTERVAL_SECS = 10.0
-logger = logging.getLogger(__name__)
-_T = TypeVar("_T")
 
 
 def fs_ctx_from_agfs_path(path: str) -> Dict[str, str]:
@@ -57,10 +52,6 @@ def ensure_same_encryption_account(src_path: str, dst_path: str) -> None:
         raise ValueError(
             f"cross-account AGFS move/copy is not supported: {src_account!r} -> {dst_account!r}"
         )
-
-
-class PathLockKeepaliveError(RuntimeError):
-    """Raised when a keepalive-guarded pathlock can no longer be refreshed."""
 
 
 class AsyncAGFSClient:
@@ -315,161 +306,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
         )
-
-    @asynccontextmanager
-    async def _hold_pathlock(
-        self,
-        *,
-        kind: str,
-        path: str,
-        timeout_secs: float = 0.0,
-        refresh_interval_secs: float = _DEFAULT_PATHLOCK_KEEPALIVE_INTERVAL_SECS,
-        owner_lease_ref: Dict[str, Any] | None = None,
-        fs_ctx: Dict[str, str] | None = None,
-    ):
-        """Acquire a pathlock, keep it refreshed in the background, and release it on exit."""
-        if refresh_interval_secs <= 0:
-            raise ValueError("refresh_interval_secs must be greater than 0")
-
-        if kind == "tree":
-            lease = await self.pathlock_acquire_tree(
-                path,
-                timeout_secs=timeout_secs,
-                owner_lease_ref=owner_lease_ref,
-                fs_ctx=fs_ctx,
-            )
-        elif kind == "exact":
-            lease = await self.pathlock_acquire_exact(
-                path,
-                timeout_secs=timeout_secs,
-                owner_lease_ref=owner_lease_ref,
-                fs_ctx=fs_ctx,
-            )
-        else:
-            raise ValueError(f"unsupported pathlock kind: {kind}")
-
-        logger.debug(
-            "PathLock keepalive enabled for %s lock: path=%s interval=%.1fs",
-            kind,
-            path,
-            refresh_interval_secs,
-        )
-
-        stop_event = asyncio.Event()
-        refresh_failure: str | None = None
-        active_error: BaseException | None = None
-
-        async def _keepalive_loop() -> None:
-            """Refresh the owned lease until the caller exits or refresh stops succeeding."""
-            nonlocal refresh_failure
-            while not stop_event.is_set():
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=refresh_interval_secs)
-                    break
-                except asyncio.TimeoutError:
-                    try:
-                        result = await self.pathlock_refresh(lease)
-                    except Exception:
-                        logger.exception(
-                            "PathLock keepalive refresh raised: path=%s kind=%s", path, kind
-                        )
-                        refresh_failure = "failed"
-                        return
-                    if result != "refreshed":
-                        logger.warning(
-                            "PathLock keepalive lost health: path=%s kind=%s result=%s",
-                            path,
-                            kind,
-                            result,
-                        )
-                        refresh_failure = result
-                        return
-            logger.debug("PathLock keepalive stopped for %s lock: path=%s", kind, path)
-
-        keepalive_task = asyncio.create_task(_keepalive_loop())
-        try:
-            yield lease
-        except BaseException as exc:
-            active_error = exc
-            raise
-        finally:
-            stop_event.set()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await self.pathlock_release(lease)
-            except Exception:
-                logger.exception("PathLock keepalive release failed: path=%s kind=%s", path, kind)
-                if active_error is None:
-                    raise
-            if active_error is None and refresh_failure is not None:
-                raise PathLockKeepaliveError(
-                    f"pathlock keepalive refresh {refresh_failure} for {kind} lock on {path}"
-                )
-
-    @asynccontextmanager
-    async def hold_pathlock_exact(
-        self,
-        path: str,
-        timeout_secs: float = 0.0,
-        refresh_interval_secs: float = _DEFAULT_PATHLOCK_KEEPALIVE_INTERVAL_SECS,
-        owner_lease_ref: Dict[str, Any] | None = None,
-        *,
-        fs_ctx: Dict[str, str] | None = None,
-    ):
-        """Acquire an exact pathlock with a Python-side keepalive guard."""
-        async with self._hold_pathlock(
-            kind="exact",
-            path=path,
-            timeout_secs=timeout_secs,
-            refresh_interval_secs=refresh_interval_secs,
-            owner_lease_ref=owner_lease_ref,
-            fs_ctx=fs_ctx,
-        ) as lease:
-            yield lease
-
-    @asynccontextmanager
-    async def hold_pathlock_tree(
-        self,
-        path: str,
-        timeout_secs: float = 0.0,
-        refresh_interval_secs: float = _DEFAULT_PATHLOCK_KEEPALIVE_INTERVAL_SECS,
-        owner_lease_ref: Dict[str, Any] | None = None,
-        *,
-        fs_ctx: Dict[str, str] | None = None,
-    ):
-        """Acquire a tree pathlock with a Python-side keepalive guard."""
-        async with self._hold_pathlock(
-            kind="tree",
-            path=path,
-            timeout_secs=timeout_secs,
-            refresh_interval_secs=refresh_interval_secs,
-            owner_lease_ref=owner_lease_ref,
-            fs_ctx=fs_ctx,
-        ) as lease:
-            yield lease
-
-    async def run_with_pathlock_tree(
-        self,
-        path: str,
-        operation: Callable[[Dict[str, Any]], Awaitable[_T]],
-        timeout_secs: float = 0.0,
-        refresh_interval_secs: float = _DEFAULT_PATHLOCK_KEEPALIVE_INTERVAL_SECS,
-        owner_lease_ref: Dict[str, Any] | None = None,
-        *,
-        fs_ctx: Dict[str, str] | None = None,
-    ) -> _T:
-        """Run an async operation while a tree pathlock is held and refreshed."""
-        async with self.hold_pathlock_tree(
-            path,
-            timeout_secs=timeout_secs,
-            refresh_interval_secs=refresh_interval_secs,
-            owner_lease_ref=owner_lease_ref,
-            fs_ctx=fs_ctx,
-        ) as lease:
-            return await operation(lease)
 
     async def pathlock_acquire_tree_batch(
         self,
