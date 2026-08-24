@@ -122,6 +122,15 @@ enum AcquisitionChange {
     },
 }
 
+#[derive(Debug)]
+enum DowngradeTokenResult {
+    Downgraded,
+    AlreadyExact,
+    Missing,
+    OwnerLost,
+    Changed,
+}
+
 #[derive(Debug, Default)]
 struct OwnerRegistry {
     entries: HashMap<String, LeaseEntry>,
@@ -1492,7 +1501,17 @@ impl PathLockManager {
             {
                 Self::downgrade_token_to_exact_with(provider, &lock_path, &owner.owner_id)
                     .await
-                    .map(|()| true)
+                    .and_then(|status| match status {
+                        DowngradeTokenResult::Downgraded | DowngradeTokenResult::AlreadyExact => {
+                            Ok(true)
+                        }
+                        DowngradeTokenResult::Missing | DowngradeTokenResult::OwnerLost => {
+                            Ok(false)
+                        }
+                        DowngradeTokenResult::Changed => {
+                            Err(Self::release_changed_error(&lock_path))
+                        }
+                    })
             } else {
                 Ok(true)
             };
@@ -1583,19 +1602,15 @@ impl PathLockManager {
         provider: &Arc<dyn PathLockProvider>,
         lock_path: &str,
         owner_id: &str,
-    ) -> PathLockResult<()> {
+    ) -> PathLockResult<DowngradeTokenResult> {
         let Some(current) = provider.read_token(lock_path).await? else {
-            return Ok(());
+            return Ok(DowngradeTokenResult::Missing);
         };
         if current.owner_id != owner_id {
-            return Err(PathLockError::Conflict {
-                lock_path: lock_path.to_string(),
-                owner: current.owner_id,
-                kind: current.lock_type,
-            });
+            return Ok(DowngradeTokenResult::OwnerLost);
         }
         if current.lock_type == PathLockKind::Exact {
-            return Ok(());
+            return Ok(DowngradeTokenResult::AlreadyExact);
         }
         let replacement = LockToken {
             owner_id: current.owner_id.clone(),
@@ -1606,23 +1621,19 @@ impl PathLockManager {
             .compare_and_write_token(lock_path, &current, &replacement)
             .await?
         {
-            return Ok(());
+            return Ok(DowngradeTokenResult::Downgraded);
         }
 
         let Some(current) = provider.read_token(lock_path).await? else {
-            return Ok(());
+            return Ok(DowngradeTokenResult::Missing);
         };
         if current.owner_id != owner_id {
-            return Err(PathLockError::Conflict {
-                lock_path: lock_path.to_string(),
-                owner: current.owner_id,
-                kind: current.lock_type,
-            });
+            return Ok(DowngradeTokenResult::OwnerLost);
         }
         if current.lock_type == PathLockKind::Exact {
-            return Ok(());
+            return Ok(DowngradeTokenResult::AlreadyExact);
         }
-        Err(Self::release_changed_error(lock_path))
+        Ok(DowngradeTokenResult::Changed)
     }
 
     /// Create a borrowed view of an owned lease.
