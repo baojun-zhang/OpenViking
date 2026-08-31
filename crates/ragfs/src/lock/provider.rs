@@ -164,12 +164,22 @@ impl PathLockProvider for MemoryPathLockProvider {
 /// Lock provider that stores tokens as files on the underlying filesystem.
 pub struct FilesystemPathLockProvider {
     fs: Arc<dyn FileSystem>,
+    empty_token_expire_secs: f64,
 }
 
 impl FilesystemPathLockProvider {
     /// Create a filesystem-backed provider.
     pub fn new(fs: Arc<dyn FileSystem>) -> Self {
-        Self { fs }
+        Self {
+            fs,
+            empty_token_expire_secs: 30.0,
+        }
+    }
+
+    /// Set the empty-token expiry and return the updated provider.
+    pub fn with_lock_expire_secs(mut self, lock_expire_secs: f64) -> Self {
+        self.empty_token_expire_secs = lock_expire_secs;
+        self
     }
 
     /// Read raw token bytes from `lock_path`, returning `None` if no token exists.
@@ -289,10 +299,41 @@ impl PathLockProvider for FilesystemPathLockProvider {
         loop {
             match current {
                 Some(data) => {
-                    let raw = String::from_utf8_lossy(&data).trim().to_string();
-                    if raw.is_empty() {
-                        return Ok(None);
+                    if data.is_empty() {
+                        let info = match self.fs.stat(lock_path).await {
+                            Ok(info) => info,
+                            Err(
+                                crate::core::Error::NotFound(_)
+                                | crate::core::Error::MountPointNotFound(_),
+                            ) => return Ok(None),
+                            Err(error) => {
+                                return Err(PathLockError::Io(format!(
+                                    "failed to stat empty lock token at '{lock_path}': {error}"
+                                )));
+                            }
+                        };
+                        let age = std::time::SystemTime::now()
+                            .duration_since(info.mod_time)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        if age <= self.empty_token_expire_secs {
+                            return Err(PathLockError::EmptyToken {
+                                lock_path: lock_path.to_string(),
+                            });
+                        }
+                        if self
+                            .fs
+                            .compare_and_remove(lock_path, b"")
+                            .await
+                            .map_err(|e| Self::map_cas_error("empty lock cleanup", lock_path, e))?
+                        {
+                            tracing::warn!(lock_path = %lock_path, age_secs = age, "removed expired empty pathlock token");
+                            return Ok(None);
+                        }
+                        current = self.read_token_raw(lock_path).await?;
+                        continue;
                     }
+                    let raw = String::from_utf8_lossy(&data).trim().to_string();
                     match LockTokenCodec::decode(&raw) {
                         Ok(token) => return Ok(Some(token)),
                         Err(error) if crypto::is_encrypted(&data) => {
@@ -318,27 +359,32 @@ impl PathLockProvider for FilesystemPathLockProvider {
         use crate::core::WriteFlag;
 
         let encoded = LockTokenCodec::encode(token);
-        match self
-            .fs
-            .write(lock_path, encoded.as_bytes(), 0, WriteFlag::CreateNew)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(_) => {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let error = match self
+                .fs
+                .write(lock_path, encoded.as_bytes(), 0, WriteFlag::CreateNew)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            match self.read_token(lock_path).await? {
                 // Already exists — read and check if stale.
-                let existing = self.read_token(lock_path).await?;
-                match existing {
-                    Some(t) => Err(PathLockError::Conflict {
+                Some(t) => {
+                    return Err(PathLockError::Conflict {
                         lock_path: lock_path.to_string(),
                         owner: t.owner_id,
                         kind: t.lock_type,
-                    }),
-                    None => Err(PathLockError::Io(format!(
-                        "failed to create lock token at {lock_path}"
-                    ))),
+                    });
                 }
+                None => last_error = Some(error),
             }
         }
+        Err(PathLockError::Io(format!(
+            "failed to create lock token at {lock_path}: {}",
+            last_error.unwrap()
+        )))
     }
 
     async fn compare_and_write_token(

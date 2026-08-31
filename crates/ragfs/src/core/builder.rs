@@ -199,9 +199,10 @@ async fn build_stack_with_mountable_and_runtime(
 
     let provider: Arc<dyn PathLockProvider> = match config.pathlock.provider.as_str() {
         "memory" => Arc::new(MemoryPathLockProvider::new()),
-        _ => Arc::new(FilesystemPathLockProvider::new(
-            mountable.clone() as Arc<dyn FileSystem>
-        )),
+        _ => Arc::new(
+            FilesystemPathLockProvider::new(mountable.clone() as Arc<dyn FileSystem>)
+                .with_lock_expire_secs(config.pathlock.lock_expire_secs),
+        ),
     };
     let pathlock_manager = Arc::new(PathLockManager::new(
         mountable.clone() as Arc<dyn FileSystem>,

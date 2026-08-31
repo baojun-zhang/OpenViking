@@ -681,7 +681,9 @@ impl PathLockManager {
     fn is_retryable_error(error: &PathLockError) -> bool {
         matches!(
             error,
-            PathLockError::Conflict { .. } | PathLockError::Busy { .. }
+            PathLockError::Conflict { .. }
+                | PathLockError::Busy { .. }
+                | PathLockError::EmptyToken { .. }
         )
     }
 
