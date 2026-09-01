@@ -2404,6 +2404,7 @@ mod tests {
         fs.mkdir("/data/delete-me", 0o755).await.unwrap();
         let provider = Arc::new(crate::lock::provider::FilesystemPathLockProvider::new(
             fs.clone(),
+            PathLockConfig::default().lock_expire_secs,
         ));
         let mgr = PathLockManager::new(fs.clone(), provider, PathLockConfig::default());
         let lease = mgr

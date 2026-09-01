@@ -9,9 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::crypto;
 use crate::core::internal_names::is_hidden_runtime_lock_name;
 use crate::core::FileSystem;
+use crate::crypto;
 
 use super::codec::LockTokenCodec;
 use super::types::{LockToken, PathLockError, PathLockResult};
@@ -168,18 +168,15 @@ pub struct FilesystemPathLockProvider {
 }
 
 impl FilesystemPathLockProvider {
-    /// Create a filesystem-backed provider.
-    pub fn new(fs: Arc<dyn FileSystem>) -> Self {
+    /// Create a filesystem-backed provider with an explicit empty-token expiry.
+    ///
+    /// `fs` stores lock files, and `lock_expire_secs` controls empty-token recovery.
+    /// Returns a configured filesystem provider.
+    pub fn new(fs: Arc<dyn FileSystem>, lock_expire_secs: f64) -> Self {
         Self {
             fs,
-            empty_token_expire_secs: 30.0,
+            empty_token_expire_secs: lock_expire_secs,
         }
-    }
-
-    /// Set the empty-token expiry and return the updated provider.
-    pub fn with_lock_expire_secs(mut self, lock_expire_secs: f64) -> Self {
-        self.empty_token_expire_secs = lock_expire_secs;
-        self
     }
 
     /// Read raw token bytes from `lock_path`, returning `None` if no token exists.
@@ -227,10 +224,15 @@ mod tests {
     async fn read_token_cleans_up_legacy_encrypted_lock() {
         let fs = Arc::new(MemFileSystem::new());
         fs.mkdir("/data", 0o755).await.unwrap();
-        fs.write("/data/.path.ovlock", b"OVE1legacy-ciphertext", 0, WriteFlag::Create)
-            .await
-            .unwrap();
-        let provider = FilesystemPathLockProvider::new(fs.clone());
+        fs.write(
+            "/data/.path.ovlock",
+            b"OVE1legacy-ciphertext",
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+        let provider = FilesystemPathLockProvider::new(fs.clone(), 30.0);
 
         let token = provider.read_token("/data/.path.ovlock").await.unwrap();
 
@@ -249,7 +251,7 @@ mod tests {
         fs.write("/data/.path.ovlock", b"not-a-token", 0, WriteFlag::Create)
             .await
             .unwrap();
-        let provider = FilesystemPathLockProvider::new(fs.clone());
+        let provider = FilesystemPathLockProvider::new(fs.clone(), 30.0);
 
         let err = provider.read_token("/data/.path.ovlock").await.unwrap_err();
 
@@ -268,9 +270,13 @@ mod tests {
         fs.write("/data/.path.ovlock", b"owner:123:E", 0, WriteFlag::Create)
             .await
             .unwrap();
-        let provider = FilesystemPathLockProvider::new(fs);
+        let provider = FilesystemPathLockProvider::new(fs, 30.0);
 
-        let token = provider.read_token("/data/.path.ovlock").await.unwrap().unwrap();
+        let token = provider
+            .read_token("/data/.path.ovlock")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(token.owner_id, "owner");
         assert_eq!(token.time_ns, 123);
@@ -331,7 +337,13 @@ impl PathLockProvider for FilesystemPathLockProvider {
                                 .fs
                                 .compare_and_remove(lock_path, &data)
                                 .await
-                                .map_err(|e| Self::map_cas_error("legacy encrypted lock cleanup", lock_path, e))?
+                                .map_err(|e| {
+                                    Self::map_cas_error(
+                                        "legacy encrypted lock cleanup",
+                                        lock_path,
+                                        e,
+                                    )
+                                })?
                             {
                                 return Ok(None);
                             }
@@ -453,11 +465,7 @@ impl FilesystemPathLockProvider {
         is_hidden_runtime_lock_name(name)
     }
 
-    async fn scan_recursive(
-        &self,
-        dir: &str,
-        result: &mut Vec<String>,
-    ) -> PathLockResult<()> {
+    async fn scan_recursive(&self, dir: &str, result: &mut Vec<String>) -> PathLockResult<()> {
         let entries = match self.fs.read_internal_dir(dir).await {
             Ok(entries) => entries,
             Err(crate::core::Error::NotFound(_) | crate::core::Error::NotADirectory(_)) => {
