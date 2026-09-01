@@ -321,17 +321,7 @@ impl PathLockProvider for FilesystemPathLockProvider {
                                 lock_path: lock_path.to_string(),
                             });
                         }
-                        if self
-                            .fs
-                            .compare_and_remove(lock_path, b"")
-                            .await
-                            .map_err(|e| Self::map_cas_error("empty lock cleanup", lock_path, e))?
-                        {
-                            tracing::warn!(lock_path = %lock_path, age_secs = age, "removed expired empty pathlock token");
-                            return Ok(None);
-                        }
-                        current = self.read_token_raw(lock_path).await?;
-                        continue;
+                        return Ok(None);
                     }
                     let raw = String::from_utf8_lossy(&data).trim().to_string();
                     match LockTokenCodec::decode(&raw) {
@@ -378,7 +368,17 @@ impl PathLockProvider for FilesystemPathLockProvider {
                         kind: t.lock_type,
                     });
                 }
-                None => last_error = Some(error),
+                None => {
+                    last_error = Some(error);
+                    if self
+                        .fs
+                        .compare_and_write(lock_path, b"", encoded.as_bytes())
+                        .await
+                        .map_err(|e| Self::map_cas_error("empty lock recovery", lock_path, e))?
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
         Err(PathLockError::Io(format!(
