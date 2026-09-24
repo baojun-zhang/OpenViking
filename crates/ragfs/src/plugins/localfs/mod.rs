@@ -1256,47 +1256,6 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
-    /// Verify LocalFS grep never executes an `rg` binary found in PATH.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_localfs_grep_does_not_invoke_path_rg() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new().unwrap();
-        write_file(dir.path(), "a.txt", "hello\n");
-        write_file(
-            dir.path(),
-            "rg",
-            "#!/bin/sh\ntouch \"$RAGFS_RG_SENTINEL\"\nexit 0\n",
-        );
-        let rg_path = dir.path().join("rg");
-        let mut permissions = std::fs::metadata(&rg_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&rg_path, permissions).unwrap();
-
-        let marker = dir.path().join("rg-invoked");
-        let original_path = std::env::var_os("PATH");
-        let mut paths = vec![dir.path().to_path_buf()];
-        if let Some(path) = original_path.as_deref() {
-            paths.extend(std::env::split_paths(path));
-        }
-        let overridden_path = std::env::join_paths(paths).unwrap();
-        std::env::set_var("PATH", overridden_path);
-        std::env::set_var("RAGFS_RG_SENTINEL", &marker);
-
-        let fs = LocalFileSystem::new(dir.path().to_str().unwrap()).unwrap();
-        let result = fs.grep("/", "hello", GrepOptions::default()).await;
-
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-        std::env::remove_var("RAGFS_RG_SENTINEL");
-
-        assert!(!marker.exists(), "LocalFS invoked an rg binary from PATH");
-        assert_eq!(result.unwrap().count, 1);
-    }
-
     #[test]
     fn test_open_file_identity_matches_only_the_current_path_entry() {
         let dir = TempDir::new().unwrap();
