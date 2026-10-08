@@ -69,9 +69,9 @@ pub(crate) enum MultiWriteWorker {
     Gc,
 }
 
-/// Raw-primary store for V2 multi-write metadata.
+/// Primary filesystem store for V2 multi-write metadata.
 pub struct MetadataStore {
-    raw_primary: Arc<dyn FileSystem>,
+    primary: Arc<dyn FileSystem>,
     pathlock_manager: Arc<PathLockManager>,
     paths: MultiWritePaths,
     worker_errors: [AtomicU64; 4],
@@ -80,12 +80,12 @@ pub struct MetadataStore {
 impl MetadataStore {
     /// Create a V2 metadata store for one logical mount prefix.
     pub fn new(
-        raw_primary: Arc<dyn FileSystem>,
+        primary: Arc<dyn FileSystem>,
         pathlock_manager: Arc<PathLockManager>,
         mount_prefix: &str,
     ) -> Result<Self> {
         Ok(Self {
-            raw_primary,
+            primary,
             pathlock_manager,
             paths: MultiWritePaths::new(mount_prefix)?,
             worker_errors: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -107,15 +107,15 @@ impl MetadataStore {
         &self.paths
     }
 
-    /// List account directories currently visible on the raw primary.
+    /// List account directories currently visible on the primary filesystem.
     pub(crate) async fn initialized_accounts(&self) -> Result<Vec<String>> {
         let mut accounts = Vec::new();
-        for entry in self.raw_primary.read_internal_dir("/").await? {
+        for entry in self.primary.read_internal_dir("/").await? {
             if !entry.is_dir || entry.name == "_system" {
                 continue;
             }
             let manifest = self.paths.account_manifest(&entry.name)?.1;
-            match self.raw_primary.stat(&manifest).await {
+            match self.primary.stat(&manifest).await {
                 Ok(_) => accounts.push(entry.name),
                 Err(Error::NotFound(_)) => {}
                 Err(error) => return Err(error),
@@ -125,12 +125,12 @@ impl MetadataStore {
         Ok(accounts)
     }
 
-    /// Return whether the raw primary account root still exists.
+    /// Return whether the primary account root still exists.
     pub(crate) async fn account_exists(&self, account_id: &str) -> Result<bool> {
         let root = self
             .paths
             .raw_backend_path(&format!("/local/{account_id}"))?;
-        match self.raw_primary.stat(&root).await {
+        match self.primary.stat(&root).await {
             Ok(_) => Ok(true),
             Err(Error::NotFound(_)) => Ok(false),
             Err(error) => Err(error),
@@ -142,10 +142,28 @@ impl MetadataStore {
         &self.pathlock_manager
     }
 
+    /// Build the filesystem context used for one logical metadata path.
+    fn metadata_context(&self, logical_path: &str) -> Result<FsContext> {
+        let parts: Vec<&str> = logical_path.trim_start_matches('/').split('/').collect();
+        if parts.len() >= 2 && parts[0] == "local" && !parts[1].is_empty() {
+            return Ok(Arc::new(
+                FsContextInner::new(parts[1].to_string())
+                    .with_bypass_cache(true)
+                    .with_auto_pathlock_disabled(),
+            ));
+        }
+        Err(Error::internal(format!(
+            "cannot resolve metadata FsContext from path: {logical_path}"
+        )))
+    }
+
     /// Read one complete binary value from a canonical logical path.
     pub(crate) async fn read_bytes(&self, logical_path: &str) -> Result<Vec<u8>> {
         let backend_path = self.paths.raw_backend_path(logical_path)?;
-        self.raw_primary.read(&backend_path, 0, 0).await
+        let context = self.metadata_context(logical_path)?;
+        FS_CTX
+            .scope(context, self.primary.read(&backend_path, 0, 0))
+            .await
     }
 
     /// Read and validate the current V2 protocol status.
@@ -155,16 +173,40 @@ impl MetadataStore {
         Ok(state.status)
     }
 
-    /// Replace protocol bytes only when their complete current value matches.
+    /// Replace protocol bytes under an Exact lock when the current value matches.
     pub(crate) async fn compare_protocol(
         &self,
         expected: &[u8],
         replacement: &[u8],
     ) -> Result<bool> {
-        let (_, backend_path) = self.paths.mount_protocol();
-        self.raw_primary
-            .compare_and_write(&backend_path, expected, replacement)
+        let logical_path = self.paths.mount_protocol().0;
+        let lease = self
+            .pathlock_manager
+            .acquire_exact(
+                &logical_path,
+                self.pathlock_manager
+                    .default_lock_timeout()
+                    .max(std::time::Duration::from_secs(5)),
+                None,
+            )
+            .await?;
+        let operation = async {
+            match self.read_bytes(&logical_path).await {
+                Ok(current) if current == expected => {
+                    self.write_bytes(&logical_path, replacement).await?;
+                    Ok(true)
+                }
+                Ok(_) | Err(Error::NotFound(_)) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        .await;
+        let release = self
+            .pathlock_manager
+            .release(&lease)
             .await
+            .map_err(Error::from);
+        merge_operation_and_cleanup(operation, release)
     }
 
     /// Read and deserialize one JSON value from a canonical logical path.
@@ -179,20 +221,18 @@ impl MetadataStore {
     /// Write complete binary bytes to a canonical logical path.
     pub(crate) async fn write_bytes(&self, logical_path: &str, bytes: &[u8]) -> Result<()> {
         let backend_path = self.paths.raw_backend_path(logical_path)?;
-        self.raw_primary
-            .ensure_parent_dirs(&backend_path, 0o755)
-            .await?;
-        let written = self
-            .raw_primary
-            .write(&backend_path, bytes, 0, WriteFlag::Create)
-            .await?;
-        if written != bytes.len() as u64 {
-            return Err(Error::internal(format!(
-                "short metadata write: {written}/{}",
-                bytes.len()
-            )));
-        }
-        Ok(())
+        let context = self.metadata_context(logical_path)?;
+        FS_CTX
+            .scope(context, async {
+                self.primary
+                    .ensure_parent_dirs(&backend_path, 0o755)
+                    .await?;
+                self.primary
+                    .write(&backend_path, bytes, 0, WriteFlag::Create)
+                    .await?;
+                Ok(())
+            })
+            .await
     }
 
     /// Validate and write one JSON value at a logical path.
@@ -208,30 +248,12 @@ impl MetadataStore {
 
     /// Create one immutable blob or accept an identical existing value.
     pub async fn write_immutable(&self, logical_path: &str, bytes: &[u8]) -> Result<()> {
-        let backend_path = self.paths.raw_backend_path(logical_path)?;
-        self.raw_primary
-            .ensure_parent_dirs(&backend_path, 0o755)
-            .await?;
-        match self
-            .raw_primary
-            .write(&backend_path, bytes, 0, WriteFlag::CreateNew)
-            .await
-        {
-            Ok(written) if written == bytes.len() as u64 => Ok(()),
-            Ok(written) => Err(Error::internal(format!(
-                "short immutable write: {written}/{}",
-                bytes.len()
+        match self.read_bytes(logical_path).await {
+            Ok(existing) if existing == bytes => Ok(()),
+            Ok(_) => Err(Error::AlreadyExists(format!(
+                "immutable metadata differs: {logical_path}"
             ))),
-            Err(Error::AlreadyExists(_)) => {
-                let existing = self.raw_primary.read(&backend_path, 0, 0).await?;
-                if existing == bytes {
-                    Ok(())
-                } else {
-                    Err(Error::AlreadyExists(format!(
-                        "immutable metadata differs: {backend_path}"
-                    )))
-                }
-            }
+            Err(Error::NotFound(_)) => self.write_bytes(logical_path, bytes).await,
             Err(error) => Err(error),
         }
     }
@@ -239,7 +261,7 @@ impl MetadataStore {
     /// List one raw metadata directory without public hidden-name filtering.
     pub(crate) async fn list_directory(&self, logical_path: &str) -> Result<Vec<FileInfo>> {
         let backend_path = self.paths.raw_backend_path(logical_path)?;
-        self.raw_primary.read_internal_dir(&backend_path).await
+        self.primary.read_internal_dir(&backend_path).await
     }
 
     /// Remove one raw metadata file while treating absence as success.
@@ -251,12 +273,12 @@ impl MetadataStore {
     /// Remove one raw metadata directory only when it is empty.
     pub(crate) async fn remove_empty_directory(&self, logical_path: &str) -> Result<()> {
         let backend_path = self.paths.raw_backend_path(logical_path)?;
-        match self.raw_primary.read_internal_dir(&backend_path).await {
+        match self.primary.read_internal_dir(&backend_path).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(_) | Err(Error::NotFound(_)) => return Ok(()),
             Err(error) => return Err(error),
         }
-        match self.raw_primary.remove_all(&backend_path).await {
+        match self.primary.remove_all(&backend_path).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }
@@ -295,7 +317,9 @@ impl MetadataStore {
             .pathlock_manager
             .acquire_exact(
                 &logical_manifest,
-            self.pathlock_manager.default_lock_timeout().max(std::time::Duration::from_secs(5)),
+                self.pathlock_manager
+                    .default_lock_timeout()
+                    .max(std::time::Duration::from_secs(5)),
                 None,
             )
             .await?;
@@ -324,7 +348,9 @@ impl MetadataStore {
             .pathlock_manager
             .acquire_exact(
                 &logical_manifest,
-            self.pathlock_manager.default_lock_timeout().max(std::time::Duration::from_secs(5)),
+                self.pathlock_manager
+                    .default_lock_timeout()
+                    .max(std::time::Duration::from_secs(5)),
                 None,
             )
             .await?;
@@ -459,7 +485,7 @@ impl MetadataStore {
 
     /// Remove a temporary file while treating an absent file as clean.
     async fn remove_if_present(&self, backend_path: &str) -> Result<()> {
-        match self.raw_primary.remove(backend_path).await {
+        match self.primary.remove(backend_path).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }

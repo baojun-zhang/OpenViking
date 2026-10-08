@@ -16,9 +16,9 @@ use crate::multibackend::config::{
     item_params_to_config_values, validate_backups_config, validate_primary_encryption_flags,
 };
 use crate::multibackend::meta::{MetadataStore, RelativePathFsContextResolver};
-use crate::multibackend::provider::{FilesystemProvider, MultiWriteProvider};
 #[cfg(feature = "cache")]
 use crate::multibackend::provider::CacheProvider;
+use crate::multibackend::provider::{FilesystemProvider, MultiWriteProvider};
 use crate::multibackend::types::MultiBackendBuildContext;
 use crate::shape::validate::ensure_backend_shape;
 
@@ -108,7 +108,7 @@ pub(crate) async fn build_inactive_multi_write_fs(
     };
 
     let metadata_store = Arc::new(MetadataStore::new(
-        primary_raw.clone(),
+        primary_backend.clone(),
         build_ctx.pathlock_manager.clone(),
         &build_ctx.backend_prefix,
     )?);
@@ -118,9 +118,7 @@ pub(crate) async fn build_inactive_multi_write_fs(
             #[cfg(feature = "cache")]
             {
                 let runtime = build_ctx.cache_runtime.clone().ok_or_else(|| {
-                    Error::config(
-                        "backups.provider = 'cache' requires a top-level CacheRuntime",
-                    )
+                    Error::config("backups.provider = 'cache' requires a top-level CacheRuntime")
                 })?;
                 Arc::new(CacheProvider::new(metadata_store.clone(), runtime)?)
             }
