@@ -24,7 +24,7 @@ use crate::multibackend::router::AccountRouter;
 
 use super::{read_sealed_segment, select_record_range, MultiWriteProvider};
 
-const MAX_SEGMENT_RECORDS: usize = 4096;
+const MAX_SEGMENT_RECORDS: usize = 8192;
 const FLUSH_SCRIPT_ID: &str = "multiwrite.flush.v1";
 const SEAL_SCRIPT_ID: &str = "multiwrite.seal.v1";
 const ADVANCE_SCRIPT_ID: &str = "multiwrite.advance.v1";
@@ -58,7 +58,7 @@ if marker_seq ~= 0 then
     return { "seal_required" }
 end
 local head_len = redis.call("LLEN", KEYS[2])
-local capacity = 4096 - head_len
+local capacity = 8192 - head_len
 if capacity <= 0 then
     return { "seal_required" }
 end
@@ -82,7 +82,7 @@ local marker_seq_text = string.format("%.0f", marker_seq)
 redis.call("HSET", KEYS[1], "next_seq", next_seq_text,
     "marker_seq", marker_seq_text)
 local needs_seal = 0
-if redis.call("LLEN", KEYS[2]) == 4096 or marker_seq ~= 0 then
+if redis.call("LLEN", KEYS[2]) == 8192 or marker_seq ~= 0 then
     needs_seal = 1
 end
 if needs_seal == 0 then

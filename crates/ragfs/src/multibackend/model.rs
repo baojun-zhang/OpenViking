@@ -429,7 +429,7 @@ impl SegmentDescriptor {
                     "sealed segment count does not match range"
                 );
                 ensure!(
-                    self.record_count <= 4_096,
+                    self.record_count <= 8_192,
                     "sealed segment has too many records"
                 );
                 validate_checksum(self.checksum.as_deref().ok_or_else(|| {

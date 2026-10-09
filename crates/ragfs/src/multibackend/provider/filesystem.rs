@@ -19,7 +19,7 @@ use crate::multibackend::router::AccountRouter;
 
 use super::{read_sealed_segment, select_record_range, MultiWriteProvider};
 
-const MAX_SEGMENT_RECORDS: usize = 4096;
+const MAX_SEGMENT_RECORDS: usize = 8192;
 
 /// Persists V2 manifests and segment blobs on the primary filesystem.
 pub struct FilesystemProvider {

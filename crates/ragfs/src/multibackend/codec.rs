@@ -4,9 +4,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::core::errors::{Error, Result};
-use crate::multibackend::model::{
-    CheckpointNode, DecodedSegment, SegmentEventType, SegmentRecord,
-};
+use crate::multibackend::model::{CheckpointNode, DecodedSegment, SegmentEventType, SegmentRecord};
 
 const SEGMENT_MAGIC: &[u8; 4] = b"OVSG";
 const CHECKPOINT_MAGIC: &[u8; 4] = b"OVCP";
@@ -14,7 +12,7 @@ const FORMAT_VERSION: u16 = 1;
 const MAX_STRING_LEN: usize = 1024 * 1024;
 const MIN_RECORD_LEN: usize = 14;
 const MAX_RECORD_LEN: usize = 2 * 1024 * 1024;
-const MAX_SEGMENT_RECORDS: usize = 4096;
+const MAX_SEGMENT_RECORDS: usize = 8192;
 const MAX_CHECKPOINT_NODES: usize = 500_000;
 const MAX_CHECKPOINT_DEPTH: usize = 256;
 
@@ -109,7 +107,9 @@ pub fn decode_checkpoint_chunk(bytes: &[u8]) -> Result<CheckpointNode> {
     let mut remaining_nodes = node_count;
     let root = decode_checkpoint_node(&mut reader, &mut remaining_nodes, 1)?;
     if remaining_nodes != 0 {
-        return Err(serialization("checkpoint node count does not match payload"));
+        return Err(serialization(
+            "checkpoint node count does not match payload",
+        ));
     }
     if reader.remaining() != 0 {
         return Err(serialization("checkpoint has trailing bytes"));
@@ -128,8 +128,8 @@ fn encode_record(record: &SegmentRecord) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&record.seq.to_le_bytes());
     bytes.push(record.event_type as u8);
-    let flags = u8::from(record.op_id.is_some())
-        | (u8::from(record.destination_path.is_some()) << 1);
+    let flags =
+        u8::from(record.op_id.is_some()) | (u8::from(record.destination_path.is_some()) << 1);
     bytes.push(flags);
     write_string(&mut bytes, &record.path)?;
     if let Some(op_id) = record.op_id {
@@ -250,11 +250,7 @@ fn decode_checkpoint_node(
 
     let mut children = Vec::new();
     for _ in 0..child_count {
-        children.push(decode_checkpoint_node(
-            reader,
-            remaining_nodes,
-            depth + 1,
-        )?);
+        children.push(decode_checkpoint_node(reader, remaining_nodes, depth + 1)?);
     }
     Ok(CheckpointNode {
         path_fragment,
@@ -332,23 +328,17 @@ impl<'a> Reader<'a> {
 
     /// Read one little-endian u16.
     fn read_u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(
-            self.read_exact(2)?.try_into().unwrap(),
-        ))
+        Ok(u16::from_le_bytes(self.read_exact(2)?.try_into().unwrap()))
     }
 
     /// Read one little-endian u32.
     fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(
-            self.read_exact(4)?.try_into().unwrap(),
-        ))
+        Ok(u32::from_le_bytes(self.read_exact(4)?.try_into().unwrap()))
     }
 
     /// Read one little-endian u64.
     fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            self.read_exact(8)?.try_into().unwrap(),
-        ))
+        Ok(u64::from_le_bytes(self.read_exact(8)?.try_into().unwrap()))
     }
 
     /// Read one bounded length-prefixed UTF-8 string.
