@@ -36,5 +36,3 @@ pub const VBUCKETS: u32 = 65_536;
 pub(crate) const MAX_SEGMENT_RECORDS: usize = 8_192;
 /// Maximum file states allowed in one checkpoint chunk.
 pub(crate) const MAX_CHECKPOINT_NODES: usize = 500_000;
-/// Default checkpoint interval used by runtime helpers.
-pub(crate) const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 86_400;
