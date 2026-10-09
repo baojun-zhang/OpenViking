@@ -197,8 +197,8 @@ pub struct CheckpointManifest {
 pub struct ChunkDescriptor {
     pub file: String,
     pub root_path: String,
-    pub first_path: Option<String>,
-    pub last_path: Option<String>,
+    pub start_path: Option<String>,
+    pub end_path: Option<String>,
     pub file_state_count: u32,
     pub checksum: String,
     pub chunks: Vec<ChunkDescriptor>,
@@ -571,20 +571,41 @@ impl ChunkDescriptor {
             "chunk has too many file states"
         );
         validate_checksum(&self.checksum)?;
-        match (root, self.first_path.as_deref(), self.last_path.as_deref()) {
-            (true, None, None) => {}
-            (true, _, _) => ensure!(false, "root chunk must not have bounds"),
-            (false, Some(first), Some(last)) => ensure!(first <= last, "chunk range is reversed"),
-            (false, _, _) => ensure!(false, "non-root chunk requires both bounds"),
-        }
-        let mut previous_last = None;
+        let (range_start, range_end) =
+            match (root, self.start_path.as_deref(), self.end_path.as_deref()) {
+                (true, None, None) => (self.root_path.as_str(), None),
+                (true, _, _) => {
+                    return Err(Error::Serialization(
+                        "root chunk must not have bounds".into(),
+                    ));
+                }
+                (false, Some(start), end) => {
+                    if let Some(end) = end {
+                        ensure!(start < end, "chunk range is reversed");
+                    }
+                    (start, end)
+                }
+                (false, None, _) => {
+                    return Err(Error::Serialization(
+                        "non-root chunk requires start bound".into(),
+                    ));
+                }
+            };
+        let mut expected_start = Some(range_start);
         for child in &self.chunks {
             child.validate_inner(false, files)?;
+            let child_start = child.start_path.as_deref().unwrap();
             ensure!(
-                previous_last.is_none_or(|last| last < child.first_path.as_deref().unwrap()),
-                "chunk ranges overlap or are unordered"
+                expected_start.is_some_and(|start| start == child_start),
+                "chunk ranges are not contiguous"
             );
-            previous_last = child.last_path.as_deref();
+            expected_start = child.end_path.as_deref();
+        }
+        if !self.chunks.is_empty() {
+            ensure!(
+                expected_start == range_end,
+                "chunk ranges are not contiguous"
+            );
         }
         Ok(())
     }

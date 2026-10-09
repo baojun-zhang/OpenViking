@@ -184,7 +184,7 @@ impl SegmentDelta {
 
 enum ChunkMergeTarget<'a> {
     All,
-    Bounds(&'a str, &'a str),
+    Range(&'a str, Option<&'a str>),
     RootOnly(&'a str),
 }
 
@@ -616,21 +616,21 @@ impl CheckpointBuilder {
                     false,
                 )
                 .await?;
-                let (first, last) = checkpoint_descriptor_bounds(&descriptor)?;
+                let (start, end) = checkpoint_descriptor_range(&descriptor)?;
                 let states = merge_checkpoint_states(
                     states,
                     delta,
                     &mut remaining,
-                    ChunkMergeTarget::Bounds(first, last),
+                    ChunkMergeTarget::Range(start, end),
                 );
                 let (mut descriptors, chunks) =
-                    encode_child_states_with_index(scope, states, chunk_index)?;
+                    encode_child_states_with_index(scope, states, start, end, chunk_index)?;
                 write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
                 let replacement_root = ChunkDescriptor {
                     file: String::new(),
                     root_path: account_root.clone(),
-                    first_path: None,
-                    last_path: None,
+                    start_path: None,
+                    end_path: None,
                     file_state_count: 0,
                     checksum: String::new(),
                     chunks: descriptors.clone(),
@@ -649,14 +649,12 @@ impl CheckpointBuilder {
             }
         }
 
-        let leftover = remaining.into_values().collect::<Vec<_>>();
-        if !leftover.is_empty() {
-            let (mut descriptors, chunks) =
-                encode_child_states_with_index(scope, leftover, chunk_index)?;
-            write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
-            next_children.append(&mut descriptors);
+        if !remaining.is_empty() {
+            return Err(Error::Serialization(
+                "checkpoint delta paths were not assigned to a chunk".into(),
+            ));
         }
-        sort_checkpoint_children(&mut next_children)?;
+        sort_checkpoint_children(&mut next_children, &account_root)?;
         manifest.root.chunks = next_children;
         Ok(())
     }
@@ -739,14 +737,15 @@ impl CheckpointBuilder {
                 next_children.push(descriptor);
                 continue;
             }
+            let (start, end) = checkpoint_descriptor_range(&descriptor)?;
             let (mut descriptors, chunks) =
-                encode_child_states_with_index(scope, retained, chunk_index)?;
+                encode_child_states_with_index(scope, retained, start, end, chunk_index)?;
             write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
             let replacement_root = ChunkDescriptor {
                 file: String::new(),
                 root_path: account_root.clone(),
-                first_path: None,
-                last_path: None,
+                start_path: None,
+                end_path: None,
                 file_state_count: 0,
                 checksum: String::new(),
                 chunks: descriptors.clone(),
@@ -761,7 +760,7 @@ impl CheckpointBuilder {
             .await;
             next_children.append(&mut descriptors);
         }
-        sort_checkpoint_children(&mut next_children)?;
+        sort_checkpoint_children(&mut next_children, &account_root)?;
         manifest.root.chunks = next_children;
         Ok(())
     }
@@ -925,6 +924,8 @@ fn encode_states_with_index(
 fn encode_child_states_with_index(
     scope: &ScopeKey,
     mut states: Vec<FileState>,
+    start_path: &str,
+    end_path: Option<&str>,
     index: &mut usize,
 ) -> Result<(Vec<ChunkDescriptor>, Vec<(String, Vec<u8>)>)> {
     if states.is_empty() {
@@ -938,6 +939,7 @@ fn encode_child_states_with_index(
         descriptors.push(encode_node(node, &root_path, false, index, &mut files)?);
     }
     partition_children(children, &root_path, index, &mut files, &mut descriptors)?;
+    assign_checkpoint_child_ranges(&mut descriptors, start_path, end_path)?;
     Ok((descriptors, files))
 }
 
@@ -997,6 +999,7 @@ fn encode_checkpoint_tree(
             &mut files,
             &mut descriptor.chunks,
         )?;
+        assign_checkpoint_child_ranges(&mut descriptor.chunks, root_path, None)?;
         descriptor
     };
     Ok((root, files))
@@ -1138,7 +1141,18 @@ fn encode_node(
     index: &mut usize,
     files: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<ChunkDescriptor> {
-    let (count, first_path, last_path) = checkpoint_node_range(&node, root_path);
+    let (count, first_path) = checkpoint_node_range(&node, root_path);
+    let start_path = if root {
+        None
+    } else {
+        Some(
+            first_path
+                .or_else(|| checkpoint_node_start_path(&node, root_path))
+                .ok_or_else(|| {
+                    Error::Serialization("checkpoint child chunk lacks start path".into())
+                })?,
+        )
+    };
     let bytes = encode_checkpoint_chunk(&node)?;
     let checksum = sha256_hex(&bytes);
     let file = checkpoint_chunk_file_name(*index, &checksum);
@@ -1147,8 +1161,8 @@ fn encode_node(
     Ok(ChunkDescriptor {
         file,
         root_path: root_path.to_string(),
-        first_path: (!root).then_some(first_path).flatten(),
-        last_path: (!root).then_some(last_path).flatten(),
+        start_path,
+        end_path: None,
         file_state_count: count as u32,
         checksum,
         chunks: Vec::new(),
@@ -1166,14 +1180,55 @@ fn checkpoint_node_count(root: &CheckpointNode) -> usize {
     count
 }
 
-/// Return the state count and ordered path bounds encoded in one chunk.
-fn checkpoint_node_range(
-    root: &CheckpointNode,
-    root_path: &str,
-) -> (usize, Option<String>, Option<String>) {
+/// Return the state count and first ordered path encoded in one chunk.
+fn checkpoint_node_range(root: &CheckpointNode, root_path: &str) -> (usize, Option<String>) {
     let mut paths = Vec::new();
     collect_node_paths(root, root_path, &mut paths);
-    (paths.len(), paths.first().cloned(), paths.last().cloned())
+    (paths.len(), paths.first().cloned())
+}
+
+/// Return the lowest owned path prefix for one encoded checkpoint subtree.
+fn checkpoint_node_start_path(node: &CheckpointNode, root_path: &str) -> Option<String> {
+    let path = format!("{root_path}{}", node.path_fragment);
+    if node.latest_seq.is_some() || !node.path_fragment.is_empty() {
+        return Some(path);
+    }
+    node.children
+        .first()
+        .map(|child| format!("{path}{}", child.path_fragment))
+}
+
+/// Assign contiguous left-closed and right-open ownership ranges to siblings.
+fn assign_checkpoint_child_ranges(
+    children: &mut Vec<ChunkDescriptor>,
+    start_path: &str,
+    end_path: Option<&str>,
+) -> Result<()> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    children.sort_by(|left, right| left.start_path.cmp(&right.start_path));
+    let starts = children
+        .iter()
+        .map(|child| {
+            child.start_path.clone().ok_or_else(|| {
+                Error::Serialization("checkpoint child chunk lacks start path".into())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for index in 0..children.len() {
+        children[index].start_path = Some(if index == 0 {
+            start_path.to_string()
+        } else {
+            starts[index].clone()
+        });
+        children[index].end_path = if index + 1 < starts.len() {
+            Some(starts[index + 1].clone())
+        } else {
+            end_path.map(str::to_string)
+        };
+    }
+    Ok(())
 }
 
 /// Collect state paths from one radix subtree in canonical order.
@@ -1352,13 +1407,16 @@ async fn read_checkpoint_chunk_states(
             "checkpoint chunk paths are invalid or unordered".into(),
         ));
     }
-    if !root
-        && (states.first().map(|state| &state.path) != descriptor.first_path.as_ref()
-            || states.last().map(|state| &state.path) != descriptor.last_path.as_ref())
-    {
-        return Err(Error::Serialization(
-            "checkpoint chunk range mismatch".into(),
-        ));
+    if !root {
+        let (start, end) = checkpoint_descriptor_range(descriptor)?;
+        if states
+            .iter()
+            .any(|state| !checkpoint_range_contains(start, end, &state.path))
+        {
+            return Err(Error::Serialization(
+                "checkpoint chunk range mismatch".into(),
+            ));
+        }
     }
     Ok(states)
 }
@@ -1392,7 +1450,7 @@ fn merge_checkpoint_states(
 fn checkpoint_target_contains(target: &ChunkMergeTarget<'_>, path: &str) -> bool {
     match target {
         ChunkMergeTarget::All => true,
-        ChunkMergeTarget::Bounds(first, last) => *first <= path && path <= *last,
+        ChunkMergeTarget::Range(start, end) => checkpoint_range_contains(start, *end, path),
         ChunkMergeTarget::RootOnly(root) => path == *root,
     }
 }
@@ -1411,55 +1469,51 @@ fn checkpoint_descriptor_is_dirty(
     descriptor: &ChunkDescriptor,
     delta: &SegmentDelta,
 ) -> Result<bool> {
-    let (first, last) = checkpoint_descriptor_bounds(descriptor)?;
+    let (start, end) = checkpoint_descriptor_range(descriptor)?;
     Ok(delta
         .exact_paths
         .iter()
-        .any(|path| first <= path.as_str() && path.as_str() <= last)
+        .any(|path| checkpoint_range_contains(start, end, path))
         || delta
             .states
             .keys()
-            .any(|path| first <= path.as_str() && path.as_str() <= last)
+            .any(|path| checkpoint_range_contains(start, end, path))
         || delta
             .prefixes
             .iter()
-            .any(|prefix| checkpoint_range_overlaps_prefix(first, last, prefix)))
+            .any(|prefix| checkpoint_range_overlaps_prefix(start, end, prefix)))
 }
 
-/// Return the validated first and last logical path for a non-root descriptor.
-fn checkpoint_descriptor_bounds(descriptor: &ChunkDescriptor) -> Result<(&str, &str)> {
-    let first = descriptor
-        .first_path
+/// Return the validated left-closed and right-open range for a non-root descriptor.
+fn checkpoint_descriptor_range(descriptor: &ChunkDescriptor) -> Result<(&str, Option<&str>)> {
+    let start = descriptor
+        .start_path
         .as_deref()
-        .ok_or_else(|| Error::Serialization("checkpoint child chunk lacks first path".into()))?;
-    let last = descriptor
-        .last_path
-        .as_deref()
-        .ok_or_else(|| Error::Serialization("checkpoint child chunk lacks last path".into()))?;
-    Ok((first, last))
-}
-
-/// Return whether one sorted chunk range can contain paths under a dirty prefix.
-fn checkpoint_range_overlaps_prefix(first: &str, last: &str, prefix: &str) -> bool {
-    is_path_within(first, prefix)
-        || is_path_within(last, prefix)
-        || (first <= prefix && prefix <= last)
-}
-
-/// Sort child descriptors and reject overlapping path ranges.
-fn sort_checkpoint_children(children: &mut Vec<ChunkDescriptor>) -> Result<()> {
-    children.sort_by(|left, right| left.first_path.cmp(&right.first_path));
-    let mut previous_last = None;
-    for child in children {
-        let (first, last) = checkpoint_descriptor_bounds(child)?;
-        if previous_last.is_some_and(|previous| previous >= first) {
+        .ok_or_else(|| Error::Serialization("checkpoint child chunk lacks start path".into()))?;
+    let end = descriptor.end_path.as_deref();
+    if let Some(end) = end {
+        if start >= end {
             return Err(Error::Serialization(
-                "chunk ranges overlap or are unordered".into(),
+                "checkpoint chunk range is reversed".into(),
             ));
         }
-        previous_last = Some(last);
     }
-    Ok(())
+    Ok((start, end))
+}
+
+/// Return whether a left-closed range contains one logical path.
+fn checkpoint_range_contains(start: &str, end: Option<&str>, path: &str) -> bool {
+    start <= path && end.is_none_or(|end| path < end)
+}
+
+/// Return whether one ownership range can contain paths under a dirty prefix.
+fn checkpoint_range_overlaps_prefix(start: &str, end: Option<&str>, prefix: &str) -> bool {
+    checkpoint_range_contains(start, end, prefix) || is_path_within(start, prefix)
+}
+
+/// Sort child descriptors and normalize contiguous ownership ranges.
+fn sort_checkpoint_children(children: &mut Vec<ChunkDescriptor>, root_path: &str) -> Result<()> {
+    assign_checkpoint_child_ranges(children, root_path, None)
 }
 
 /// Retain live states and tombstones still needed by at least one backend.
