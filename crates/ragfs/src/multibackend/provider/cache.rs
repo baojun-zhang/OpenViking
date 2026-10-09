@@ -14,7 +14,10 @@ use crate::cache_runtime::{
 use crate::core::errors::{Error, Result};
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::multibackend::codec::{decode_segment, encode_segment, sha256_hex};
-use crate::multibackend::constants::{HEAD_SEGMENT_FILE_PREFIX, MAX_EXACT_SEQUENCE, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,SEGMENT_FILE_EXTENSION,};
+use crate::multibackend::constants::{
+    HEAD_SEGMENT_FILE_PREFIX, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,
+    SEGMENT_FILE_EXTENSION,
+};
 use crate::multibackend::meta::MetadataStore;
 use crate::multibackend::model::{
     BackendState, CheckpointsManifest, FlushResult, MarkerPosition, PartitionContext,
@@ -38,7 +41,7 @@ if redis.call("HGET", KEYS[1], "account") ~= ARGV[1]
     or redis.call("HGET", KEYS[1], "epoch") ~= ARGV[3] then
     return { "scope_mismatch" }
 end
-local requested = #ARGV - 7
+local requested = #ARGV - 6
 if ARGV[4] == "1" and requested ~= 1 then
     return { "invalid", "marker flush requires exactly one record" }
 end
@@ -64,13 +67,9 @@ if capacity <= 0 then
 end
 local count = math.min(requested, capacity)
 local next_seq = tonumber(redis.call("HGET", KEYS[1], "next_seq"))
-local max_seq = tonumber(ARGV[7])
-if next_seq > max_seq - count then
-    return { "invalid", "sequence limit reached" }
-end
 local first_seq = next_seq
 for index = 1, count do
-    local record = cjson.decode(ARGV[index + 7])
+    local record = cjson.decode(ARGV[index + 6])
     record.seq = next_seq
     redis.call("RPUSH", KEYS[2], cjson.encode(record))
     next_seq = next_seq + 1
@@ -555,7 +554,6 @@ impl CacheProvider {
         args.push(Bytes::from(if marker { "1" } else { "0" }));
         args.push(Bytes::from(owner.to_string()));
         args.push(Bytes::from(if continuing { "1" } else { "0" }));
-        args.push(Bytes::from(MAX_EXACT_SEQUENCE.to_string()));
         for record in records {
             args.push(Bytes::from(serde_json::to_vec(record)?));
         }
@@ -1077,7 +1075,9 @@ impl CacheProvider {
 
     /// Parse one deterministic sealed segment filename.
     fn sealed_range(name: &str) -> Option<(u64, u64)> {
-        let range = name.strip_prefix(SEALED_SEGMENT_FILE_PREFIX)?.strip_suffix(SEGMENT_FILE_EXTENSION)?;
+        let range = name
+            .strip_prefix(SEALED_SEGMENT_FILE_PREFIX)?
+            .strip_suffix(SEGMENT_FILE_EXTENSION)?;
         let (from, to) = range.split_once('-')?;
         Some((from.parse().ok()?, to.parse().ok()?))
     }
