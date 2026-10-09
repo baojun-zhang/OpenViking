@@ -53,18 +53,6 @@ pub async fn init_backend_plugin(
     Ok(Arc::from(fs))
 }
 
-/// Build the multi-backend wrapper from primary and backup configuration.
-pub async fn build_multi_write_fs(
-    registry: &Arc<RwLock<HashMap<String, Arc<dyn ServicePlugin>>>>,
-    config: &PluginConfig,
-    bc: &BackendsConfig,
-    build_ctx: MultiBackendBuildContext,
-) -> Result<MultiWriteWrappedFS> {
-    let fs = build_inactive_multi_write_fs(registry, config, bc, build_ctx).await?;
-    fs.activate();
-    Ok(fs)
-}
-
 /// Build the multi-backend wrapper without starting background work.
 pub(crate) async fn build_inactive_multi_write_fs(
     registry: &Arc<RwLock<HashMap<String, Arc<dyn ServicePlugin>>>>,

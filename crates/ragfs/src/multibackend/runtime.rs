@@ -15,7 +15,7 @@ use crate::core::filesystem::FileSystem;
 use crate::multibackend::catch_up::{CatchUpTarget, CatchUpWorker};
 use crate::multibackend::checkpoint::{CheckpointReader, CheckpointWorker};
 use crate::multibackend::codec::{decode_segment, sha256_hex};
-use crate::multibackend::constants::{DEFAULT_CHECKPOINT_INTERVAL_SECS, SYSTEM_DIR};
+use crate::multibackend::constants::SYSTEM_DIR;
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
 use crate::multibackend::model::{
     DirectoryEvent, DirectoryOperation, MarkerPosition, PartitionContext, PartitionState,
@@ -68,72 +68,6 @@ pub struct MultiWriteRuntime {
 }
 
 impl MultiWriteRuntime {
-    /// Start one flush worker and return its non-blocking submission handle.
-    pub async fn start(
-        store: Arc<MetadataStore>,
-        provider: Arc<dyn MultiWriteProvider>,
-        initial_partitions: u32,
-        backup_names: Vec<String>,
-    ) -> Self {
-        let runtime = Self::prepare(
-            store,
-            provider,
-            initial_partitions,
-            backup_names,
-            None,
-            Vec::new(),
-            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
-        )
-        .await;
-        runtime.activate();
-        runtime
-    }
-
-    /// Start the flush worker plus one independent worker for each backup.
-    pub async fn start_with_catch_up(
-        store: Arc<MetadataStore>,
-        provider: Arc<dyn MultiWriteProvider>,
-        initial_partitions: u32,
-        backup_names: Vec<String>,
-        primary: Arc<dyn FileSystem>,
-        targets: Vec<CatchUpTarget>,
-    ) -> Self {
-        Self::start_with_catch_up_interval(
-            store,
-            provider,
-            initial_partitions,
-            backup_names,
-            primary,
-            targets,
-            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
-        )
-        .await
-    }
-
-    /// Start flush, catch-up, and checkpoint workers with an explicit cadence.
-    pub async fn start_with_catch_up_interval(
-        store: Arc<MetadataStore>,
-        provider: Arc<dyn MultiWriteProvider>,
-        initial_partitions: u32,
-        backup_names: Vec<String>,
-        primary: Arc<dyn FileSystem>,
-        targets: Vec<CatchUpTarget>,
-        checkpoint_interval: Duration,
-    ) -> Self {
-        let runtime = Self::prepare(
-            store,
-            provider,
-            initial_partitions,
-            backup_names,
-            Some(primary),
-            targets,
-            checkpoint_interval,
-        )
-        .await;
-        runtime.activate();
-        runtime
-    }
-
     /// Assemble runtime tasks without allowing background work to start.
     pub(crate) async fn prepare(
         store: Arc<MetadataStore>,
