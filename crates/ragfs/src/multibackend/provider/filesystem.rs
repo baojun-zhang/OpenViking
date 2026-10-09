@@ -9,17 +9,16 @@ use crate::core::errors::{Error, Result};
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::lock::{OwnedPathLockLease, PathLockKind, PathLockRequest};
 use crate::multibackend::codec::{decode_segment, encode_segment, sha256_hex};
+use crate::multibackend::constants::{HEAD_SEGMENT_FILE_PREFIX, MAX_EXACT_SEQUENCE, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,SEGMENT_FILE_EXTENSION,};
 use crate::multibackend::meta::MetadataStore;
 use crate::multibackend::model::{
     FlushResult, MarkerPosition, PartitionContext, PartitionsManifest, PendingEvent,
     PendingEventKind, ScopeKey, SegmentDescriptor, SegmentEventType, SegmentManifest,
-    SegmentRecord, MAX_EXACT_SEQUENCE,
+    SegmentRecord,
 };
 use crate::multibackend::router::AccountRouter;
 
 use super::{read_sealed_segment, select_record_range, MultiWriteProvider};
-
-const MAX_SEGMENT_RECORDS: usize = 8192;
 
 /// Persists V2 manifests and segment blobs on the primary filesystem.
 pub struct FilesystemProvider {
@@ -119,12 +118,12 @@ impl FilesystemProvider {
 
     /// Returns the deterministic mutable head filename.
     fn head_name(from_seq: u64) -> String {
-        format!("head-{from_seq:020}.ovsg")
+        format!("{HEAD_SEGMENT_FILE_PREFIX}{from_seq:020}{SEGMENT_FILE_EXTENSION}")
     }
 
     /// Returns the deterministic immutable sealed filename.
     fn sealed_name(from_seq: u64, to_seq: u64) -> String {
-        format!("segment-{from_seq:020}-{to_seq:020}.ovsg")
+        format!("{SEALED_SEGMENT_FILE_PREFIX}{from_seq:020}-{to_seq:020}{SEGMENT_FILE_EXTENSION}")
     }
 
     /// Returns one logical segment blob path.
@@ -590,6 +589,15 @@ impl MultiWriteProvider for FilesystemProvider {
             }
         }
         select_record_range(records, from_seq_inclusive, to_seq_exclusive)
+    }
+
+    /// Reads one immutable sealed segment named by a validated descriptor.
+    async fn read_sealed_segment(
+        &self,
+        scope: &ScopeKey,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<Vec<SegmentRecord>> {
+        read_sealed_segment(&self.store, scope, descriptor).await
     }
 
     /// Returns the current segment state for one scope.

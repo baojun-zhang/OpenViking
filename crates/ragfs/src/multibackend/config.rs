@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::core::errors::{Error, Result};
 use crate::core::types::{BackendsConfig, ConfigValue, PluginConfig};
-use crate::multibackend::model::MAX_PARTITIONS;
+use crate::multibackend::constants::{MAX_PARTITIONS, MIN_CHECKPOINT_INTERVAL_SECS};
 
 /// Convert one nested backup `params` object into plugin config values.
 pub fn item_params_to_config_values(value: &Value) -> Result<HashMap<String, ConfigValue>> {
@@ -69,14 +69,14 @@ pub fn validate_primary_encryption_flags(
 /// Validate V2 backup settings.
 pub fn validate_backups_config(bc: &BackendsConfig) -> Result<()> {
     if !(1..=MAX_PARTITIONS).contains(&bc.initial_partitions) {
-        return Err(Error::config(
-            format!("backups.initial_partitions must be between 1 and {MAX_PARTITIONS}"),
-        ));
+        return Err(Error::config(format!(
+            "backups.initial_partitions must be between 1 and {MAX_PARTITIONS}"
+        )));
     }
-    if bc.checkpoint_interval_secs < 60 {
-        return Err(Error::config(
-            "backups.checkpoint_interval_secs must be at least 60",
-        ));
+    if bc.checkpoint_interval_secs < MIN_CHECKPOINT_INTERVAL_SECS {
+        return Err(Error::config(format!(
+            "backups.checkpoint_interval_secs must be at least {MIN_CHECKPOINT_INTERVAL_SECS}"
+        )));
     }
     if !matches!(bc.provider.as_str(), "filesystem" | "cache") {
         return Err(Error::config(
@@ -96,7 +96,7 @@ pub fn validate_backups_config(bc: &BackendsConfig) -> Result<()> {
             ));
         }
         if !names.insert(name) {
-            return Err(Error::config(format!("duplicate backup name '{}'", item.name)));
+            return Err(Error::config(format!("duplicate backup name '{}'",item.name)));
         }
     }
 

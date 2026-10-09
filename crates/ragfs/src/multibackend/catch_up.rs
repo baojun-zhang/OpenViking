@@ -19,6 +19,7 @@ use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::core::types::{FileInfo, ListSortBy, SortOrder, WriteFlag};
 use crate::lock::OwnedPathLockLease;
+use crate::multibackend::constants::{MULTIWRITE_MOUNT_PREFIX, SYSTEM_DIR};
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
 use crate::multibackend::model::{
     FileState, PartitionState, PartitionsManifest, ScopeKey, SegmentEventType, SegmentRecord,
@@ -120,7 +121,7 @@ type CatchUpResult<T> = std::result::Result<T, CatchUpFailure>;
 impl CatchUpLease {
     /// Acquire the mount-level Exact lease for one logical backup id.
     async fn acquire(store: Arc<MetadataStore>, backend_id: &str) -> Result<Self> {
-        let path = format!("/local/_system/.multiwrite.catch-up.{backend_id}");
+        let path =format!("{MULTIWRITE_MOUNT_PREFIX}/{SYSTEM_DIR}/.multiwrite.catch-up.{backend_id}");
         let manager = store.pathlock_manager();
         let lease = manager
             .acquire_exact(
@@ -241,7 +242,7 @@ impl CatchUpWorker {
             inner: self.backup.clone(),
             lease: lease.clone(),
         };
-        self.reconcile_with_retry(&guarded, &lease, "_system", "/_system", true)
+        self.reconcile_with_retry(&guarded, &lease, SYSTEM_DIR, "/_system", true)
             .await?;
         let accounts = self.read_accounts().await?;
         self.remove_extra_accounts(&guarded, &accounts).await?;
@@ -299,7 +300,7 @@ impl CatchUpWorker {
     /// Read sorted account ids from the encrypted mount-level registry.
     async fn read_accounts(&self) -> Result<Vec<String>> {
         let bytes = self
-            .with_context("_system", self.primary.read("/_system/accounts.json", 0, 0))
+            .with_context(SYSTEM_DIR,self.primary.read("/_system/accounts.json", 0, 0))
             .await?;
         let value: Value = serde_json::from_slice(&bytes)?;
         let accounts = value
@@ -319,10 +320,10 @@ impl CatchUpWorker {
     ) -> Result<()> {
         let expected = accounts.iter().map(String::as_str).collect::<HashSet<_>>();
         let entries = self
-            .with_context("_system", backup.read_internal_dir("/"))
+            .with_context(SYSTEM_DIR, backup.read_internal_dir("/"))
             .await?;
         for entry in entries {
-            if entry.is_dir && entry.name != "_system" && !expected.contains(entry.name.as_str()) {
+            if entry.is_dir && entry.name != SYSTEM_DIR && !expected.contains(entry.name.as_str()) {
                 let path = format!("/{}", entry.name);
                 self.with_context(&entry.name, backup.remove_all(&path))
                     .await?;
@@ -856,7 +857,7 @@ async fn remove_stale_paths(
 /// Recognize internal paths in either logical or mount-relative path space.
 fn is_catch_up_internal_path(path: &str) -> bool {
     is_multiwrite_internal_path(path)
-        || is_multiwrite_internal_path(&format!("/local/{}", path.trim_start_matches('/')))
+        || is_multiwrite_internal_path(&format!("{MULTIWRITE_MOUNT_PREFIX}/{}",path.trim_start_matches('/')))
 }
 
 /// Ensure one backup path is a directory with the requested mode.

@@ -6,10 +6,12 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::core::errors::{Error, Result};
-use crate::multibackend::meta::MetadataStore;
-use crate::multibackend::model::{
-    PartitionContext, PartitionsManifest, RouteEntry, ScopeKey, VBUCKETS,
+use crate::multibackend::constants::{
+    CHECKPOINTS_DIR, MANIFEST_FILE, MULTIWRITE_MOUNT_PREFIX, MULTIWRITE_PROTOCOL_FILE,
+    PARTITIONS_DIR, SEGMENTS_DIR, SYSTEM_DIR, VBUCKETS,
 };
+use crate::multibackend::meta::MetadataStore;
+use crate::multibackend::model::{PartitionContext, PartitionsManifest, RouteEntry, ScopeKey};
 
 /// Maps canonical logical metadata paths to raw backend paths.
 #[derive(Debug, Clone)]
@@ -21,7 +23,7 @@ impl MultiWritePaths {
     /// Create a path mapper for one canonical absolute mount prefix.
     pub fn new(mount_prefix: &str) -> Result<Self> {
         validate_canonical_path(mount_prefix)?;
-        if mount_prefix != "/local" {
+        if mount_prefix != MULTIWRITE_MOUNT_PREFIX {
             return Err(Error::invalid_path(format!(
                 "unsupported multi-write mount prefix: {mount_prefix}"
             )));
@@ -34,7 +36,7 @@ impl MultiWritePaths {
     /// Return logical and backend paths for the mount protocol manifest.
     pub fn mount_protocol(&self) -> (String, String) {
         self.pair(&format!(
-            "{}/_system/.multiwrite.json",
+            "{}/{SYSTEM_DIR}/{MULTIWRITE_PROTOCOL_FILE}",
             self.mount_prefix
         ))
     }
@@ -43,7 +45,7 @@ impl MultiWritePaths {
     pub fn account_partitions(&self, account_id: &str) -> Result<(String, String)> {
         validate_account(account_id)?;
         Ok(self.pair(&format!(
-            "{}/{account_id}/_system/partitions",
+            "{}/{account_id}/{SYSTEM_DIR}/{PARTITIONS_DIR}",
             self.mount_prefix
         )))
     }
@@ -51,7 +53,7 @@ impl MultiWritePaths {
     /// Return logical and backend paths for an account partitions manifest.
     pub fn account_manifest(&self, account_id: &str) -> Result<(String, String)> {
         let (logical, _) = self.account_partitions(account_id)?;
-        Ok(self.pair(&format!("{logical}/manifest.json")))
+        Ok(self.pair(&format!("{logical}/{MANIFEST_FILE}")))
     }
 
     /// Return logical and backend paths for one partition manifest.
@@ -61,17 +63,13 @@ impl MultiWritePaths {
         partition_id: u32,
     ) -> Result<(String, String)> {
         let (logical, _) = self.account_partitions(account_id)?;
-        Ok(self.pair(&format!("{logical}/{partition_id}/manifest.json")))
+        Ok(self.pair(&format!("{logical}/{partition_id}/{MANIFEST_FILE}")))
     }
 
     /// Return logical and backend paths for one partition segments directory.
-    pub fn segments_dir(
-        &self,
-        account_id: &str,
-        partition_id: u32,
-    ) -> Result<(String, String)> {
+    pub fn segments_dir(&self, account_id: &str, partition_id: u32) -> Result<(String, String)> {
         let (logical, _) = self.account_partitions(account_id)?;
-        Ok(self.pair(&format!("{logical}/{partition_id}/segments")))
+        Ok(self.pair(&format!("{logical}/{partition_id}/{SEGMENTS_DIR}")))
     }
 
     /// Return logical and backend paths for one segment manifest.
@@ -81,17 +79,13 @@ impl MultiWritePaths {
         partition_id: u32,
     ) -> Result<(String, String)> {
         let (logical, _) = self.segments_dir(account_id, partition_id)?;
-        Ok(self.pair(&format!("{logical}/manifest.json")))
+        Ok(self.pair(&format!("{logical}/{MANIFEST_FILE}")))
     }
 
     /// Return logical and backend paths for one partition checkpoints directory.
-    pub fn checkpoints_dir(
-        &self,
-        account_id: &str,
-        partition_id: u32,
-    ) -> Result<(String, String)> {
+    pub fn checkpoints_dir(&self, account_id: &str, partition_id: u32) -> Result<(String, String)> {
         let (logical, _) = self.account_partitions(account_id)?;
-        Ok(self.pair(&format!("{logical}/{partition_id}/checkpoints")))
+        Ok(self.pair(&format!("{logical}/{partition_id}/{CHECKPOINTS_DIR}")))
     }
 
     /// Return logical and backend paths for one checkpoints manifest.
@@ -101,7 +95,7 @@ impl MultiWritePaths {
         partition_id: u32,
     ) -> Result<(String, String)> {
         let (logical, _) = self.checkpoints_dir(account_id, partition_id)?;
-        Ok(self.pair(&format!("{logical}/manifest.json")))
+        Ok(self.pair(&format!("{logical}/{MANIFEST_FILE}")))
     }
 
     /// Convert a canonical logical account path to its raw backend path.
@@ -162,18 +156,12 @@ impl AccountRouter {
     }
 
     /// Route one canonical logical account path to its partition context.
-    pub async fn route(
-        &self,
-        account_id: &str,
-        logical_path: &str,
-    ) -> Result<PartitionContext> {
+    pub async fn route(&self, account_id: &str, logical_path: &str) -> Result<PartitionContext> {
         let bucket = self.store.paths().vbucket(account_id, logical_path)?;
         let manifest_path = self.store.paths().account_manifest(account_id)?.0;
         let manifest: PartitionsManifest = self.store.read_json(&manifest_path).await?;
         manifest.validate()?;
-        let index = manifest
-            .routes
-            .partition_point(|route| route.end < bucket);
+        let index = manifest.routes.partition_point(|route| route.end < bucket);
         let route = manifest
             .routes
             .get(index)
@@ -236,7 +224,7 @@ pub fn build_initial_routes(partition_count: u32) -> Result<Vec<RouteEntry>> {
         )));
     }
     let owners = (0..VBUCKETS)
-        .map(|bucket| ((u64::from(bucket) * u64::from(partition_count)) / u64::from(VBUCKETS)) as u32)
+        .map(|bucket| { ((u64::from(bucket) * u64::from(partition_count)) / u64::from(VBUCKETS)) as u32})
         .collect::<Vec<_>>();
     let routes = compress_owners(&owners);
     validate_routes(&routes, 0..partition_count)?;
@@ -262,10 +250,7 @@ pub(crate) fn compress_owners(owners: &[u32]) -> Vec<RouteEntry> {
 
 /// Validate an account identifier as one canonical path component.
 fn validate_account(account_id: &str) -> Result<()> {
-    if account_id.is_empty()
-        || account_id == "."
-        || account_id == ".."
-        || account_id.contains('/')
+    if account_id.is_empty() || account_id == "." || account_id == ".." || account_id.contains('/')
     {
         return Err(Error::invalid_path(format!(
             "invalid account identifier: {account_id}"

@@ -1,14 +1,13 @@
 //! V2 multi-write persistence and in-memory data models.
 #![allow(missing_docs)]
 use crate::core::errors::{Error, Result};
+use crate::multibackend::constants::{CHECKPOINT_DIR_PREFIX, HEAD_SEGMENT_FILE_PREFIX, MAX_CHECKPOINT_NODES, MAX_SEGMENT_RECORDS,SEALED_SEGMENT_FILE_PREFIX, SEGMENT_FILE_EXTENSION,};
 use crate::multibackend::router::validate_routes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 macro_rules! ensure { ($condition:expr, $($arg:tt)*) => { if !$condition { return Err(Error::Serialization(format!($($arg)*))); } }; }
-pub const VBUCKETS: u32 = 65_536;
-pub const MAX_PARTITIONS: u32 = 1_024;
-pub const MAX_EXACT_SEQUENCE: u64 = 999_999_999_999;
+pub use crate::multibackend::constants::{MAX_EXACT_SEQUENCE, MAX_PARTITIONS, VBUCKETS};
 const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -421,7 +420,7 @@ impl SegmentDescriptor {
                     "segment range is invalid"
                 );
                 ensure!(
-                    self.path == format!("segment-{:020}-{to:020}.ovsg", self.segment_from_seq),
+                    self.path == format!("{SEALED_SEGMENT_FILE_PREFIX}{:020}-{to:020}{SEGMENT_FILE_EXTENSION}", self.segment_from_seq),
                     "sealed segment path does not match range"
                 );
                 ensure!(
@@ -429,7 +428,7 @@ impl SegmentDescriptor {
                     "sealed segment count does not match range"
                 );
                 ensure!(
-                    self.record_count <= 8_192,
+                    self.record_count <= MAX_SEGMENT_RECORDS as u32,
                     "sealed segment has too many records"
                 );
                 validate_checksum(self.checksum.as_deref().ok_or_else(|| {
@@ -438,7 +437,7 @@ impl SegmentDescriptor {
             }
             None => {
                 ensure!(
-                    self.path == format!("head-{:020}.ovsg", self.segment_from_seq),
+                    self.path == format!("{HEAD_SEGMENT_FILE_PREFIX}{:020}{SEGMENT_FILE_EXTENSION}", self.segment_from_seq),
                     "head segment path does not match start sequence"
                 );
                 ensure!(self.checksum.is_none(), "head segment has a checksum");
@@ -525,7 +524,7 @@ impl LatestCheckpoint {
 
 /// Return whether a single directory name identifies a published checkpoint.
 pub(crate) fn is_checkpoint_directory_name(name: &str) -> bool {
-    !name.contains('/') && name.starts_with("cp-")
+    !name.contains('/') && name.starts_with(CHECKPOINT_DIR_PREFIX)
 }
 
 impl CheckpointManifest {
@@ -570,7 +569,7 @@ impl ChunkDescriptor {
         );
         validate_path(&self.root_path)?;
         ensure!(
-            self.file_state_count <= 500_000,
+            self.file_state_count <= MAX_CHECKPOINT_NODES as u32,
             "chunk has too many file states"
         );
         validate_checksum(&self.checksum)?;

@@ -14,6 +14,7 @@ use crate::cache_runtime::{
 use crate::core::errors::{Error, Result};
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::multibackend::codec::{decode_segment, encode_segment, sha256_hex};
+use crate::multibackend::constants::{HEAD_SEGMENT_FILE_PREFIX, MAX_EXACT_SEQUENCE, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,SEGMENT_FILE_EXTENSION,};
 use crate::multibackend::meta::MetadataStore;
 use crate::multibackend::model::{
     BackendState, CheckpointsManifest, FlushResult, MarkerPosition, PartitionContext,
@@ -24,7 +25,6 @@ use crate::multibackend::router::AccountRouter;
 
 use super::{read_sealed_segment, select_record_range, MultiWriteProvider};
 
-const MAX_SEGMENT_RECORDS: usize = 8192;
 const FLUSH_SCRIPT_ID: &str = "multiwrite.flush.v1";
 const SEAL_SCRIPT_ID: &str = "multiwrite.seal.v1";
 const ADVANCE_SCRIPT_ID: &str = "multiwrite.advance.v1";
@@ -38,7 +38,7 @@ if redis.call("HGET", KEYS[1], "account") ~= ARGV[1]
     or redis.call("HGET", KEYS[1], "epoch") ~= ARGV[3] then
     return { "scope_mismatch" }
 end
-local requested = #ARGV - 6
+local requested = #ARGV - 7
 if ARGV[4] == "1" and requested ~= 1 then
     return { "invalid", "marker flush requires exactly one record" }
 end
@@ -64,12 +64,13 @@ if capacity <= 0 then
 end
 local count = math.min(requested, capacity)
 local next_seq = tonumber(redis.call("HGET", KEYS[1], "next_seq"))
-if next_seq > 999999999999 - count then
+local max_seq = tonumber(ARGV[7])
+if next_seq > max_seq - count then
     return { "invalid", "sequence limit reached" }
 end
 local first_seq = next_seq
 for index = 1, count do
-    local record = cjson.decode(ARGV[index + 6])
+    local record = cjson.decode(ARGV[index + 7])
     record.seq = next_seq
     redis.call("RPUSH", KEYS[2], cjson.encode(record))
     next_seq = next_seq + 1
@@ -554,6 +555,7 @@ impl CacheProvider {
         args.push(Bytes::from(if marker { "1" } else { "0" }));
         args.push(Bytes::from(owner.to_string()));
         args.push(Bytes::from(if continuing { "1" } else { "0" }));
+        args.push(Bytes::from(MAX_EXACT_SEQUENCE.to_string()));
         for record in records {
             args.push(Bytes::from(serde_json::to_vec(record)?));
         }
@@ -980,12 +982,12 @@ impl CacheProvider {
 
     /// Returns the deterministic mutable head filename.
     fn head_name(from_seq: u64) -> String {
-        format!("head-{from_seq:020}.ovsg")
+        format!("{HEAD_SEGMENT_FILE_PREFIX}{from_seq:020}{SEGMENT_FILE_EXTENSION}")
     }
 
     /// Returns the deterministic immutable segment filename.
     fn sealed_name(from_seq: u64, to_seq: u64) -> String {
-        format!("segment-{from_seq:020}-{to_seq:020}.ovsg")
+        format!("{SEALED_SEGMENT_FILE_PREFIX}{from_seq:020}-{to_seq:020}{SEGMENT_FILE_EXTENSION}")
     }
 
     /// Rebuild missing mutable state from the latest checkpoint and retained segments.
@@ -1075,7 +1077,7 @@ impl CacheProvider {
 
     /// Parse one deterministic sealed segment filename.
     fn sealed_range(name: &str) -> Option<(u64, u64)> {
-        let range = name.strip_prefix("segment-")?.strip_suffix(".ovsg")?;
+        let range = name.strip_prefix(SEALED_SEGMENT_FILE_PREFIX)?.strip_suffix(SEGMENT_FILE_EXTENSION)?;
         let (from, to) = range.split_once('-')?;
         Some((from.parse().ok()?, to.parse().ok()?))
     }
@@ -1378,6 +1380,15 @@ impl MultiWriteProvider for CacheProvider {
         }
         records.extend(head);
         select_record_range(records, from_seq_inclusive, to_seq_exclusive)
+    }
+
+    /// Reads one immutable sealed segment named by a validated descriptor.
+    async fn read_sealed_segment(
+        &self,
+        scope: &ScopeKey,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<Vec<SegmentRecord>> {
+        read_sealed_segment(&self.store, scope, descriptor).await
     }
 
     /// Returns validated sealed state plus a derived mutable-head descriptor.

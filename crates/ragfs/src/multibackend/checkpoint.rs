@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -14,17 +15,16 @@ use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::multibackend::catch_up::{CheckpointConsumer, CheckpointReadResult, CheckpointSnapshot};
 use crate::multibackend::codec::{decode_checkpoint_chunk, encode_checkpoint_chunk, sha256_hex};
+use crate::multibackend::constants::{CHECKPOINT_CHUNK_FILE_EXTENSION, CHECKPOINT_CHUNK_FILE_PREFIX, CHECKPOINT_DIR_PREFIX,CHECKPOINT_DIR_TIME_FORMAT, MANIFEST_FILE, MAX_CHECKPOINT_NODES, MULTIWRITE_MOUNT_PREFIX,};
 use crate::multibackend::gc::MetadataGc;
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
 use crate::multibackend::model::{
     is_checkpoint_directory_name, CheckpointManifest, CheckpointNode, CheckpointsManifest,
     ChunkDescriptor, DirectoryOperation, FileState, LatestCheckpoint, PartitionsManifest,
-    ProtocolStatus, ScopeKey, ScopedSeq, SegmentEventType,
+    ProtocolStatus, ScopeKey, ScopedSeq, SegmentEventType, SegmentRecord,
 };
 use crate::multibackend::provider::MultiWriteProvider;
 use crate::multibackend::router::AccountRouter;
-
-const MAX_CHUNK_NODES: usize = 500_000;
 
 /// Periodically builds checkpoints for every Stable account partition.
 pub struct CheckpointWorker {
@@ -168,6 +168,26 @@ pub enum CheckpointBuildResult {
     Retry,
 }
 
+#[derive(Default)]
+struct SegmentDelta {
+    states: BTreeMap<String, FileState>,
+    exact_paths: BTreeSet<String>,
+    prefixes: BTreeSet<String>,
+}
+
+impl SegmentDelta {
+    /// Return whether this segment delta cannot change checkpoint contents.
+    fn is_empty(&self) -> bool {
+        self.states.is_empty() && self.exact_paths.is_empty() && self.prefixes.is_empty()
+    }
+}
+
+enum ChunkMergeTarget<'a> {
+    All,
+    Bounds(&'a str, &'a str),
+    RootOnly(&'a str),
+}
+
 /// Builds immutable checkpoints from sealed records and current primary state.
 pub struct CheckpointBuilder {
     primary: Arc<dyn FileSystem>,
@@ -203,7 +223,7 @@ impl CheckpointBuilder {
             .pathlock_manager()
             .acquire_exact(
                 &pointer_path,
-       self.store.pathlock_manager().default_lock_timeout().max(Duration::from_secs(5)),
+                self.store.pathlock_manager().default_lock_timeout().max(Duration::from_secs(5)),
                 None,
             )
             .await?;
@@ -220,11 +240,6 @@ impl CheckpointBuilder {
             .await
             .map_err(Error::from);
         let start = finish_with_release(read_pointer, release)?;
-        let old_states = match &start.latest_checkpoint {
-            Some(latest) => read_published(self.store.as_ref(), scope, latest).await?,
-            None => Vec::new(),
-        };
-
         let segments = self.provider.read_manifest(scope).await?;
         segments.validate()?;
         let Some(tail) = segments
@@ -242,98 +257,13 @@ impl CheckpointBuilder {
         if tail <= old_to {
             return Ok(CheckpointBuildResult::NoSealedChanges);
         }
-        let records = self
-            .provider
-            .read_committed_range(scope, old_to + 1, tail + 1)
-            .await?;
-        let mut states = old_states
-            .into_iter()
-            .map(|state| (state.path.clone(), state))
-            .collect::<BTreeMap<_, _>>();
-        for record in records {
-            match record.event_type {
-                SegmentEventType::Write | SegmentEventType::Remove => {
-                    let backend_path = self
-                        .store
-                        .paths()
-                        .backend_path(&scope.account_id, &record.path)?;
-                    let deleted = match FS_CTX
-                        .scope(
-                            Arc::new(
-                                FsContextInner::new(&scope.account_id)
-                                    .with_bypass_cache(true)
-                                    .with_auto_pathlock_disabled(),
-                            ),
-                            self.primary.stat(&backend_path),
-                        )
-                        .await
-                    {
-                        Ok(_) => None,
-                        Err(Error::NotFound(_)) => Some(true),
-                        Err(error) => return Err(error),
-                    };
-                    states.insert(
-                        record.path.clone(),
-                        FileState {
-                            path: record.path,
-                            latest_seq: ScopedSeq {
-                                scope: scope.clone(),
-                                seq: record.seq,
-                            },
-                            deleted,
-                        },
-                    );
-                }
-                SegmentEventType::RemoveTree | SegmentEventType::MoveTree => {
-                    let mut prefixes = vec![record.path.clone()];
-                    if let Some(destination) = record.destination_path {
-                        prefixes.push(destination);
-                    }
-                    for prefix in prefixes {
-                        states.retain(|path, _| !is_path_within(path, &prefix));
-                        for path in self.scan_prefix(scope, &prefix).await? {
-                            states.insert(
-                                path.clone(),
-                                FileState {
-                                    path,
-                                    latest_seq: ScopedSeq {
-                                        scope: scope.clone(),
-                                        seq: record.seq,
-                                    },
-                                    deleted: None,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
         let min_synced = segments
             .backend_states
             .values()
             .map(|state| state.synced_seq)
             .min();
-        states.retain(|_, state| {
-            state.deleted.is_none()
-                || min_synced.is_some_and(|synced| state.latest_seq.seq >= synced)
-        });
-
         let created_at_ns = now_ns()?;
-        let (root, chunks) = encode_states(scope, states.into_values().collect(), tail)?;
-        let checksum = tree_checksum(&root)?;
-        let manifest = CheckpointManifest {
-            version: 1,
-            partition_id: scope.partition_id,
-            epoch: scope.epoch,
-            checkpoint_from_seq: old_to + 1,
-            checkpoint_to_seq: tail,
-            created_at_ns,
-            root,
-            checksum,
-        };
-        manifest.validate_for_scope(scope)?;
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
-        let candidate = format!("cp-{tail}-{}/", &sha256_hex(&manifest_bytes)[..12]);
+        let candidate = checkpoint_candidate_name(created_at_ns)?;
         let directory = self
             .store
             .paths()
@@ -350,26 +280,57 @@ impl CheckpointBuilder {
             )
             .await?;
         let operation = async {
-            for (path, bytes) in &chunks {
-                self.store
-                    .write_bytes(&format!("{directory}/{candidate}{path}"), bytes)
-                    .await?;
+            let mut manifest = self
+                .prepare_candidate_checkpoint(scope, &start, &candidate, created_at_ns, old_to)
+                .await?;
+            let mut chunk_index = checkpoint_chunk_count(&manifest.root);
+            for descriptor in segments
+                .segments
+                .iter()
+                .filter(|descriptor| descriptor.segment_to_seq.is_some_and(|to| to > old_to))
+            {
+                let records = self.provider.read_sealed_segment(scope, descriptor).await?;
+                let records = records
+                    .into_iter()
+                    .filter(|record| record.seq > old_to && record.seq <= tail)
+                    .collect::<Vec<_>>();
+                if records.is_empty() {
+                    continue;
+                }
+                let delta = self.segment_delta(scope, records).await?;
+                self.apply_checkpoint_delta(
+                    scope,
+                    &candidate,
+                    &mut manifest,
+                    &delta,
+                    &mut chunk_index,
+                )
+                .await?;
             }
+            self.prune_checkpoint_tombstones(
+                scope,
+                &candidate,
+                &mut manifest,
+                min_synced,
+                &mut chunk_index,
+            )
+            .await?;
+            manifest.version = 1;
+            manifest.partition_id = scope.partition_id;
+            manifest.epoch = scope.epoch;
+            manifest.checkpoint_from_seq = old_to + 1;
+            manifest.checkpoint_to_seq = tail;
+            manifest.created_at_ns = created_at_ns;
+            manifest.checksum = tree_checksum(&manifest.root)?;
+            manifest.validate_for_scope(scope)?;
+            let manifest_bytes = serde_json::to_vec(&manifest)?;
             self.store
                 .write_bytes(
-                    &format!("{directory}/{candidate}manifest.json"),
+                    &format!("{directory}/{candidate}{MANIFEST_FILE}"),
                     &manifest_bytes,
                 )
                 .await?;
-            let manifest = read_manifest(self.store.as_ref(), scope, &candidate).await?;
-            let verified = read_chunks(self.store.as_ref(), scope, &manifest, &candidate).await?;
-            if tree_checksum(&manifest.root)? != manifest.checksum
-                || verified.iter().any(|state| state.latest_seq.seq > tail)
-            {
-                return Err(Error::Serialization(
-                    "checkpoint candidate verification failed".into(),
-                ));
-            }
+            verify_checkpoint(self.store.as_ref(), scope, &manifest, &candidate, tail).await?;
             let latest = LatestCheckpoint {
                 path: candidate,
                 checkpoint_to_seq: tail,
@@ -380,7 +341,7 @@ impl CheckpointBuilder {
                 .pathlock_manager()
                 .acquire_exact(
                     &pointer_path,
-           self.store.pathlock_manager().default_lock_timeout().max(Duration::from_secs(5)),
+                    self.store.pathlock_manager().default_lock_timeout().max(Duration::from_secs(5)),
                     None,
                 )
                 .await?;
@@ -418,6 +379,391 @@ impl CheckpointBuilder {
             .await
             .map_err(Error::from);
         finish_with_release(operation, release)
+    }
+
+    /// Prepare a candidate checkpoint directory from the latest checkpoint or an empty base.
+    async fn prepare_candidate_checkpoint(
+        &self,
+        scope: &ScopeKey,
+        start: &CheckpointsManifest,
+        candidate: &str,
+        created_at_ns: u64,
+        old_to: u64,
+    ) -> Result<CheckpointManifest> {
+        if let Some(latest) = &start.latest_checkpoint {
+            let manifest = read_manifest(self.store.as_ref(), scope, &latest.path).await?;
+            if manifest.checkpoint_to_seq != latest.checkpoint_to_seq {
+                return Err(Error::Serialization(
+                    "checkpoint pointer sequence mismatch".into(),
+                ));
+            }
+            let manifest = copy_checkpoint_files(
+                self.store.as_ref(),
+                scope,
+                &latest.path,
+                candidate,
+                &manifest,
+            )
+            .await?;
+            return Ok(manifest);
+        }
+
+        let mut chunk_index = 0;
+        let (root, chunks) = encode_states_with_index(scope, Vec::new(), &mut chunk_index)?;
+        let checksum = tree_checksum(&root)?;
+        let manifest = CheckpointManifest {
+            version: 1,
+            partition_id: scope.partition_id,
+            epoch: scope.epoch,
+            checkpoint_from_seq: 1,
+            checkpoint_to_seq: old_to,
+            created_at_ns,
+            root,
+            checksum,
+        };
+        manifest.validate_for_scope(scope)?;
+        write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+        let directory = checkpoint_directory(self.store.as_ref(), scope, candidate)?;
+        self.store
+            .write_bytes(
+                &format!("{directory}/{MANIFEST_FILE}"),
+                &serde_json::to_vec(&manifest)?,
+            )
+            .await?;
+        Ok(manifest)
+    }
+
+    /// Convert one sealed segment into checkpoint path replacements and prefix invalidations.
+    async fn segment_delta(
+        &self,
+        scope: &ScopeKey,
+        records: Vec<SegmentRecord>,
+    ) -> Result<SegmentDelta> {
+        let mut delta = SegmentDelta::default();
+        for record in records {
+            match record.event_type {
+                SegmentEventType::Write | SegmentEventType::Remove => {
+                    let backend_path = self
+                        .store
+                        .paths()
+                        .backend_path(&scope.account_id, &record.path)?;
+                    let deleted = match FS_CTX
+                        .scope(
+                            Arc::new(
+                                FsContextInner::new(&scope.account_id)
+                                    .with_bypass_cache(true)
+                                    .with_auto_pathlock_disabled(),
+                            ),
+                            self.primary.stat(&backend_path),
+                        )
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(Error::NotFound(_)) => Some(true),
+                        Err(error) => return Err(error),
+                    };
+                    delta.exact_paths.insert(record.path.clone());
+                    delta.states.insert(
+                        record.path.clone(),
+                        FileState {
+                            path: record.path,
+                            latest_seq: ScopedSeq {
+                                scope: scope.clone(),
+                                seq: record.seq,
+                            },
+                            deleted,
+                        },
+                    );
+                }
+                SegmentEventType::RemoveTree | SegmentEventType::MoveTree => {
+                    let mut prefixes = vec![record.path.clone()];
+                    if let Some(destination) = record.destination_path {
+                        prefixes.push(destination);
+                    }
+                    for prefix in prefixes {
+                        delta.prefixes.insert(prefix.clone());
+                        delta
+                            .states
+                            .retain(|path, _| !is_path_within(path, &prefix));
+                        for path in self.scan_prefix(scope, &prefix).await? {
+                            delta.states.insert(
+                                path.clone(),
+                                FileState {
+                                    path,
+                                    latest_seq: ScopedSeq {
+                                        scope: scope.clone(),
+                                        seq: record.seq,
+                                    },
+                                    deleted: None,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(delta)
+    }
+
+    /// Apply one segment delta to the candidate manifest by rewriting only needed chunks.
+    async fn apply_checkpoint_delta(
+        &self,
+        scope: &ScopeKey,
+        candidate: &str,
+        manifest: &mut CheckpointManifest,
+        delta: &SegmentDelta,
+        chunk_index: &mut usize,
+    ) -> Result<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        if manifest.root.chunks.is_empty() {
+            self.rewrite_full_checkpoint_chunk(scope, candidate, manifest, delta, chunk_index)
+                .await?;
+        } else {
+            self.rewrite_split_checkpoint_chunks(scope, candidate, manifest, delta, chunk_index)
+                .await?;
+        }
+        manifest.root.validate()?;
+        Ok(())
+    }
+
+    /// Rewrite a checkpoint whose complete state still lives in the root chunk.
+    async fn rewrite_full_checkpoint_chunk(
+        &self,
+        scope: &ScopeKey,
+        candidate: &str,
+        manifest: &mut CheckpointManifest,
+        delta: &SegmentDelta,
+        chunk_index: &mut usize,
+    ) -> Result<()> {
+        let old_root = manifest.root.clone();
+        let directory = checkpoint_directory(self.store.as_ref(), scope, candidate)?;
+        let states =
+            read_checkpoint_chunk_states(self.store.as_ref(), scope, &directory, &old_root, true)
+                .await?;
+        let mut remaining = delta.states.clone();
+        let states = merge_checkpoint_states(states, delta, &mut remaining, ChunkMergeTarget::All);
+        let (root, chunks) = encode_states_with_index(scope, states, chunk_index)?;
+        write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+        manifest.root = root;
+        remove_replaced_checkpoint_files(
+            self.store.as_ref(),
+            scope,
+            candidate,
+            checkpoint_chunk_files(&old_root),
+            &manifest.root,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Rewrite affected child chunks and insert new states not covered by old ranges.
+    async fn rewrite_split_checkpoint_chunks(
+        &self,
+        scope: &ScopeKey,
+        candidate: &str,
+        manifest: &mut CheckpointManifest,
+        delta: &SegmentDelta,
+        chunk_index: &mut usize,
+    ) -> Result<()> {
+        let directory = checkpoint_directory(self.store.as_ref(), scope, candidate)?;
+        let account_root = format!("{MULTIWRITE_MOUNT_PREFIX}/{}", scope.account_id);
+        let mut remaining = delta.states.clone();
+
+        if checkpoint_state_is_dirty(&account_root, delta) || remaining.contains_key(&account_root)
+        {
+            let old_root = manifest.root.clone();
+            let children = std::mem::take(&mut manifest.root.chunks);
+            let states = read_checkpoint_chunk_states(
+                self.store.as_ref(),
+                scope,
+                &directory,
+                &old_root,
+                true,
+            )
+            .await?;
+            let states = merge_checkpoint_states(
+                states,
+                delta,
+                &mut remaining,
+                ChunkMergeTarget::RootOnly(&account_root),
+            );
+            let (mut root, chunks) = encode_states_with_index(scope, states, chunk_index)?;
+            root.chunks = children;
+            write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+            manifest.root = root;
+            remove_replaced_checkpoint_files(
+                self.store.as_ref(),
+                scope,
+                candidate,
+                vec![old_root.file],
+                &manifest.root,
+            )
+            .await;
+        }
+
+        let mut next_children = Vec::new();
+        let children = std::mem::take(&mut manifest.root.chunks);
+        for descriptor in children {
+            if checkpoint_descriptor_is_dirty(&descriptor, delta)? {
+                let old_files = checkpoint_chunk_files(&descriptor);
+                let states = read_checkpoint_chunk_states(
+                    self.store.as_ref(),
+                    scope,
+                    &directory,
+                    &descriptor,
+                    false,
+                )
+                .await?;
+                let (first, last) = checkpoint_descriptor_bounds(&descriptor)?;
+                let states = merge_checkpoint_states(
+                    states,
+                    delta,
+                    &mut remaining,
+                    ChunkMergeTarget::Bounds(first, last),
+                );
+                let (mut descriptors, chunks) =
+                    encode_child_states_with_index(scope, states, chunk_index)?;
+                write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+                let replacement_root = ChunkDescriptor {
+                    file: String::new(),
+                    root_path: account_root.clone(),
+                    first_path: None,
+                    last_path: None,
+                    file_state_count: 0,
+                    checksum: String::new(),
+                    chunks: descriptors.clone(),
+                };
+                remove_replaced_checkpoint_files(
+                    self.store.as_ref(),
+                    scope,
+                    candidate,
+                    old_files,
+                    &replacement_root,
+                )
+                .await;
+                next_children.append(&mut descriptors);
+            } else {
+                next_children.push(descriptor);
+            }
+        }
+
+        let leftover = remaining.into_values().collect::<Vec<_>>();
+        if !leftover.is_empty() {
+            let (mut descriptors, chunks) =
+                encode_child_states_with_index(scope, leftover, chunk_index)?;
+            write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+            next_children.append(&mut descriptors);
+        }
+        sort_checkpoint_children(&mut next_children)?;
+        manifest.root.chunks = next_children;
+        Ok(())
+    }
+
+    /// Remove checkpoint tombstones that no current backend still needs.
+    async fn prune_checkpoint_tombstones(
+        &self,
+        scope: &ScopeKey,
+        candidate: &str,
+        manifest: &mut CheckpointManifest,
+        min_synced: Option<u64>,
+        chunk_index: &mut usize,
+    ) -> Result<()> {
+        if manifest.root.chunks.is_empty() {
+            let old_root = manifest.root.clone();
+            let directory = checkpoint_directory(self.store.as_ref(), scope, candidate)?;
+            let states = read_checkpoint_chunk_states(
+                self.store.as_ref(),
+                scope,
+                &directory,
+                &old_root,
+                true,
+            )
+            .await?;
+            let retained = retain_checkpoint_states(states.clone(), min_synced);
+            if retained != states {
+                let (root, chunks) = encode_states_with_index(scope, retained, chunk_index)?;
+                write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+                manifest.root = root;
+                remove_replaced_checkpoint_files(
+                    self.store.as_ref(),
+                    scope,
+                    candidate,
+                    checkpoint_chunk_files(&old_root),
+                    &manifest.root,
+                )
+                .await;
+            }
+            return Ok(());
+        }
+
+        let directory = checkpoint_directory(self.store.as_ref(), scope, candidate)?;
+        let account_root = format!("{MULTIWRITE_MOUNT_PREFIX}/{}", scope.account_id);
+        let old_root = manifest.root.clone();
+        let children = std::mem::take(&mut manifest.root.chunks);
+        let states =
+            read_checkpoint_chunk_states(self.store.as_ref(), scope, &directory, &old_root, true)
+                .await?;
+        let retained = retain_checkpoint_states(states.clone(), min_synced);
+        if retained != states {
+            let (mut root, chunks) = encode_states_with_index(scope, retained, chunk_index)?;
+            root.chunks = children;
+            write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+            manifest.root = root;
+            remove_replaced_checkpoint_files(
+                self.store.as_ref(),
+                scope,
+                candidate,
+                vec![old_root.file],
+                &manifest.root,
+            )
+            .await;
+        } else {
+            manifest.root.chunks = children;
+        }
+
+        let mut next_children = Vec::new();
+        for descriptor in std::mem::take(&mut manifest.root.chunks) {
+            let old_files = checkpoint_chunk_files(&descriptor);
+            let states = read_checkpoint_chunk_states(
+                self.store.as_ref(),
+                scope,
+                &directory,
+                &descriptor,
+                false,
+            )
+            .await?;
+            let retained = retain_checkpoint_states(states.clone(), min_synced);
+            if retained == states {
+                next_children.push(descriptor);
+                continue;
+            }
+            let (mut descriptors, chunks) =
+                encode_child_states_with_index(scope, retained, chunk_index)?;
+            write_checkpoint_chunks(self.store.as_ref(), scope, candidate, &chunks).await?;
+            let replacement_root = ChunkDescriptor {
+                file: String::new(),
+                root_path: account_root.clone(),
+                first_path: None,
+                last_path: None,
+                file_state_count: 0,
+                checksum: String::new(),
+                chunks: descriptors.clone(),
+            };
+            remove_replaced_checkpoint_files(
+                self.store.as_ref(),
+                scope,
+                candidate,
+                old_files,
+                &replacement_root,
+            )
+            .await;
+            next_children.append(&mut descriptors);
+        }
+        sort_checkpoint_children(&mut next_children)?;
+        manifest.root.chunks = next_children;
+        Ok(())
     }
 
     /// Scan one current primary prefix and retain paths owned by this scope.
@@ -462,7 +808,7 @@ impl CheckpointBuilder {
             .await?;
         let mut selected = Vec::new();
         for path in paths {
-            let logical = format!("/local{path}");
+            let logical = format!("{MULTIWRITE_MOUNT_PREFIX}{path}");
             if !is_multiwrite_internal_path(&logical)
                 && self.router.route(&scope.account_id, &logical).await?.scope == *scope
             {
@@ -565,13 +911,42 @@ impl CheckpointConsumer for CheckpointReader {
     }
 }
 
-/// Encode a deterministic checkpoint tree within the production node limit.
-fn encode_states(
+/// Encode a deterministic checkpoint tree while continuing the caller's chunk index.
+fn encode_states_with_index(
     scope: &ScopeKey,
     mut states: Vec<FileState>,
-    checkpoint_to_seq: u64,
+    index: &mut usize,
 ) -> Result<(ChunkDescriptor, Vec<(String, Vec<u8>)>)> {
-    for state in &states {
+    let (node, root_path) = checkpoint_node_from_states(scope, &mut states)?;
+    encode_checkpoint_tree(node, &root_path, index)
+}
+
+/// Encode states as one or more non-root checkpoint descriptors.
+fn encode_child_states_with_index(
+    scope: &ScopeKey,
+    mut states: Vec<FileState>,
+    index: &mut usize,
+) -> Result<(Vec<ChunkDescriptor>, Vec<(String, Vec<u8>)>)> {
+    if states.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (mut node, root_path) = checkpoint_node_from_states(scope, &mut states)?;
+    let mut files = Vec::new();
+    let mut descriptors = Vec::new();
+    let children = std::mem::take(&mut node.children);
+    if node.latest_seq.is_some() {
+        descriptors.push(encode_node(node, &root_path, false, index, &mut files)?);
+    }
+    partition_children(children, &root_path, index, &mut files, &mut descriptors)?;
+    Ok((descriptors, files))
+}
+
+/// Build the account-relative checkpoint radix tree from sorted file states.
+fn checkpoint_node_from_states(
+    scope: &ScopeKey,
+    states: &mut Vec<FileState>,
+) -> Result<(CheckpointNode, String)> {
+    for state in states.iter() {
         state.validate(scope)?;
     }
     states.sort_by(|left, right| left.path.cmp(&right.path));
@@ -580,14 +955,14 @@ fn encode_states(
             "checkpoint contains duplicate paths".into(),
         ));
     }
-    let root_path = format!("/local/{}", scope.account_id);
+    let root_path = format!("{MULTIWRITE_MOUNT_PREFIX}/{}", scope.account_id);
     let mut node = CheckpointNode {
         path_fragment: String::new(),
         latest_seq: None,
         deleted: None,
         children: Vec::new(),
     };
-    for state in states {
+    for state in states.iter() {
         if !is_canonical_account_path(&state.path, &root_path) {
             return Err(Error::Serialization(
                 "checkpoint path crosses account root".into(),
@@ -597,44 +972,28 @@ fn encode_states(
             .path
             .strip_prefix(&root_path)
             .ok_or_else(|| Error::Serialization("checkpoint path crosses account root".into()))?;
-        insert_state(&mut node, relative, &state)?;
+        insert_state(&mut node, relative, state)?;
     }
-    encode_checkpoint_tree(node, &root_path, checkpoint_to_seq)
+    Ok((node, root_path))
 }
 
 /// Encode one preconstructed radix tree through the production chunk splitter.
 fn encode_checkpoint_tree(
     mut node: CheckpointNode,
     root_path: &str,
-    checkpoint_to_seq: u64,
+    index: &mut usize,
 ) -> Result<(ChunkDescriptor, Vec<(String, Vec<u8>)>)> {
     node.validate()?;
     let mut files = Vec::new();
-    let mut index = 0;
-    let root = if checkpoint_node_count(&node) <= MAX_CHUNK_NODES {
-        encode_node(
-            node,
-            &root_path,
-            checkpoint_to_seq,
-            true,
-            &mut index,
-            &mut files,
-        )?
+    let root = if checkpoint_node_count(&node) <= MAX_CHECKPOINT_NODES {
+        encode_node(node, root_path, true, index, &mut files)?
     } else {
         let children = std::mem::take(&mut node.children);
-        let mut descriptor = encode_node(
-            node,
-            &root_path,
-            checkpoint_to_seq,
-            true,
-            &mut index,
-            &mut files,
-        )?;
+        let mut descriptor = encode_node(node, root_path, true, index, &mut files)?;
         partition_children(
             children,
-            &root_path,
-            checkpoint_to_seq,
-            &mut index,
+            root_path,
+            index,
             &mut files,
             &mut descriptor.chunks,
         )?;
@@ -719,7 +1078,6 @@ fn common_prefix_len(left: &str, right: &str) -> usize {
 fn partition_children(
     children: Vec<CheckpointNode>,
     parent_path: &str,
-    checkpoint_to_seq: u64,
     index: &mut usize,
     files: &mut Vec<(String, Vec<u8>)>,
     descriptors: &mut Vec<ChunkDescriptor>,
@@ -728,69 +1086,33 @@ fn partition_children(
     let mut group_nodes = 1;
     for mut child in children {
         let child_nodes = checkpoint_node_count(&child);
-        if child_nodes + 1 > MAX_CHUNK_NODES {
-            flush_child_group(
-                &mut group,
-                parent_path,
-                checkpoint_to_seq,
-                index,
-                files,
-                descriptors,
-            )?;
+        if child_nodes + 1 > MAX_CHECKPOINT_NODES {
+            flush_child_group(&mut group, parent_path, index, files, descriptors)?;
             let fragment = child.path_fragment.clone();
             let mut grandchildren = std::mem::take(&mut child.children);
             if child.latest_seq.is_some() {
-                descriptors.push(encode_node(
-                    child,
-                    parent_path,
-                    checkpoint_to_seq,
-                    false,
-                    index,
-                    files,
-                )?);
+                descriptors.push(encode_node(child, parent_path, false, index, files)?);
             }
             for grandchild in &mut grandchildren {
                 grandchild.path_fragment.insert_str(0, &fragment);
             }
-            partition_children(
-                grandchildren,
-                parent_path,
-                checkpoint_to_seq,
-                index,
-                files,
-                descriptors,
-            )?;
+            partition_children(grandchildren, parent_path, index, files, descriptors)?;
         } else {
-            if group_nodes + child_nodes > MAX_CHUNK_NODES {
-                flush_child_group(
-                    &mut group,
-                    parent_path,
-                    checkpoint_to_seq,
-                    index,
-                    files,
-                    descriptors,
-                )?;
+            if group_nodes + child_nodes > MAX_CHECKPOINT_NODES {
+                flush_child_group(&mut group, parent_path, index, files, descriptors)?;
                 group_nodes = 1;
             }
             group_nodes += child_nodes;
             group.push(child);
         }
     }
-    flush_child_group(
-        &mut group,
-        parent_path,
-        checkpoint_to_seq,
-        index,
-        files,
-        descriptors,
-    )
+    flush_child_group(&mut group, parent_path, index, files, descriptors)
 }
 
 /// Encode one non-empty direct child range as a synthetic-root chunk.
 fn flush_child_group(
     children: &mut Vec<CheckpointNode>,
     parent_path: &str,
-    checkpoint_to_seq: u64,
     index: &mut usize,
     files: &mut Vec<(String, Vec<u8>)>,
     descriptors: &mut Vec<ChunkDescriptor>,
@@ -804,14 +1126,7 @@ fn flush_child_group(
         deleted: None,
         children: std::mem::take(children),
     };
-    descriptors.push(encode_node(
-        node,
-        parent_path,
-        checkpoint_to_seq,
-        false,
-        index,
-        files,
-    )?);
+    descriptors.push(encode_node(node, parent_path, false, index, files)?);
     Ok(())
 }
 
@@ -819,7 +1134,6 @@ fn flush_child_group(
 fn encode_node(
     node: CheckpointNode,
     root_path: &str,
-    checkpoint_to_seq: u64,
     root: bool,
     index: &mut usize,
     files: &mut Vec<(String, Vec<u8>)>,
@@ -827,7 +1141,7 @@ fn encode_node(
     let (count, first_path, last_path) = checkpoint_node_range(&node, root_path);
     let bytes = encode_checkpoint_chunk(&node)?;
     let checksum = sha256_hex(&bytes);
-    let file = format!("chunk-{checkpoint_to_seq}-{index:06}-{checksum}.ovcp");
+    let file = checkpoint_chunk_file_name(*index, &checksum);
     *index += 1;
     files.push((file.clone(), bytes));
     Ok(ChunkDescriptor {
@@ -896,7 +1210,7 @@ async fn read_manifest(
 ) -> Result<CheckpointManifest> {
     let directory = checkpoint_directory(store, scope, candidate)?;
     let manifest: CheckpointManifest = store
-        .read_json(&format!("{directory}/manifest.json"))
+        .read_json(&format!("{directory}/{MANIFEST_FILE}"))
         .await?;
     manifest.validate_for_scope(scope)?;
     if tree_checksum(&manifest.root)? != manifest.checksum {
@@ -907,6 +1221,342 @@ async fn read_manifest(
     Ok(manifest)
 }
 
+/// Build the second-resolution checkpoint directory name used by new publications.
+fn checkpoint_candidate_name(created_at_ns: u64) -> Result<String> {
+    let seconds = i64::try_from(created_at_ns / 1_000_000_000)
+        .map_err(|_| Error::internal("checkpoint timestamp overflow"))?;
+    let datetime = DateTime::<Utc>::from_timestamp(seconds, 0)
+        .ok_or_else(|| Error::internal("checkpoint timestamp is out of range"))?;
+    Ok(format!(
+        "{CHECKPOINT_DIR_PREFIX}{}/",
+        datetime.format(CHECKPOINT_DIR_TIME_FORMAT)
+    ))
+}
+
+/// Build a checkpoint chunk filename without embedding any sequence number.
+fn checkpoint_chunk_file_name(index: usize, checksum: &str) -> String {
+    format!("{CHECKPOINT_CHUNK_FILE_PREFIX}{index:06}-{checksum}{CHECKPOINT_CHUNK_FILE_EXTENSION}")
+}
+
+/// Rename descriptor file references while recording old-to-new chunk copies.
+fn rename_checkpoint_chunk_files(
+    descriptor: &mut ChunkDescriptor,
+    index: &mut usize,
+    copies: &mut Vec<(String, String, String)>,
+) {
+    let source = descriptor.file.clone();
+    let candidate = checkpoint_chunk_file_name(*index, &descriptor.checksum);
+    *index += 1;
+    descriptor.file = candidate.clone();
+    copies.push((source, candidate, descriptor.checksum.clone()));
+    for child in &mut descriptor.chunks {
+        rename_checkpoint_chunk_files(child, index, copies);
+    }
+}
+
+/// Copy a published checkpoint manifest and referenced chunks into a candidate directory.
+async fn copy_checkpoint_files(
+    store: &MetadataStore,
+    scope: &ScopeKey,
+    source: &str,
+    candidate: &str,
+    manifest: &CheckpointManifest,
+) -> Result<CheckpointManifest> {
+    let source_directory = checkpoint_directory(store, scope, source)?;
+    let candidate_directory = checkpoint_directory(store, scope, candidate)?;
+    let mut candidate_manifest = manifest.clone();
+    let mut copies = Vec::new();
+    let mut index = 0;
+    rename_checkpoint_chunk_files(&mut candidate_manifest.root, &mut index, &mut copies);
+    candidate_manifest.checksum = tree_checksum(&candidate_manifest.root)?;
+    candidate_manifest.validate_for_scope(scope)?;
+    for (source_file, candidate_file, checksum) in copies {
+        let bytes = store
+            .read_bytes(&format!("{source_directory}/{source_file}"))
+            .await?;
+        if sha256_hex(&bytes) != checksum {
+            return Err(Error::Serialization(
+                "checkpoint chunk checksum mismatch".into(),
+            ));
+        }
+        store
+            .write_bytes(&format!("{candidate_directory}/{candidate_file}"), &bytes)
+            .await?;
+    }
+    store
+        .write_bytes(
+            &format!("{candidate_directory}/{MANIFEST_FILE}"),
+            &serde_json::to_vec(&candidate_manifest)?,
+        )
+        .await?;
+    Ok(candidate_manifest)
+}
+
+/// Write checkpoint chunk bytes into one candidate directory.
+async fn write_checkpoint_chunks(
+    store: &MetadataStore,
+    scope: &ScopeKey,
+    candidate: &str,
+    chunks: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let directory = checkpoint_directory(store, scope, candidate)?;
+    for (file, bytes) in chunks {
+        store
+            .write_bytes(&format!("{directory}/{file}"), bytes)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Read and validate one checkpoint chunk without reading its child descriptors.
+async fn read_checkpoint_chunk_states(
+    store: &MetadataStore,
+    scope: &ScopeKey,
+    directory: &str,
+    descriptor: &ChunkDescriptor,
+    root: bool,
+) -> Result<Vec<FileState>> {
+    let account_root = format!("{MULTIWRITE_MOUNT_PREFIX}/{}", scope.account_id);
+    if descriptor.root_path != account_root {
+        return Err(Error::Serialization(
+            "checkpoint descriptor root mismatch".into(),
+        ));
+    }
+    let bytes = store
+        .read_bytes(&format!("{directory}/{}", descriptor.file))
+        .await?;
+    if sha256_hex(&bytes) != descriptor.checksum {
+        return Err(Error::Serialization(
+            "checkpoint chunk checksum mismatch".into(),
+        ));
+    }
+    let node = decode_checkpoint_chunk(&bytes)?;
+    if encode_checkpoint_chunk(&node)? != bytes {
+        return Err(Error::Serialization(
+            "checkpoint chunk is not canonical".into(),
+        ));
+    }
+    let mut states = Vec::new();
+    flatten_node(scope, &node, &descriptor.root_path, true, &mut states)?;
+    if states.len() != descriptor.file_state_count as usize {
+        return Err(Error::Serialization(
+            "checkpoint chunk state count mismatch".into(),
+        ));
+    }
+    if states.windows(2).any(|pair| pair[0].path >= pair[1].path)
+        || states
+            .iter()
+            .any(|state| !is_canonical_account_path(&state.path, &account_root))
+    {
+        return Err(Error::Serialization(
+            "checkpoint chunk paths are invalid or unordered".into(),
+        ));
+    }
+    if !root
+        && (states.first().map(|state| &state.path) != descriptor.first_path.as_ref()
+            || states.last().map(|state| &state.path) != descriptor.last_path.as_ref())
+    {
+        return Err(Error::Serialization(
+            "checkpoint chunk range mismatch".into(),
+        ));
+    }
+    Ok(states)
+}
+
+/// Merge old chunk states with replacement states that belong to one target range.
+fn merge_checkpoint_states(
+    states: Vec<FileState>,
+    delta: &SegmentDelta,
+    remaining: &mut BTreeMap<String, FileState>,
+    target: ChunkMergeTarget<'_>,
+) -> Vec<FileState> {
+    let mut merged = states
+        .into_iter()
+        .filter(|state| !checkpoint_state_is_dirty(&state.path, delta))
+        .map(|state| (state.path.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+    let selected = remaining
+        .keys()
+        .filter(|path| checkpoint_target_contains(&target, path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in selected {
+        if let Some(state) = remaining.remove(&path) {
+            merged.insert(path, state);
+        }
+    }
+    merged.into_values().collect()
+}
+
+/// Return whether one merge target owns a logical checkpoint path.
+fn checkpoint_target_contains(target: &ChunkMergeTarget<'_>, path: &str) -> bool {
+    match target {
+        ChunkMergeTarget::All => true,
+        ChunkMergeTarget::Bounds(first, last) => *first <= path && path <= *last,
+        ChunkMergeTarget::RootOnly(root) => path == *root,
+    }
+}
+
+/// Return whether a checkpoint state path is replaced or invalidated by a delta.
+fn checkpoint_state_is_dirty(path: &str, delta: &SegmentDelta) -> bool {
+    delta.exact_paths.contains(path)
+        || delta
+            .prefixes
+            .iter()
+            .any(|prefix| is_path_within(path, prefix))
+}
+
+/// Return whether a non-root chunk range intersects one segment delta.
+fn checkpoint_descriptor_is_dirty(
+    descriptor: &ChunkDescriptor,
+    delta: &SegmentDelta,
+) -> Result<bool> {
+    let (first, last) = checkpoint_descriptor_bounds(descriptor)?;
+    Ok(delta
+        .exact_paths
+        .iter()
+        .any(|path| first <= path.as_str() && path.as_str() <= last)
+        || delta
+            .states
+            .keys()
+            .any(|path| first <= path.as_str() && path.as_str() <= last)
+        || delta
+            .prefixes
+            .iter()
+            .any(|prefix| checkpoint_range_overlaps_prefix(first, last, prefix)))
+}
+
+/// Return the validated first and last logical path for a non-root descriptor.
+fn checkpoint_descriptor_bounds(descriptor: &ChunkDescriptor) -> Result<(&str, &str)> {
+    let first = descriptor
+        .first_path
+        .as_deref()
+        .ok_or_else(|| Error::Serialization("checkpoint child chunk lacks first path".into()))?;
+    let last = descriptor
+        .last_path
+        .as_deref()
+        .ok_or_else(|| Error::Serialization("checkpoint child chunk lacks last path".into()))?;
+    Ok((first, last))
+}
+
+/// Return whether one sorted chunk range can contain paths under a dirty prefix.
+fn checkpoint_range_overlaps_prefix(first: &str, last: &str, prefix: &str) -> bool {
+    is_path_within(first, prefix)
+        || is_path_within(last, prefix)
+        || (first <= prefix && prefix <= last)
+}
+
+/// Sort child descriptors and reject overlapping path ranges.
+fn sort_checkpoint_children(children: &mut Vec<ChunkDescriptor>) -> Result<()> {
+    children.sort_by(|left, right| left.first_path.cmp(&right.first_path));
+    let mut previous_last = None;
+    for child in children {
+        let (first, last) = checkpoint_descriptor_bounds(child)?;
+        if previous_last.is_some_and(|previous| previous >= first) {
+            return Err(Error::Serialization(
+                "chunk ranges overlap or are unordered".into(),
+            ));
+        }
+        previous_last = Some(last);
+    }
+    Ok(())
+}
+
+/// Retain live states and tombstones still needed by at least one backend.
+fn retain_checkpoint_states(states: Vec<FileState>, min_synced: Option<u64>) -> Vec<FileState> {
+    states
+        .into_iter()
+        .filter(|state| {
+            state.deleted.is_none()
+                || min_synced.is_some_and(|synced| state.latest_seq.seq >= synced)
+        })
+        .collect()
+}
+
+/// Return every chunk descriptor reachable from a root descriptor.
+fn checkpoint_chunk_descriptors(root: &ChunkDescriptor) -> Vec<&ChunkDescriptor> {
+    let mut descriptors = Vec::new();
+    let mut stack = vec![root];
+    while let Some(descriptor) = stack.pop() {
+        descriptors.push(descriptor);
+        stack.extend(descriptor.chunks.iter());
+    }
+    descriptors
+}
+
+/// Return every non-empty chunk filename reachable from one descriptor tree.
+fn checkpoint_chunk_files(root: &ChunkDescriptor) -> Vec<String> {
+    checkpoint_chunk_descriptors(root)
+        .into_iter()
+        .filter_map(|descriptor| (!descriptor.file.is_empty()).then(|| descriptor.file.clone()))
+        .collect()
+}
+
+/// Count chunk files already referenced by one descriptor tree.
+fn checkpoint_chunk_count(root: &ChunkDescriptor) -> usize {
+    checkpoint_chunk_files(root).len()
+}
+
+/// Best-effort delete candidate chunk files no longer referenced after a rewrite.
+async fn remove_replaced_checkpoint_files(
+    store: &MetadataStore,
+    scope: &ScopeKey,
+    candidate: &str,
+    old_files: Vec<String>,
+    new_root: &ChunkDescriptor,
+) {
+    let Ok(directory) = checkpoint_directory(store, scope, candidate) else {
+        return;
+    };
+    let retained = checkpoint_chunk_files(new_root)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for file in old_files {
+        if retained.contains(&file) {
+            continue;
+        }
+        if let Err(error) = store.remove_file(&format!("{directory}/{file}")).await {
+            warn!(file = %file, error = %error, "checkpoint chunk cleanup failed");
+        }
+    }
+}
+
+/// Stream-validate a candidate checkpoint without materializing all file states.
+async fn verify_checkpoint(
+    store: &MetadataStore,
+    scope: &ScopeKey,
+    manifest: &CheckpointManifest,
+    candidate: &str,
+    tail: u64,
+) -> Result<()> {
+    if tree_checksum(&manifest.root)? != manifest.checksum {
+        return Err(Error::Serialization(
+            "checkpoint tree checksum mismatch".into(),
+        ));
+    }
+    let directory = checkpoint_directory(store, scope, candidate)?;
+    let mut descriptors = vec![(&manifest.root, true)];
+    let mut previous_path: Option<String> = None;
+    while let Some((descriptor, root)) = descriptors.pop() {
+        let states =
+            read_checkpoint_chunk_states(store, scope, &directory, descriptor, root).await?;
+        for state in states {
+            if state.latest_seq.seq > tail
+                || previous_path
+                    .as_ref()
+                    .is_some_and(|previous| previous >= &state.path)
+            {
+                return Err(Error::Serialization(
+                    "checkpoint candidate verification failed".into(),
+                ));
+            }
+            previous_path = Some(state.path);
+        }
+        descriptors.extend(descriptor.chunks.iter().rev().map(|child| (child, false)));
+    }
+    Ok(())
+}
+
 /// Read every referenced chunk and reconstruct sorted file states.
 async fn read_chunks(
     store: &MetadataStore,
@@ -915,56 +1565,12 @@ async fn read_chunks(
     candidate: &str,
 ) -> Result<Vec<FileState>> {
     let directory = checkpoint_directory(store, scope, candidate)?;
-    let account_root = format!("/local/{}", scope.account_id);
     let mut descriptors = vec![(&manifest.root, true)];
     let mut states = Vec::new();
     while let Some((descriptor, root)) = descriptors.pop() {
-        if descriptor.root_path != account_root {
-            return Err(Error::Serialization(
-                "checkpoint descriptor root mismatch".into(),
-            ));
-        }
-        let bytes = store
-            .read_bytes(&format!("{directory}/{}", descriptor.file))
-            .await?;
-        if sha256_hex(&bytes) != descriptor.checksum {
-            return Err(Error::Serialization(
-                "checkpoint chunk checksum mismatch".into(),
-            ));
-        }
-        let node = decode_checkpoint_chunk(&bytes)?;
-        if encode_checkpoint_chunk(&node)? != bytes {
-            return Err(Error::Serialization(
-                "checkpoint chunk is not canonical".into(),
-            ));
-        }
-        let mut chunk_states = Vec::new();
-        flatten_node(scope, &node, &descriptor.root_path, true, &mut chunk_states)?;
-        if chunk_states.len() != descriptor.file_state_count as usize {
-            return Err(Error::Serialization(
-                "checkpoint chunk state count mismatch".into(),
-            ));
-        }
-        if chunk_states
-            .windows(2)
-            .any(|pair| pair[0].path >= pair[1].path)
-            || chunk_states
-                .iter()
-                .any(|state| !is_canonical_account_path(&state.path, &account_root))
-        {
-            return Err(Error::Serialization(
-                "checkpoint chunk paths are invalid or unordered".into(),
-            ));
-        }
-        if !root
-            && (chunk_states.first().map(|state| &state.path) != descriptor.first_path.as_ref()
-                || chunk_states.last().map(|state| &state.path) != descriptor.last_path.as_ref())
-        {
-            return Err(Error::Serialization(
-                "checkpoint chunk range mismatch".into(),
-            ));
-        }
-        states.extend(chunk_states);
+        states.extend(
+            read_checkpoint_chunk_states(store, scope, &directory, descriptor, root).await?,
+        );
         descriptors.extend(descriptor.chunks.iter().rev().map(|child| (child, false)));
     }
     if states.windows(2).any(|pair| pair[0].path >= pair[1].path) {

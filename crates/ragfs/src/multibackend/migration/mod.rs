@@ -8,6 +8,7 @@ use crate::core::context::{FsContextInner, FS_CTX};
 use crate::core::errors::{Error, Result};
 use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_multiwrite_internal_path;
+use crate::multibackend::constants::MULTIWRITE_MOUNT_PREFIX;
 use crate::multibackend::meta::MetadataStore;
 use crate::multibackend::model::{
     PendingEvent, PendingEventKind, ProtocolState, ProtocolStatus, ProtocolVersion,
@@ -146,7 +147,7 @@ impl FullDataImporter {
             entries.sort_by(|left, right| left.name.cmp(&right.name));
             for entry in entries {
                 let path = child_path(&directory, &entry.name);
-                let logical_path = format!("/local{path}");
+                let logical_path = format!("{MULTIWRITE_MOUNT_PREFIX}{path}");
                 if is_multiwrite_internal_path(&logical_path) {
                     continue;
                 }

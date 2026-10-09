@@ -15,6 +15,7 @@ use crate::core::filesystem::FileSystem;
 use crate::multibackend::catch_up::{CatchUpTarget, CatchUpWorker};
 use crate::multibackend::checkpoint::{CheckpointReader, CheckpointWorker};
 use crate::multibackend::codec::{decode_segment, sha256_hex};
+use crate::multibackend::constants::{DEFAULT_CHECKPOINT_INTERVAL_SECS, SYSTEM_DIR};
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
 use crate::multibackend::model::{
     DirectoryEvent, DirectoryOperation, MarkerPosition, PartitionContext, PartitionState,
@@ -26,7 +27,7 @@ use crate::multibackend::router::AccountRouter;
 /// Read active account ids from the encrypted or plain primary registry.
 pub(crate) async fn read_active_accounts(primary: &dyn FileSystem) -> Result<HashSet<String>> {
     let context = Arc::new(
-        FsContextInner::new("_system")
+        FsContextInner::new(SYSTEM_DIR)
             .with_bypass_cache(true)
             .with_auto_pathlock_disabled(),
     );
@@ -81,7 +82,7 @@ impl MultiWriteRuntime {
             backup_names,
             None,
             Vec::new(),
-            Duration::from_secs(86_400),
+            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
         )
         .await;
         runtime.activate();
@@ -104,7 +105,7 @@ impl MultiWriteRuntime {
             backup_names,
             primary,
             targets,
-            Duration::from_secs(86_400),
+            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
         )
         .await
     }

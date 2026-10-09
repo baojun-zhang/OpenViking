@@ -8,6 +8,8 @@ pub mod checkpoint;
 pub mod codec;
 /// Multi-backend config validation and normalization helpers.
 pub mod config;
+/// Shared constants for V2 multi-write metadata.
+pub(crate) mod constants;
 /// Multi-backend runtime assembly from validated config.
 pub mod factory;
 /// Metadata garbage collection.

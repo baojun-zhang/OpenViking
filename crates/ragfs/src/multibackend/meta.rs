@@ -11,9 +11,10 @@ use crate::core::errors::{Error, Result};
 use crate::core::filesystem::FileSystem;
 use crate::core::types::{FileInfo, WriteFlag};
 use crate::lock::PathLockManager;
+use crate::multibackend::constants::{MULTIWRITE_MOUNT_PREFIX, SYSTEM_DIR, VBUCKETS};
 use crate::multibackend::model::{
     BackendState, CheckpointsManifest, PartitionEntry, PartitionManifest, PartitionState,
-    PartitionsManifest, ProtocolState, ProtocolStatus, ScopeKey, SegmentManifest, VBUCKETS,
+    PartitionsManifest, ProtocolState, ProtocolStatus, ScopeKey, SegmentManifest,
 };
 use crate::multibackend::router::{build_initial_routes, MultiWritePaths};
 
@@ -33,7 +34,7 @@ impl FsContextResolver for DefaultFsContextResolver {
     fn resolve(&self, path: &str) -> Result<FsContext> {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         // Path format: /local/{account_id}/...
-        if parts.len() >= 2 && parts[0] == "local" && !parts[1].is_empty() {
+        if parts.len() >= 2 && parts[0] == MULTIWRITE_MOUNT_PREFIX.trim_start_matches('/') && !parts[1].is_empty(){
             Ok(Arc::new(FsContextInner::new(parts[1].to_string())))
         } else {
             Err(Error::internal(format!(
@@ -111,7 +112,7 @@ impl MetadataStore {
     pub(crate) async fn initialized_accounts(&self) -> Result<Vec<String>> {
         let mut accounts = Vec::new();
         for entry in self.primary.read_internal_dir("/").await? {
-            if !entry.is_dir || entry.name == "_system" {
+            if !entry.is_dir || entry.name == SYSTEM_DIR {
                 continue;
             }
             let manifest = self.paths.account_manifest(&entry.name)?.1;
@@ -129,7 +130,7 @@ impl MetadataStore {
     pub(crate) async fn account_exists(&self, account_id: &str) -> Result<bool> {
         let root = self
             .paths
-            .raw_backend_path(&format!("/local/{account_id}"))?;
+            .raw_backend_path(&format!("{MULTIWRITE_MOUNT_PREFIX}/{account_id}"))?;
         match self.primary.stat(&root).await {
             Ok(_) => Ok(true),
             Err(Error::NotFound(_)) => Ok(false),
@@ -145,7 +146,7 @@ impl MetadataStore {
     /// Build the filesystem context used for one logical metadata path.
     fn metadata_context(&self, logical_path: &str) -> Result<FsContext> {
         let parts: Vec<&str> = logical_path.trim_start_matches('/').split('/').collect();
-        if parts.len() >= 2 && parts[0] == "local" && !parts[1].is_empty() {
+        if parts.len() >= 2 && parts[0] == MULTIWRITE_MOUNT_PREFIX.trim_start_matches('/') && !parts[1].is_empty(){
             return Ok(Arc::new(
                 FsContextInner::new(parts[1].to_string())
                     .with_bypass_cache(true)

@@ -5,13 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::errors::{Error, Result};
+use crate::multibackend::constants::{CHECKPOINT_CHUNK_FILE_EXTENSION, MANIFEST_FILE, SEGMENT_FILE_EXTENSION,};
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
-use crate::multibackend::model::{CheckpointsManifest, DirectoryEvent, LatestCheckpoint,
-    PartitionState, PartitionsManifest, ProtocolStatus, ScopeKey, SegmentManifest,
-    is_checkpoint_directory_name};
+use crate::multibackend::model::{is_checkpoint_directory_name, CheckpointsManifest, DirectoryEvent, LatestCheckpoint,PartitionState, PartitionsManifest, ProtocolStatus, ScopeKey, SegmentManifest,};
 use crate::multibackend::provider::MultiWriteProvider;
 
-struct ScopeSnapshot { latest: Option<LatestCheckpoint>, segments: SegmentManifest }
+struct ScopeSnapshot { latest: Option<LatestCheckpoint>, segments: SegmentManifest}
 
 /// Collects obsolete segment and checkpoint metadata after publication.
 pub struct MetadataGc {
@@ -52,8 +51,8 @@ impl MetadataGc {
             return Ok(());
         }
         let stable = stable_partitions(&account);
-        let positions_complete = directory_positions_complete(
-            &account.directory_events, &stable, account.epoch);
+        let positions_complete =
+            directory_positions_complete(&account.directory_events, &stable, account.epoch);
         let retained = if positions_complete {
             self.collect_completed_events(&scope.account_id, &account, &stable).await?
         } else {
@@ -62,8 +61,8 @@ impl MetadataGc {
         let Some(retained) = retained else {
             return Ok(());
         };
-        let allow_segments = positions_complete
-            && directory_positions_complete(&retained, &stable, account.epoch);
+        let allow_segments =
+            positions_complete && directory_positions_complete(&retained, &stable, account.epoch);
         let latest = self.read_latest(scope).await?;
         if allow_segments {
             self.collect_segments(scope, latest.as_ref(), &retained).await?;
@@ -148,7 +147,7 @@ impl MetadataGc {
         let directory = self.store.paths().segments_dir(
             &scope.account_id, scope.partition_id)?.0;
         for entry in self.store.list_directory(&directory).await? {
-            if !entry.is_dir && entry.name.ends_with(".ovsg") {
+            if !entry.is_dir && entry.name.ends_with(SEGMENT_FILE_EXTENSION) {
                 self.remove_segment(scope, &entry.name).await?;
             }
         }
@@ -201,9 +200,9 @@ impl MetadataGc {
                     Err(Error::NotFound(_)) => return Ok(()),
                     Err(error) => return Err(error),
                 };
-                self.store.remove_file(&format!("{candidate}/manifest.json")).await?;
+                self.store.remove_file(&format!("{candidate}/{MANIFEST_FILE}")).await?;
                 for file in files {
-                    if !file.is_dir && file.name.ends_with(".ovcp") {
+                    if !file.is_dir && file.name.ends_with(CHECKPOINT_CHUNK_FILE_EXTENSION) {
                         self.store.remove_file(&format!("{candidate}/{}", file.name)).await?;
                     }
                 }

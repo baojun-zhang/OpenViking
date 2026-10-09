@@ -51,6 +51,13 @@ pub trait MultiWriteProvider: Send + Sync {
         to_seq_exclusive: u64,
     ) -> Result<Vec<SegmentRecord>>;
 
+    /// Reads one immutable sealed segment named by a validated descriptor.
+    async fn read_sealed_segment(
+        &self,
+        scope: &ScopeKey,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<Vec<SegmentRecord>>;
+
     /// Returns the current segment state for one scope.
     async fn read_manifest(&self, scope: &ScopeKey) -> Result<SegmentManifest>;
 

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::core::errors::{Error, Result};
+use crate::multibackend::constants::{MAX_CHECKPOINT_NODES, MAX_SEGMENT_RECORDS};
 use crate::multibackend::model::{CheckpointNode, DecodedSegment, SegmentEventType, SegmentRecord};
 
 const SEGMENT_MAGIC: &[u8; 4] = b"OVSG";
@@ -12,8 +13,6 @@ const FORMAT_VERSION: u16 = 1;
 const MAX_STRING_LEN: usize = 1024 * 1024;
 const MIN_RECORD_LEN: usize = 14;
 const MAX_RECORD_LEN: usize = 2 * 1024 * 1024;
-const MAX_SEGMENT_RECORDS: usize = 8192;
-const MAX_CHECKPOINT_NODES: usize = 500_000;
 const MAX_CHECKPOINT_DEPTH: usize = 256;
 
 /// Encode segment records in the stable OVSG binary format.
