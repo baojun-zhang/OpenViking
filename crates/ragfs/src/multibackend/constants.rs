@@ -32,15 +32,9 @@ pub(crate) const CHECKPOINT_CHUNK_FILE_EXTENSION: &str = ".ovcp";
 
 /// Total number of fixed routing buckets.
 pub const VBUCKETS: u32 = 65_536;
-/// Maximum supported partition count.
-pub const MAX_PARTITIONS: u32 = 1_024;
-/// Maximum exact metadata sequence value.
-pub const MAX_EXACT_SEQUENCE: u64 = 999_999_999_999;
 /// Maximum records allowed in one segment.
 pub(crate) const MAX_SEGMENT_RECORDS: usize = 8_192;
 /// Maximum file states allowed in one checkpoint chunk.
 pub(crate) const MAX_CHECKPOINT_NODES: usize = 500_000;
-/// Minimum checkpoint interval accepted by config.
-pub(crate) const MIN_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 /// Default checkpoint interval used by runtime helpers.
 pub(crate) const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 86_400;

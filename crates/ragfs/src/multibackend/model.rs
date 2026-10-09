@@ -1,13 +1,16 @@
 //! V2 multi-write persistence and in-memory data models.
 #![allow(missing_docs)]
 use crate::core::errors::{Error, Result};
-use crate::multibackend::constants::{CHECKPOINT_DIR_PREFIX, HEAD_SEGMENT_FILE_PREFIX, MAX_CHECKPOINT_NODES, MAX_SEGMENT_RECORDS,SEALED_SEGMENT_FILE_PREFIX, SEGMENT_FILE_EXTENSION,};
+use crate::multibackend::constants::{
+    CHECKPOINT_DIR_PREFIX, HEAD_SEGMENT_FILE_PREFIX, MAX_CHECKPOINT_NODES, MAX_SEGMENT_RECORDS,
+    SEALED_SEGMENT_FILE_PREFIX, SEGMENT_FILE_EXTENSION,
+};
 use crate::multibackend::router::validate_routes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 macro_rules! ensure { ($condition:expr, $($arg:tt)*) => { if !$condition { return Err(Error::Serialization(format!($($arg)*))); } }; }
-pub use crate::multibackend::constants::{MAX_EXACT_SEQUENCE, MAX_PARTITIONS, VBUCKETS};
+pub use crate::multibackend::constants::VBUCKETS;
 const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -330,20 +333,14 @@ impl ScopedSeq {
     /// Validate a scoped sequence value.
     pub fn validate(&self) -> Result<()> {
         self.scope.validate()?;
-        ensure!(
-            self.seq > 0 && self.seq < MAX_EXACT_SEQUENCE,
-            "scoped sequence exceeds the exact protocol range"
-        );
+        ensure!(self.seq > 0, "scoped sequence must be positive");
         Ok(())
     }
 }
 impl SegmentRecord {
     /// Validate a persisted segment record.
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.seq > 0 && self.seq < MAX_EXACT_SEQUENCE,
-            "record sequence exceeds the exact protocol range"
-        );
+        ensure!(self.seq > 0, "record sequence must be positive");
         validate_path(&self.path)?;
         match self.event_type {
             SegmentEventType::MoveTree => {
@@ -371,10 +368,7 @@ impl SegmentManifest {
     /// Validate segment continuity and backend progress.
     pub fn validate(&self) -> Result<()> {
         validate_version("segment manifest", self.version)?;
-        ensure!(
-            self.next_seq > 0 && self.next_seq <= MAX_EXACT_SEQUENCE,
-            "next sequence exceeds the exact protocol range"
-        );
+        ensure!(self.next_seq > 0, "next sequence must be positive");
         let (mut next, mut paths) = (None, HashSet::new());
         for (index, segment) in self.segments.iter().enumerate() {
             segment.validate()?;
@@ -389,6 +383,7 @@ impl SegmentManifest {
             next = segment
                 .segment_from_seq
                 .checked_add(u64::from(segment.record_count));
+            ensure!(next.is_some(), "segment sequence overflow");
         }
         if let Some(expected) = next {
             ensure!(
@@ -407,20 +402,19 @@ impl SegmentDescriptor {
     /// Validate one segment summary.
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !self.path.is_empty()
-                && self.segment_from_seq > 0
-                && self.segment_from_seq < MAX_EXACT_SEQUENCE,
+            !self.path.is_empty() && self.segment_from_seq > 0,
             "invalid segment identity"
         );
         ensure!(self.byte_len >= 6, "segment byte length is too small");
         match self.segment_to_seq {
             Some(to) => {
+                ensure!(to >= self.segment_from_seq, "segment range is invalid");
                 ensure!(
-                    to >= self.segment_from_seq && to < MAX_EXACT_SEQUENCE,
-                    "segment range is invalid"
-                );
-                ensure!(
-                    self.path == format!("{SEALED_SEGMENT_FILE_PREFIX}{:020}-{to:020}{SEGMENT_FILE_EXTENSION}", self.segment_from_seq),
+                    self.path
+                        == format!(
+                            "{SEALED_SEGMENT_FILE_PREFIX}{:020}-{to:020}{SEGMENT_FILE_EXTENSION}",
+                            self.segment_from_seq
+                        ),
                     "sealed segment path does not match range"
                 );
                 ensure!(
@@ -437,7 +431,11 @@ impl SegmentDescriptor {
             }
             None => {
                 ensure!(
-                    self.path == format!("{HEAD_SEGMENT_FILE_PREFIX}{:020}{SEGMENT_FILE_EXTENSION}", self.segment_from_seq),
+                    self.path
+                        == format!(
+                            "{HEAD_SEGMENT_FILE_PREFIX}{:020}{SEGMENT_FILE_EXTENSION}",
+                            self.segment_from_seq
+                        ),
                     "head segment path does not match start sequence"
                 );
                 ensure!(self.checksum.is_none(), "head segment has a checksum");

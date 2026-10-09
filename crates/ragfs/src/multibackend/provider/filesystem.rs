@@ -9,7 +9,10 @@ use crate::core::errors::{Error, Result};
 use crate::core::internal_names::is_multiwrite_internal_path;
 use crate::lock::{OwnedPathLockLease, PathLockKind, PathLockRequest};
 use crate::multibackend::codec::{decode_segment, encode_segment, sha256_hex};
-use crate::multibackend::constants::{HEAD_SEGMENT_FILE_PREFIX, MAX_EXACT_SEQUENCE, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,SEGMENT_FILE_EXTENSION,};
+use crate::multibackend::constants::{
+    HEAD_SEGMENT_FILE_PREFIX, MAX_SEGMENT_RECORDS, SEALED_SEGMENT_FILE_PREFIX,
+    SEGMENT_FILE_EXTENSION,
+};
 use crate::multibackend::meta::MetadataStore;
 use crate::multibackend::model::{
     FlushResult, MarkerPosition, PartitionContext, PartitionsManifest, PendingEvent,
@@ -152,13 +155,8 @@ impl FilesystemProvider {
         paths.insert(self.store.paths().account_manifest(&scope.account_id)?.0);
         let mut remaining = event_count;
         let mut next_seq = manifest.next_seq;
-        if next_seq
-            .checked_add(event_count as u64)
-            .is_none_or(|next| next > MAX_EXACT_SEQUENCE)
-        {
-            return Err(Error::invalid_operation(
-                "multi-write sequence limit reached",
-            ));
+        if next_seq.checked_add(event_count as u64).is_none() {
+            return Err(Error::invalid_operation("multi-write sequence overflow"));
         }
         let mut count = 0;
         let mut segment_from_seq = next_seq;
