@@ -51,6 +51,7 @@ pub(crate) struct Inner {
 }
 
 /// Filesystem wrapper that commits primary operations before queuing V2 events.
+#[derive(Clone)]
 pub struct MultiWriteWrappedFS {
     pub(crate) inner: Arc<Inner>,
     metadata_store: Arc<MetadataStore>,
@@ -146,15 +147,6 @@ impl MultiWriteWrappedFSBuilder {
         let protocol = ProtocolDetector::new(metadata_store.clone())
             .detect()
             .await?;
-        let importer = (protocol.status == ProtocolStatus::Migrating).then(|| {
-            FullDataImporter::new(
-                self.primary_backend.clone(),
-                metadata_store.clone(),
-                metadata_provider.clone(),
-                self.initial_partitions,
-                backup_names.clone(),
-            )
-        });
         let configured_backups = backup_names.iter().collect::<BTreeSet<_>>();
         for account in read_active_accounts(self.primary_backend.as_ref()).await? {
             let path = metadata_store.paths().account_manifest(&account)?.0;
@@ -189,14 +181,37 @@ impl MultiWriteWrappedFSBuilder {
             metadata_store.clone(),
             metadata_provider.clone(),
             self.initial_partitions,
-            backup_names,
+            backup_names.clone(),
             Some(self.primary_backend.clone()),
             catch_up_targets,
             self.checkpoint_interval,
         )
         .await;
-        if let Some(importer) = importer {
-            runtime.set_import_worker(async move {
+        let primary = BackendEntry {
+            name: "primary".to_string(),
+            role: BackendRole::Primary,
+            backend: self.primary_backend,
+            raw_backend: self.primary_raw_backend,
+        };
+        let fs = MultiWriteWrappedFS {
+            inner: Arc::new(Inner {
+                primary,
+                runtime,
+                ctx_resolver: self.ctx_resolver,
+            }),
+            metadata_store: metadata_store.clone(),
+            metadata_provider: metadata_provider.clone(),
+        };
+        if protocol.status != ProtocolStatus::Stable {
+            let importer_primary: Arc<dyn FileSystem> = Arc::new(fs.clone());
+            let importer = FullDataImporter::new(
+                importer_primary,
+                metadata_store,
+                metadata_provider,
+                self.initial_partitions,
+                backup_names,
+            );
+            fs.inner.runtime.set_import_worker(async move {
                 let result = importer.run().await;
                 if let Err(error) = &result {
                     tracing::error!(error = %error, "multi-write full-data import failed");
@@ -204,21 +219,7 @@ impl MultiWriteWrappedFSBuilder {
                 result
             });
         }
-        let primary = BackendEntry {
-            name: "primary".to_string(),
-            role: BackendRole::Primary,
-            backend: self.primary_backend,
-            raw_backend: self.primary_raw_backend,
-        };
-        Ok(MultiWriteWrappedFS {
-            inner: Arc::new(Inner {
-                primary,
-                runtime,
-                ctx_resolver: self.ctx_resolver,
-            }),
-            metadata_store,
-            metadata_provider,
-        })
+        Ok(fs)
     }
 }
 

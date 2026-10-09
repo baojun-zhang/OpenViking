@@ -94,27 +94,28 @@ impl FullDataImporter {
             .into_iter()
             .collect::<Vec<_>>();
         accounts.sort();
-        for account in accounts {
+        for account in &accounts {
             if !read_active_accounts(self.primary.as_ref())
                 .await?
-                .contains(&account)
+                .contains(account)
             {
                 continue;
             }
             let partitions = self
                 .store
-                .initialize_account(&account, self.initial_partitions, &self.backup_names)
+                .initialize_account(account, self.initial_partitions, &self.backup_names)
                 .await?;
             bootstrap_account(
                 self.provider.as_ref(),
                 self.store.as_ref(),
-                &account,
+                account,
                 &partitions,
             )
             .await?;
-            let context = Arc::new(FsContextInner::new(&account).with_auto_pathlock_disabled());
-            FS_CTX.scope(context, self.import_account(&account)).await?;
+            let context = Arc::new(FsContextInner::new(account).with_auto_pathlock_disabled());
+            FS_CTX.scope(context, self.import_account(account)).await?;
         }
+        self.cleanup_v1_metadata().await?;
 
         let stable_bytes = serde_json::to_vec(&ProtocolState {
             protocol_version: ProtocolVersion::V2,
@@ -171,6 +172,39 @@ impl FullDataImporter {
             }
         }
         Ok(())
+    }
+
+    /// Remove V1 metadata through the configured primary filesystem.
+    /// Returns an error when scanning or primary removal fails.
+    async fn cleanup_v1_metadata(&self) -> Result<()> {
+        match self.primary.stat("/_system/.multiwrite.global.json").await {
+            Ok(_) => {}
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+
+        let page = self
+            .primary
+            .glob_directory("/", "**/.sync_log.json", true, None, None, None)
+            .await?;
+        for entry in page.entries {
+            if entry.is_dir {
+                continue;
+            }
+            match self.primary.remove(&entry.path).await {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        match self
+            .primary
+            .remove("/_system/.multiwrite.global.json")
+            .await
+        {
+            Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
