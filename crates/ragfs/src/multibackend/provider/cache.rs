@@ -331,26 +331,12 @@ pub struct CacheProvider {
     store: Arc<MetadataStore>,
     router: AccountRouter,
     runtime: Arc<CacheRuntime>,
-    #[cfg(test)]
-    seal_delay: std::time::Duration,
 }
 
 impl CacheProvider {
     /// Creates a cache-backed metadata provider.
     pub fn new(store: Arc<MetadataStore>, runtime: Arc<CacheRuntime>) -> Result<Self> {
         Self::build(store, runtime)
-    }
-
-    /// Creates a runtime provider with a controlled test-only seal delay.
-    #[cfg(test)]
-    pub(crate) fn new_with_seal_delay(
-        store: Arc<MetadataStore>,
-        runtime: Arc<CacheRuntime>,
-        seal_delay: std::time::Duration,
-    ) -> Result<Self> {
-        let mut provider = Self::build(store, runtime)?;
-        provider.seal_delay = seal_delay;
-        Ok(provider)
     }
 
     /// Validates runtime capabilities and registers stable provider scripts.
@@ -373,8 +359,6 @@ impl CacheProvider {
             router: AccountRouter::new(store.clone()),
             store,
             runtime,
-            #[cfg(test)]
-            seal_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -944,10 +928,6 @@ impl CacheProvider {
         if records.is_empty() {
             return Ok(None);
         }
-        #[cfg(test)]
-        if !self.seal_delay.is_zero() {
-            tokio::time::sleep(self.seal_delay).await;
-        }
         let directory = self
             .store
             .paths()
@@ -1118,7 +1098,9 @@ impl CacheProvider {
     fn string_value<'a>(values: &'a [ScriptValue], index: usize, field: &str) -> Result<&'a str> {
         match values.get(index) {
             Some(ScriptValue::Bytes(value)) => std::str::from_utf8(value).map_err(|error| {
-                Error::Serialization(format!("Cache-backed multi-write {field} is not UTF-8: {error}"))
+                Error::Serialization(format!(
+                    "Cache-backed multi-write {field} is not UTF-8: {error}"
+                ))
             }),
             other => Err(Error::Serialization(format!(
                 "Cache-backed multi-write {field} has invalid type: {other:?}"
@@ -1136,7 +1118,9 @@ impl CacheProvider {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .ok_or_else(|| {
-                    Error::Serialization(format!("Cache-backed multi-write {field} is not an integer"))
+                    Error::Serialization(format!(
+                        "Cache-backed multi-write {field} is not an integer"
+                    ))
                 }),
             other => Err(Error::Serialization(format!(
                 "Cache-backed multi-write {field} has invalid type: {other:?}"
@@ -1146,14 +1130,16 @@ impl CacheProvider {
 
     /// Reads one script integer as u32.
     fn u32_value(values: &[ScriptValue], index: usize, field: &str) -> Result<u32> {
-        u32::try_from(Self::u64_value(values, index, field)?)
-            .map_err(|_| Error::Serialization(format!("Cache-backed multi-write {field} exceeds u32")))
+        u32::try_from(Self::u64_value(values, index, field)?).map_err(|_| {
+            Error::Serialization(format!("Cache-backed multi-write {field} exceeds u32"))
+        })
     }
 
     /// Reads one script integer as usize.
     fn usize_value(values: &[ScriptValue], index: usize, field: &str) -> Result<usize> {
-        usize::try_from(Self::u64_value(values, index, field)?)
-            .map_err(|_| Error::Serialization(format!("Cache-backed multi-write {field} exceeds usize")))
+        usize::try_from(Self::u64_value(values, index, field)?).map_err(|_| {
+            Error::Serialization(format!("Cache-backed multi-write {field} exceeds usize"))
+        })
     }
 
     /// Deserializes one JSON byte result.
@@ -1194,9 +1180,9 @@ impl CacheProvider {
             CacheError::Unavailable(message) => {
                 Error::Network(format!("Cache-backed multi-write {operation}: {message}"))
             }
-            CacheError::Closed => {
-                Error::Network(format!("Cache-backed multi-write {operation}: runtime is closed"))
-            }
+            CacheError::Closed => Error::Network(format!(
+                "Cache-backed multi-write {operation}: runtime is closed"
+            )),
             CacheError::InvalidData(message) => {
                 Error::Serialization(format!("Cache-backed multi-write {operation}: {message}"))
             }

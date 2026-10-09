@@ -46,8 +46,6 @@ pub struct BackendEntry {
 
 pub(crate) struct Inner {
     primary: BackendEntry,
-    #[allow(dead_code)]
-    backups: Vec<BackendEntry>,
     runtime: MultiWriteRuntime,
     ctx_resolver: Arc<dyn FsContextResolver>,
 }
@@ -215,7 +213,6 @@ impl MultiWriteWrappedFSBuilder {
         Ok(MultiWriteWrappedFS {
             inner: Arc::new(Inner {
                 primary,
-                backups: self.backup_entries,
                 runtime,
                 ctx_resolver: self.ctx_resolver,
             }),

@@ -1235,7 +1235,6 @@ mod tests {
     use super::*;
     use crate::core::BackendItemConfig;
     use crate::core::ConfigValue;
-    use crate::metrics::RagfsMetricValue;
     use crate::shape::SHAPE_MANIFEST_PATH;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1314,11 +1313,6 @@ mod tests {
         mfs.set_pathlock_manager(manager).await;
         mfs.mount(config).await.unwrap();
         mfs
-    }
-
-    /// Write one complete file through the public mount API.
-    async fn write_mounted_file(mfs: &MountableFS, path: &str, data: &[u8]) {
-        mfs.write(path, data, 0, WriteFlag::Create).await.unwrap();
     }
 
     // Mock filesystem for testing
@@ -1585,33 +1579,6 @@ mod tests {
         let mfs = MountableFS::new();
         mfs.register_plugin(MockPlugin::new(name)).await;
         mfs.mount(test_config(name, mount_path)).await.unwrap();
-        mfs
-    }
-
-    /// Create a MountableFS backed by the real in-memory plugin.
-    async fn mounted_memfs(mount_path: &str) -> MountableFS {
-        use crate::plugins::MemFSPlugin;
-
-        let mfs = MountableFS::new();
-        mfs.register_plugin(MemFSPlugin).await;
-        mfs.mount(test_config("memfs", mount_path)).await.unwrap();
-        mfs
-    }
-
-    /// Create a cache-enabled MountableFS backed by the real in-memory plugin.
-    #[cfg(feature = "cache")]
-    async fn mounted_cached_memfs(namespace: &str, mount_path: &str) -> MountableFS {
-        use crate::cache::{CacheNamespace, CachePolicy};
-        use crate::cache_runtime::CacheRuntime;
-        use crate::plugins::MemFSPlugin;
-
-        let mfs = MountableFS::with_cache_runtime(
-            CacheRuntime::memory(),
-            CacheNamespace::new(namespace),
-            CachePolicy::default(),
-        );
-        mfs.register_plugin(MemFSPlugin).await;
-        mfs.mount(test_config("memfs", mount_path)).await.unwrap();
         mfs
     }
 
