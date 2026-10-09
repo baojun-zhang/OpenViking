@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::errors::{Error, Result};
-use crate::multibackend::constants::{CHECKPOINT_CHUNK_FILE_EXTENSION, MANIFEST_FILE, SEGMENT_FILE_EXTENSION,};
+use crate::multibackend::constants::SEGMENT_FILE_EXTENSION;
 use crate::multibackend::meta::{MetadataStore, MultiWriteWorker};
 use crate::multibackend::model::{is_checkpoint_directory_name, CheckpointsManifest, DirectoryEvent, LatestCheckpoint,PartitionState, PartitionsManifest, ProtocolStatus, ScopeKey, SegmentManifest,};
 use crate::multibackend::provider::MultiWriteProvider;
@@ -195,18 +195,7 @@ impl MetadataGc {
                 {
                     return Ok(());
                 }
-                let files = match self.store.list_directory(&candidate).await {
-                    Ok(files) => files,
-                    Err(Error::NotFound(_)) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                self.store.remove_file(&format!("{candidate}/{MANIFEST_FILE}")).await?;
-                for file in files {
-                    if !file.is_dir && file.name.ends_with(CHECKPOINT_CHUNK_FILE_EXTENSION) {
-                        self.store.remove_file(&format!("{candidate}/{}", file.name)).await?;
-                    }
-                }
-                self.store.remove_empty_directory(&candidate).await
+                self.store.remove_all(&candidate).await
             }.await;
             let release = self.store.pathlock_manager().release(&lease).await.map_err(Error::from);
             finish_with_release(operation, release)?;

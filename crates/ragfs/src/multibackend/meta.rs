@@ -271,14 +271,9 @@ impl MetadataStore {
         self.remove_if_present(&backend_path).await
     }
 
-    /// Remove one raw metadata directory only when it is empty.
-    pub(crate) async fn remove_empty_directory(&self, logical_path: &str) -> Result<()> {
+    /// Remove one raw metadata tree while treating absence as success.
+    pub(crate) async fn remove_all(&self, logical_path: &str) -> Result<()> {
         let backend_path = self.paths.raw_backend_path(logical_path)?;
-        match self.primary.read_internal_dir(&backend_path).await {
-            Ok(entries) if entries.is_empty() => {}
-            Ok(_) | Err(Error::NotFound(_)) => return Ok(()),
-            Err(error) => return Err(error),
-        }
         match self.primary.remove_all(&backend_path).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
