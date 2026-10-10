@@ -331,16 +331,26 @@ pub struct CacheProvider {
     store: Arc<MetadataStore>,
     router: AccountRouter,
     runtime: Arc<CacheRuntime>,
+    namespace: String,
 }
 
 impl CacheProvider {
     /// Creates a cache-backed metadata provider.
-    pub fn new(store: Arc<MetadataStore>, runtime: Arc<CacheRuntime>) -> Result<Self> {
-        Self::build(store, runtime)
+    pub fn new(
+        store: Arc<MetadataStore>,
+        runtime: Arc<CacheRuntime>,
+        namespace: String,
+    ) -> Result<Self> {
+        Self::build(store, runtime, namespace)
     }
 
     /// Validates runtime capabilities and registers stable provider scripts.
-    fn build(store: Arc<MetadataStore>, runtime: Arc<CacheRuntime>) -> Result<Self> {
+    fn build(
+        store: Arc<MetadataStore>,
+        runtime: Arc<CacheRuntime>,
+        namespace: String,
+    ) -> Result<Self> {
+        Self::validate_namespace(&namespace)?;
         runtime
             .require_operations(&[CacheOperation::Lrange, CacheOperation::ExecuteScript])
             .map_err(|error| {
@@ -359,11 +369,22 @@ impl CacheProvider {
             router: AccountRouter::new(store.clone()),
             store,
             runtime,
+            namespace,
         })
     }
 
+    /// Validate the Redis hash tag namespace used by multi-write cache keys.
+    fn validate_namespace(namespace: &str) -> Result<()> {
+        if namespace.trim().is_empty() || namespace.contains(['{', '}']) {
+            return Err(Error::config(
+                "cache-backed multi-write namespace must be non-empty and must not contain '{' or '}'",
+            ));
+        }
+        Ok(())
+    }
+
     /// Builds deterministic same-slot keys for one validated scope.
-    pub(crate) fn keys_for_scope(scope: &ScopeKey) -> Result<CachePartitionKeys> {
+    pub(crate) fn keys_for_scope(&self, scope: &ScopeKey) -> Result<CachePartitionKeys> {
         scope.validate()?;
         if matches!(scope.account_id.as_str(), "." | "..")
             || scope.account_id.contains('/')
@@ -377,8 +398,8 @@ impl CacheProvider {
             ));
         }
         let prefix = format!(
-            "openviking:multiwrite:{{{}:{}}}",
-            scope.account_id, scope.partition_id
+            "{{{}}}:ov:multiwrite:{}:{}",
+            self.namespace, scope.account_id, scope.partition_id
         );
         Ok(CachePartitionKeys {
             state: format!("{prefix}:state"),
@@ -441,7 +462,7 @@ impl CacheProvider {
 
     /// Validates a scope against its current account partitions manifest.
     async fn validate_scope(&self, scope: &ScopeKey) -> Result<()> {
-        Self::keys_for_scope(scope)?;
+        self.keys_for_scope(scope)?;
         let path = self.store.paths().account_manifest(&scope.account_id)?.0;
         let manifest: PartitionsManifest = self.store.read_json(&path).await?;
         manifest.validate()?;
@@ -549,7 +570,7 @@ impl CacheProvider {
         owner: &str,
         continuing: bool,
     ) -> Result<FlushScriptOutcome> {
-        let keys = Self::keys_for_scope(scope)?;
+        let keys = self.keys_for_scope(scope)?;
         let mut args = Self::scope_args(scope);
         args.push(Bytes::from(if marker { "1" } else { "0" }));
         args.push(Bytes::from(owner.to_string()));
@@ -673,7 +694,7 @@ impl CacheProvider {
         scope: &ScopeKey,
     ) -> Result<(CacheState, Vec<SegmentRecord>, Vec<Bytes>)> {
         self.validate_scope(scope).await?;
-        let keys = Self::keys_for_scope(scope)?;
+        let keys = self.keys_for_scope(scope)?;
         loop {
             let before = self.read_state_once(scope, &keys).await?;
             let raw_records = self
@@ -888,7 +909,7 @@ impl CacheProvider {
         owner: Option<&str>,
         keep_owner: bool,
     ) -> Result<()> {
-        let keys = Self::keys_for_scope(scope)?;
+        let keys = self.keys_for_scope(scope)?;
         let mut args = vec![Bytes::from_static(b"commit")];
         args.extend(Self::scope_args(scope));
         args.push(Bytes::from(descriptor.segment_from_seq.to_string()));
@@ -1204,7 +1225,7 @@ impl MultiWriteProvider for CacheProvider {
             Err(error) => return Err(error),
         }
         let manifest = self.recovery_manifest(scope, manifest).await?;
-        let keys = Self::keys_for_scope(scope)?;
+        let keys = self.keys_for_scope(scope)?;
         let mut args = vec![Bytes::from_static(b"bootstrap")];
         args.extend(Self::scope_args(scope));
         args.push(Bytes::from(manifest.version.to_string()));
@@ -1454,7 +1475,7 @@ impl MultiWriteProvider for CacheProvider {
         if backend_id.trim().is_empty() {
             return Err(Error::invalid_operation("backend id must not be empty"));
         }
-        let keys = Self::keys_for_scope(scope)?;
+        let keys = self.keys_for_scope(scope)?;
         let mut args = Self::scope_args(scope);
         args.push(Bytes::from(backend_id.to_string()));
         args.push(Bytes::from(synced_seq.to_string()));
@@ -1493,7 +1514,7 @@ impl MultiWriteProvider for CacheProvider {
             if !self.store.gc_scope_is_safe(scope).await? {
                 return Ok(Vec::new());
             }
-            let keys = Self::keys_for_scope(scope)?;
+            let keys = self.keys_for_scope(scope)?;
             let mut args = vec![Bytes::from_static(b"prune")];
             args.extend(Self::scope_args(scope));
             args.push(Bytes::from(serde_json::to_vec(removable_paths)?));

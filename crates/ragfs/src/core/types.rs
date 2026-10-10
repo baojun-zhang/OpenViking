@@ -559,6 +559,9 @@ impl ConfigValue {
 /// Multi-write backends container configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendsConfig {
+    /// Cache key namespace used by cache-backed metadata.
+    #[serde(default = "default_backups_namespace")]
+    pub namespace: String,
     /// Initial number of metadata partitions.
     #[serde(default = "default_initial_partitions")]
     pub initial_partitions: u32,
@@ -571,6 +574,11 @@ pub struct BackendsConfig {
     /// Backup items
     #[serde(default)]
     pub items: Vec<BackendItemConfig>,
+}
+
+/// Return the default cache-backed metadata namespace.
+fn default_backups_namespace() -> String {
+    "default".to_string()
 }
 
 /// Return the default metadata partition count.

@@ -1256,6 +1256,7 @@ mod tests {
             mount_path: mount_path.to_string(),
             params: HashMap::new(),
             backups: Some(BackendsConfig {
+                namespace: "default".to_string(),
                 initial_partitions: 16,
                 checkpoint_interval_secs: 86_400,
                 provider: "filesystem".to_string(),

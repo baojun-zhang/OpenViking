@@ -108,7 +108,11 @@ pub(crate) async fn build_inactive_multi_write_fs(
                 let runtime = build_ctx.cache_runtime.clone().ok_or_else(|| {
                     Error::config("backups.provider = 'cache' requires a top-level CacheRuntime")
                 })?;
-                Arc::new(CacheProvider::new(metadata_store.clone(), runtime)?)
+                Arc::new(CacheProvider::new(
+                    metadata_store.clone(),
+                    runtime,
+                    bc.namespace.clone(),
+                )?)
             }
             #[cfg(not(feature = "cache"))]
             {
