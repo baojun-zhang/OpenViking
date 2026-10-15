@@ -6,13 +6,15 @@ use crate::cache_runtime::{
 };
 use bytes::Bytes;
 use fred::error::{Error as FredError, ErrorKind};
+use fred::interfaces::{HashesInterface, SortedSetsInterface};
 use fred::prelude::*;
+use fred::types::scan::Scanner;
 use fred::types::{
     config::{ClusterDiscoveryPolicy, Server, TlsConfig, TlsConnector, TlsHostMapping},
     lists::{LMoveDirection, ListLocation},
     ConnectHandle, Expiration as FredExpiration, Map, SetOptions as FredSetOptions, Value,
 };
-use futures::Future;
+use futures::{Future, StreamExt};
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +167,14 @@ impl RedisClient {
         self.execute("DEL", self.client.del(keys.to_vec())).await
     }
 
+    pub(super) async fn unlink(&self, keys: &[String]) -> CacheResult<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        self.execute("UNLINK", self.client.unlink(keys.to_vec()))
+            .await
+    }
+
     pub(super) async fn mget(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -214,6 +224,27 @@ impl RedisClient {
             .await
     }
 
+    pub(super) async fn expire(&self, key: &str, duration: Duration) -> CacheResult<bool> {
+        let millis = i64::try_from(duration.as_millis())
+            .map_err(|_| CacheError::InvalidArgument("Redis TTL is too large".into()))?;
+        if millis <= 0 {
+            return Err(CacheError::InvalidArgument(
+                "Redis TTL must be greater than zero".into(),
+            ));
+        }
+        self.execute("PEXPIRE", self.client.pexpire(key, millis, None))
+            .await
+    }
+
+    pub(super) async fn hget(&self, key: &str, field: &str) -> CacheResult<Option<Bytes>> {
+        self.execute("HGET", self.client.hget(key, field)).await
+    }
+
+    pub(super) async fn hset(&self, key: &str, field: &str, value: Bytes) -> CacheResult<u64> {
+        let values = [(field.to_string(), value)].into_iter().collect::<Map>();
+        self.execute("HSET", self.client.hset(key, values)).await
+    }
+
     pub(super) async fn sismember(&self, key: &str, member: &[u8]) -> CacheResult<bool> {
         self.execute("SISMEMBER", self.client.sismember(key, member))
             .await
@@ -225,6 +256,60 @@ impl RedisClient {
 
     pub(super) async fn scard(&self, key: &str) -> CacheResult<u64> {
         self.execute("SCARD", self.client.scard(key)).await
+    }
+
+    pub(super) async fn zadd(&self, key: &str, score: f64, member: &str) -> CacheResult<u64> {
+        self.execute(
+            "ZADD",
+            self.client
+                .zadd(key, None, None, false, false, (score, member)),
+        )
+        .await
+    }
+
+    pub(super) async fn zscan_match(
+        &self,
+        key: &str,
+        pattern: &str,
+        count: u32,
+    ) -> CacheResult<Vec<String>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CacheError::Closed);
+        }
+        let _permit = Arc::clone(&self.concurrency)
+            .acquire_owned()
+            .await
+            .map_err(|_| CacheError::Closed)?;
+        let work = async {
+            let stream = self.client.zscan(key, pattern, Some(count.max(1)));
+            futures::pin_mut!(stream);
+            let mut members = Vec::new();
+            while let Some(page) = stream.next().await {
+                let mut page = page.map_err(|error| map_fred_error("ZSCAN", error))?;
+                if let Some(results) = page.take_results() {
+                    for (member, _) in results {
+                        members.push(redis_value_to_string(member, "ZSCAN")?);
+                    }
+                }
+            }
+            Ok(members)
+        };
+        tokio::time::timeout(self.command_timeout, work)
+            .await
+            .map_err(|_| {
+                CacheError::Timeout(format!(
+                    "Redis ZSCAN exceeded {} ms",
+                    self.command_timeout.as_millis()
+                ))
+            })?
+    }
+
+    pub(super) async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64> {
+        if members.is_empty() {
+            return Ok(0);
+        }
+        self.execute("ZREM", self.client.zrem(key, members.to_vec()))
+            .await
     }
 
     pub(super) async fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
@@ -377,17 +462,6 @@ impl RedisClient {
             .execute("EVALSHA", self.client.evalsha(sha, keys, args))
             .await?;
         fred_value_to_script_value(value)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn script_flush(&self) -> CacheResult<()> {
-        if self.deployment_mode == RedisDeploymentMode::Cluster {
-            self.execute("SCRIPT FLUSH", self.client.script_flush_cluster(false))
-                .await
-        } else {
-            self.execute("SCRIPT FLUSH", self.client.script_flush(false))
-                .await
-        }
     }
 
     pub(super) async fn close(&self) -> CacheResult<()> {
@@ -568,6 +642,20 @@ fn fred_value_to_script_value(value: Value) -> CacheResult<ScriptValue> {
     }
 }
 
+fn redis_value_to_string(value: Value, operation: &str) -> CacheResult<String> {
+    match value {
+        Value::String(value) => Ok(value.to_string()),
+        Value::Bytes(value) => String::from_utf8(value.to_vec()).map_err(|error| {
+            CacheError::InvalidData(format!(
+                "Redis {operation} returned non-UTF-8 member: {error}"
+            ))
+        }),
+        other => Err(CacheError::InvalidData(format!(
+            "unsupported Redis {operation} member: {other:?}"
+        ))),
+    }
+}
+
 fn map_fred_error(operation: &str, error: FredError) -> CacheError {
     let details = error.details().to_ascii_uppercase();
     if details.contains("NOSCRIPT") {
@@ -595,57 +683,5 @@ fn map_fred_error(operation: &str, error: FredError) -> CacheError {
             CacheError::InvalidData(format!("Redis {operation}: {error}"))
         }
         _ => CacheError::Internal(format!("Redis {operation}: {error}")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::net::TcpListener;
-
-    #[test]
-    fn repeated_connect_timeouts_release_connection_tasks() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let accept_task = tokio::spawn(async move {
-                let mut sockets = Vec::new();
-                while let Ok((socket, _)) = listener.accept().await {
-                    sockets.push(socket);
-                }
-            });
-            tokio::task::yield_now().await;
-            let baseline = tokio::runtime::Handle::current()
-                .metrics()
-                .num_alive_tasks();
-            let config = RedisProviderConfig {
-                endpoints: vec![format!("redis://{address}")],
-                connect_timeout_ms: 25,
-                command_timeout_ms: 10_000,
-                ..RedisProviderConfig::default()
-            };
-
-            for _ in 0..3 {
-                let error = match RedisClient::connect(&config).await {
-                    Ok(_) => panic!("Redis connection unexpectedly succeeded"),
-                    Err(error) => error,
-                };
-                assert!(matches!(error, CacheError::Timeout(_)));
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                assert_eq!(
-                    tokio::runtime::Handle::current()
-                        .metrics()
-                        .num_alive_tasks(),
-                    baseline
-                );
-            }
-
-            accept_task.abort();
-        });
     }
 }

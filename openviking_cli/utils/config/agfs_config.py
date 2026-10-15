@@ -155,13 +155,6 @@ class QueueFSConfig(BaseModel):
         return self
 
 
-class AGFSCacheTraversalMode(str, Enum):
-    """Traversal strategy for cache-aware recursive RAGFS APIs."""
-
-    BACKEND = "backend"
-    CACHED_TRAVERSAL = "cached_traversal"
-
-
 class AGFSCacheFSConfig(BaseModel):
     """CacheFS behavior independent from the selected global Provider."""
 
@@ -169,25 +162,6 @@ class AGFSCacheFSConfig(BaseModel):
         default="local",
         description="CacheFS backend: 'local' | 'cache'",
     )
-    max_file_size_bytes: int = Field(
-        default=1024 * 1024,
-        description="Maximum full-file object size admitted to cache",
-    )
-    traversal_mode: AGFSCacheTraversalMode = Field(
-        default=AGFSCacheTraversalMode.BACKEND,
-        description="Traversal strategy for tree, glob, and grep",
-    )
-    bypass_prefixes: list[str] = Field(
-        default_factory=list,
-        description="Path prefixes that bypass cache",
-    )
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        """Validate CacheFS limits."""
-        if self.max_file_size_bytes <= 0:
-            raise ValueError("cachefs max_file_size_bytes must be > 0")
-        return self
 
 
 class RedisCacheConfig(BaseModel):
@@ -219,7 +193,7 @@ class RedisCacheConfig(BaseModel):
     pool_size: int = Field(default=32, description="Redis command concurrency")
     connect_timeout_ms: int = Field(default=1000, description="Redis connect timeout")
     command_timeout_ms: int = Field(default=20, description="Redis command timeout")
-    default_ttl_seconds: int = Field(default=3600, description="Redis default cache TTL")
+    default_ttl_seconds: int = Field(default=300, description="Redis default cache TTL")
     tls_insecure_skip_verify: bool = Field(
         default=False, description="Skip Redis TLS certificate verification"
     )
