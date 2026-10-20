@@ -403,23 +403,13 @@ impl MountableFS {
                 let mw = self.build_multi_write_fs(&config, bc).await?;
                 let arc: Arc<dyn FileSystem> = Arc::new(mw);
                 #[cfg(feature = "cache")]
-                let arc = if encryption_enabled {
-                    // Multi-write owns per-backend encryption internally. A mount-level cache
-                    // would sit outside that boundary and store plaintext, so skip it.
-                    warn!(
-                        "cache is disabled for encrypted multi-write mount '{}': mount-level cache would store plaintext",
-                        normalized_path
-                    );
-                    arc
-                } else {
-                    match &self.cache {
-                        Some(cache) => Arc::new(CachedFileSystem::with_runtime(
-                            Box::new(ArcFileSystem(arc)),
-                            cache.runtime.clone(),
-                            &cache.service_name,
-                        )),
-                        None => arc,
-                    }
+                let arc = match &self.cache {
+                    Some(cache) => Arc::new(CachedFileSystem::with_runtime(
+                        Box::new(ArcFileSystem(arc)),
+                        cache.runtime.clone(),
+                        &cache.service_name,
+                    )),
+                    None => arc,
                 };
                 (arc, None)
             }
