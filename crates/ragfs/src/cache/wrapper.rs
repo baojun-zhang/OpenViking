@@ -146,26 +146,32 @@ impl CachedFileSystem {
         keys.dedup();
 
         let started = Instant::now();
-        let result = runtime.unlink(&keys).await;
-        metrics.delete(started.elapsed());
-        match result {
-            Ok(_) => metrics.invalidation(),
-            Err(error) => {
-                metrics.error();
-                warn!(
-                    path = %affected_path,
-                    bucket_count = keys.len(),
-                    error = %error,
-                    "query cache invalidation unlink failed"
-                );
+        let mut unlinked_keys = Vec::with_capacity(keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            match runtime.unlink(std::slice::from_ref(key)).await {
+                Ok(_) => unlinked_keys.push(key.clone()),
+                Err(error) => {
+                    metrics.error();
+                    warn!(
+                        path = %affected_path,
+                        bucket_index = index,
+                        error = %error,
+                        "query cache invalidation unlink failed"
+                    );
+                }
             }
         }
+        metrics.delete(started.elapsed());
+        if unlinked_keys.is_empty() {
+            return;
+        }
+        metrics.invalidation();
 
-        if let Err(error) = runtime.zrem(&index_key, &keys).await {
+        if let Err(error) = runtime.zrem(&index_key, &unlinked_keys).await {
             metrics.error();
             warn!(
                 index_key = %index_key,
-                bucket_count = keys.len(),
+                bucket_count = unlinked_keys.len(),
                 error = %error,
                 "query cache invalidation index cleanup failed"
             );
