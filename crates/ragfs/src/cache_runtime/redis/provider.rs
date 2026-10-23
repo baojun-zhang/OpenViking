@@ -97,6 +97,17 @@ impl CacheProvider for RedisProvider {
         self.client.zscan_match(key, pattern, count).await
     }
 
+    /// Return sorted-set members within one score range.
+    async fn zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        self.client.zrangebyscore(key, min, max, limit).await
+    }
+
     async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64> {
         self.client.zrem(key, members).await
     }

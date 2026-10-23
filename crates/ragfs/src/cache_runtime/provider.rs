@@ -103,6 +103,16 @@ pub(crate) trait CacheProvider: Send + Sync {
     async fn zadd(&self, key: &str, score: f64, member: &str) -> CacheResult<u64>;
     /// Return sorted-set members matching one Redis glob pattern.
     async fn zscan_match(&self, key: &str, pattern: &str, count: u32) -> CacheResult<Vec<String>>;
+    /// Return sorted-set members within one score range.
+    async fn zrangebyscore(
+        &self,
+        _key: &str,
+        _min: f64,
+        _max: f64,
+        _limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        Err(CacheError::UnsupportedOperation("zrangebyscore".into()))
+    }
     /// Remove sorted-set members and return the number removed.
     async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64>;
     async fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64>;

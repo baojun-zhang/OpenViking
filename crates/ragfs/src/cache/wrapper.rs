@@ -16,11 +16,14 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::warn;
 use xxhash_rust::xxh3::xxh3_128;
+
+const QUERY_INDEX_GC_TRIGGER_THRESHOLD: u64 = 64;
 
 /// A provider-independent read-through filesystem cache.
 ///
@@ -32,6 +35,8 @@ pub struct CachedFileSystem {
     service_name: String,
     metrics: Arc<CacheMetrics>,
     inflight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    index_gc_changes: Arc<AtomicU64>,
+    index_gc_running: Arc<AtomicBool>,
 }
 
 impl CachedFileSystem {
@@ -55,6 +60,8 @@ impl CachedFileSystem {
             service_name,
             metrics: Arc::new(CacheMetrics::default()),
             inflight: Mutex::new(HashMap::new()),
+            index_gc_changes: Arc::new(AtomicU64::new(0)),
+            index_gc_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -109,12 +116,7 @@ impl CachedFileSystem {
                     self.metrics.error();
                     return false;
                 }
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                now_ms.saturating_add(ttl.as_millis().min(u128::from(u64::MAX)) as u64)
+                current_time_ms().saturating_add(ttl.as_millis().min(u128::from(u64::MAX)) as u64)
             }
             None => u64::MAX,
         };
@@ -281,6 +283,7 @@ impl CachedFileSystem {
 
     /// Schedule asynchronous invalidation for one changed path.
     fn spawn_path_invalidation(&self, path: &str) {
+        self.note_query_index_change();
         let mut keys = Vec::new();
         self.collect_path_change_buckets(path, &mut keys);
         self.spawn_bucket_invalidation(keys, path);
@@ -288,6 +291,7 @@ impl CachedFileSystem {
 
     /// Schedule asynchronous invalidation for one changed path and its descendants.
     fn spawn_descendant_invalidation(&self, path: &str) {
+        self.note_query_index_change();
         let path = normalize_path(path);
         let runtime = Arc::clone(&self.runtime);
         let metrics = Arc::clone(&self.metrics);
@@ -305,6 +309,70 @@ impl CachedFileSystem {
             Self::collect_path_change_buckets_for(&service_name, &path, &mut keys);
             Self::delete_query_buckets(runtime, metrics, index_key, keys, path).await;
         });
+    }
+
+    /// Record one write-driven invalidation and trigger bounded index GC when needed.
+    fn note_query_index_change(&self) {
+        let changes = self.index_gc_changes.fetch_add(1, Ordering::Relaxed) + 1;
+        if changes < QUERY_INDEX_GC_TRIGGER_THRESHOLD {
+            return;
+        }
+        if self.index_gc_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.index_gc_changes.store(0, Ordering::Relaxed);
+
+        let runtime = Arc::clone(&self.runtime);
+        let metrics = Arc::clone(&self.metrics);
+        let index_key = self.query_index_key();
+        let running = Arc::clone(&self.index_gc_running);
+        tokio::spawn(async move {
+            Self::cleanup_expired_query_index_members(
+                runtime,
+                metrics,
+                index_key,
+                QUERY_INDEX_GC_TRIGGER_THRESHOLD << 1,
+            )
+            .await;
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    /// Remove a bounded batch of expired query index members.
+    async fn cleanup_expired_query_index_members(
+        runtime: Arc<CacheRuntime>,
+        metrics: Arc<CacheMetrics>,
+        index_key: String,
+        limit: u64,
+    ) {
+        let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+        let max_score = current_time_ms() as f64;
+        match runtime
+            .zrangebyscore(&index_key, f64::NEG_INFINITY, max_score, limit)
+            .await
+        {
+            Ok(members) if members.is_empty() => {}
+            Ok(members) => {
+                if let Err(error) = runtime.zrem(&index_key, &members).await {
+                    metrics.error();
+                    warn!(
+                        index_key = %index_key,
+                        count = members.len(),
+                        error = %error,
+                        "query cache index gc removal failed"
+                    );
+                }
+            }
+            Err(error) => {
+                metrics.error();
+                warn!(
+                    index_key = %index_key,
+                    limit = limit,
+                    error = %error,
+                    "query cache index gc scan failed"
+                );
+            }
+        }
     }
 
     /// Schedule asynchronous invalidation for already calculated bucket keys.
@@ -722,6 +790,15 @@ fn canonical_query_request(request: Value) -> CacheResult<(Value, String)> {
         serde_json::to_vec(&request).map_err(|error| CacheError::InvalidData(error.to_string()))?;
     let hash = format!("{:032x}", xxh3_128(&canonical));
     Ok((request, hash))
+}
+
+/// Return the current Unix timestamp in milliseconds, saturating at u64::MAX.
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// Build one query HASH bucket key from service, path, and operation.

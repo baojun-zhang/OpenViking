@@ -302,6 +302,18 @@ impl CacheRuntime {
         self.provider.zscan_match(key, pattern, count).await
     }
 
+    /// Return sorted-set members within one score range.
+    pub async fn zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        self.ensure_open()?;
+        self.provider.zrangebyscore(key, min, max, limit).await
+    }
+
     /// Remove sorted-set members and return the number removed.
     pub async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64> {
         self.ensure_open()?;

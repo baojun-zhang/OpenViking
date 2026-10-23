@@ -304,6 +304,26 @@ impl RedisClient {
             })?
     }
 
+    /// Return sorted-set members within one score range.
+    pub(super) async fn zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let count = i64::from(limit);
+        self.execute(
+            "ZRANGEBYSCORE",
+            self.client
+                .zrangebyscore(key, min, max, false, Some((0, count))),
+        )
+        .await
+    }
+
     pub(super) async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64> {
         if members.is_empty() {
             return Ok(0);

@@ -605,6 +605,45 @@ impl CacheProvider for MemoryMockProvider {
             .unwrap_or_default())
     }
 
+    /// Return sorted-set members within one score range.
+    async fn zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        self.ensure_open()?;
+        if min.is_nan() || max.is_nan() {
+            return Err(CacheError::InvalidArgument(
+                "sorted-set score range cannot be NaN".into(),
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.purge_expired_key(key).await;
+        let mut members = self
+            .zsets
+            .read()
+            .await
+            .get(key)
+            .map(|zset| {
+                zset.iter()
+                    .filter(|(_, score)| **score >= min && **score <= max)
+                    .map(|(member, score)| (member.clone(), *score))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        members.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        members.truncate(limit as usize);
+        Ok(members.into_iter().map(|(member, _)| member).collect())
+    }
+
     async fn zrem(&self, key: &str, members: &[String]) -> CacheResult<u64> {
         self.ensure_open()?;
         self.purge_expired_key(key).await;

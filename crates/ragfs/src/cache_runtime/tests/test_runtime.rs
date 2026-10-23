@@ -72,3 +72,22 @@ async fn query_cache_primitives_store_scan_and_unlink() {
     assert_eq!(provider.unlink_count(), 1);
     assert_eq!(runtime.hget(bucket, "query").await.unwrap(), None);
 }
+
+/// Verifies sorted-set score range reads are ordered and bounded.
+#[tokio::test]
+async fn zrangebyscore_returns_bounded_expired_members() {
+    let provider = Arc::new(MemoryMockProvider::new());
+    let runtime = CacheRuntime::memory_with_provider(provider);
+
+    assert_eq!(runtime.zadd("idx", 10.0, "expired-a").await.unwrap(), 1);
+    assert_eq!(runtime.zadd("idx", 30.0, "fresh").await.unwrap(), 1);
+    assert_eq!(runtime.zadd("idx", 20.0, "expired-b").await.unwrap(), 1);
+
+    assert_eq!(
+        runtime
+            .zrangebyscore("idx", f64::NEG_INFINITY, 20.0, 1)
+            .await
+            .unwrap(),
+        vec!["expired-a".to_string()]
+    );
+}
