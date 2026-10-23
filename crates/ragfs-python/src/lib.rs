@@ -371,8 +371,8 @@ impl Default for RedisCacheConfig {
             sentinel_password: String::new(),
             db: 0,
             pool_size: 32,
-            connect_timeout_ms: 1_000,
-            command_timeout_ms: 20,
+            connect_timeout_ms: 10_000,
+            command_timeout_ms: 0,
             default_ttl_seconds: 300,
             tls_insecure_skip_verify: false,
         }

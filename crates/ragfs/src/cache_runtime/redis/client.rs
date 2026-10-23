@@ -108,14 +108,7 @@ impl RedisClient {
                 .await
                 .map_err(|error| map_fred_error(operation, error))
         };
-        tokio::time::timeout(self.command_timeout, work)
-            .await
-            .map_err(|_| {
-                CacheError::Timeout(format!(
-                    "Redis {operation} exceeded {} ms",
-                    self.command_timeout.as_millis()
-                ))
-            })?
+        run_with_command_timeout(operation, self.command_timeout, work).await
     }
 
     pub(super) async fn health_check(&self) -> CacheResult<()> {
@@ -294,14 +287,7 @@ impl RedisClient {
             }
             Ok(members)
         };
-        tokio::time::timeout(self.command_timeout, work)
-            .await
-            .map_err(|_| {
-                CacheError::Timeout(format!(
-                    "Redis ZSCAN exceeded {} ms",
-                    self.command_timeout.as_millis()
-                ))
-            })?
+        run_with_command_timeout("ZSCAN", self.command_timeout, work).await
     }
 
     /// Return sorted-set members within one score range.
@@ -517,13 +503,13 @@ async fn terminate_connection_task(
     task: ConnectHandle,
     timeout_duration: Duration,
 ) -> CacheResult<()> {
-    let quit_result = match tokio::time::timeout(timeout_duration, client.quit()).await {
-        Ok(result) => result.map_err(|error| map_fred_error("QUIT", error)),
-        Err(_) => Err(CacheError::Timeout(format!(
-            "Redis QUIT exceeded {} ms",
-            timeout_duration.as_millis()
-        ))),
-    };
+    let quit_result = run_with_command_timeout("QUIT", timeout_duration, async {
+        client
+            .quit()
+            .await
+            .map_err(|error| map_fred_error("QUIT", error))
+    })
+    .await;
 
     task.abort();
     let task_result = match task.await {
@@ -533,6 +519,28 @@ async fn terminate_connection_task(
     };
 
     quit_result.and(task_result)
+}
+
+/// Run one Redis operation with the configured command timeout.
+async fn run_with_command_timeout<T, F>(
+    operation: &'static str,
+    timeout_duration: Duration,
+    future: F,
+) -> CacheResult<T>
+where
+    F: Future<Output = CacheResult<T>>,
+{
+    if timeout_duration.is_zero() {
+        return future.await;
+    }
+    tokio::time::timeout(timeout_duration, future)
+        .await
+        .map_err(|_| {
+            CacheError::Timeout(format!(
+                "Redis {operation} exceeded {} ms",
+                timeout_duration.as_millis()
+            ))
+        })?
 }
 
 fn fred_config(

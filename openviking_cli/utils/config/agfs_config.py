@@ -191,8 +191,8 @@ class RedisCacheConfig(BaseModel):
     )
     db: int = Field(default=0, description="Redis database number")
     pool_size: int = Field(default=32, description="Redis command concurrency")
-    connect_timeout_ms: int = Field(default=1000, description="Redis connect timeout")
-    command_timeout_ms: int = Field(default=20, description="Redis command timeout")
+    connect_timeout_ms: int = Field(default=10000, description="Redis connect timeout")
+    command_timeout_ms: int = Field(default=0, description="Redis command timeout; 0 disables command timeout")
     default_ttl_seconds: int = Field(default=300, description="Redis default cache TTL")
     tls_insecure_skip_verify: bool = Field(
         default=False, description="Skip Redis TLS certificate verification"
@@ -239,8 +239,8 @@ class RedisCacheConfig(BaseModel):
             raise ValueError("redis pool_size must be > 0")
         if self.connect_timeout_ms <= 0:
             raise ValueError("redis connect_timeout_ms must be > 0")
-        if self.command_timeout_ms <= 0:
-            raise ValueError("redis command_timeout_ms must be > 0")
+        if self.command_timeout_ms < 0:
+            raise ValueError("redis command_timeout_ms must be >= 0")
         if self.default_ttl_seconds < 0:
             raise ValueError("redis default_ttl_seconds must be >= 0")
         if len(schemes) != 1:

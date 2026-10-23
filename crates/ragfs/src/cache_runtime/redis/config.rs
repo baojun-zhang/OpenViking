@@ -42,7 +42,7 @@ pub struct RedisProviderConfig {
     pub pool_size: usize,
     /// Connection timeout in milliseconds.
     pub connect_timeout_ms: u64,
-    /// Command timeout in milliseconds.
+    /// Command timeout in milliseconds; zero disables command timeouts.
     pub command_timeout_ms: u64,
     /// Default TTL in seconds; zero disables expiration.
     pub default_ttl_seconds: u64,
@@ -64,8 +64,8 @@ impl Default for RedisProviderConfig {
             sentinel_password: String::new(),
             db: 0,
             pool_size: 32,
-            connect_timeout_ms: 1_000,
-            command_timeout_ms: 20,
+            connect_timeout_ms: 10_000,
+            command_timeout_ms: 0,
             default_ttl_seconds: 300,
             tls_insecure_skip_verify: false,
         }
@@ -128,9 +128,9 @@ impl RedisProviderConfig {
                 "Redis pool_size must be greater than zero".into(),
             ));
         }
-        if self.connect_timeout_ms == 0 || self.command_timeout_ms == 0 {
+        if self.connect_timeout_ms == 0 {
             return Err(CacheError::InvalidArgument(
-                "Redis timeouts must be greater than zero".into(),
+                "Redis connect_timeout_ms must be greater than zero".into(),
             ));
         }
         if self.default_ttl_seconds.checked_mul(1_000).is_none() {
