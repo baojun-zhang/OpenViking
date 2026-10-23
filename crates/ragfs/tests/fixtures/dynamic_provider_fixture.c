@@ -163,6 +163,33 @@ static int32_t fixture_zscan(
     return fixture_copy(value, sizeof(value) - 1, &output->items[0]);
 }
 
+static int32_t fixture_zrangebyscore(
+    void *provider,
+    OvCacheByteSliceV1 key,
+    double min,
+    double max,
+    uint32_t limit,
+    OvCacheOwnedBufferArrayV1 *output,
+    OvCacheOwnedBufferV1 *error) {
+    (void)provider;
+    (void)key;
+    (void)min;
+    (void)max;
+    (void)error;
+    if (limit == 0) {
+        return OV_CACHE_STATUS_OK;
+    }
+    output->items = (OvCacheOwnedBufferV1 *)fixture_host->alloc(
+        sizeof(OvCacheOwnedBufferV1),
+        OV_CACHE_ALIGNOF(OvCacheOwnedBufferV1));
+    if (output->items == NULL) {
+        return OV_CACHE_STATUS_INTERNAL;
+    }
+    output->len = 1;
+    static const uint8_t value[] = "bucket";
+    return fixture_copy(value, sizeof(value) - 1, &output->items[0]);
+}
+
 static int32_t fixture_zrem(
     void *provider,
     OvCacheByteSliceV1 key,
@@ -230,6 +257,9 @@ static const OvCacheProviderApiV1 FIXTURE_API = {
     .zrem = fixture_zrem,
 #ifndef OV_FIXTURE_NO_UNLINK
     .unlink = fixture_unlink,
+#endif
+#ifndef OV_FIXTURE_NO_ZRANGEBYSCORE
+    .zrangebyscore = fixture_zrangebyscore,
 #endif
 };
 

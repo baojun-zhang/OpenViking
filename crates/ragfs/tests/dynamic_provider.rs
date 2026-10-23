@@ -49,6 +49,10 @@ async fn dynamic_provider_dispatches_hash_and_sorted_set_calls() {
         vec!["bucket".to_string()]
     );
     assert_eq!(
+        runtime.zrangebyscore("idx", 0.0, 100.0, 10).await.unwrap(),
+        vec!["bucket".to_string()]
+    );
+    assert_eq!(
         runtime.zrem("idx", &["bucket".to_string()]).await.unwrap(),
         1
     );
@@ -92,6 +96,29 @@ async fn cachefs_rejects_dynamic_provider_without_query_cache_operations() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("unlink"));
+}
+
+#[tokio::test]
+async fn cachefs_rejects_dynamic_provider_without_zrangebyscore() {
+    let result = build_configured_stack(
+        RagfsConfig::default(),
+        Some(CacheStackConfig {
+            provider: Some(CacheRuntimeProviderConfig::Dynamic(config(
+                no_zrangebyscore_fixture_library(),
+            ))),
+            cachefs: CacheFsConfig {
+                enabled: true,
+                service_name: "query-cache-test".to_string(),
+            },
+        }),
+    )
+    .await;
+
+    let error = match result {
+        Ok(_) => panic!("CacheFS unexpectedly started with a provider missing zrangebyscore"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("zrangebyscore"));
 }
 
 #[tokio::test]
@@ -160,6 +187,11 @@ fn bad_length_fixture_library() -> &'static PathBuf {
 fn no_unlink_fixture_library() -> &'static PathBuf {
     static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
     LIBRARY.get_or_init(|| compile_fixture("no-unlink", &["OV_FIXTURE_NO_UNLINK"]))
+}
+
+fn no_zrangebyscore_fixture_library() -> &'static PathBuf {
+    static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+    LIBRARY.get_or_init(|| compile_fixture("no-zrangebyscore", &["OV_FIXTURE_NO_ZRANGEBYSCORE"]))
 }
 
 fn compile_fixture(name: &str, defines: &[&str]) -> PathBuf {

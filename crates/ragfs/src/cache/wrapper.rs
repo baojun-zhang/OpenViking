@@ -431,7 +431,7 @@ impl CachedFileSystem {
         let parent = parent_path(&normalized);
         keys.push(query_bucket_key(service_name, &parent, "read_dir"));
         for scope in ancestor_scopes(&parent) {
-            for op in ["tree_directory", "glob_directory", "grep"] {
+            for op in ["tree_directory", "glob_directory", "grep", "stat"] {
                 keys.push(query_bucket_key(service_name, &scope, op));
             }
         }

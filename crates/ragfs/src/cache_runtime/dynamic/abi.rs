@@ -217,6 +217,15 @@ pub(super) type ProviderZscanV1 = unsafe extern "C" fn(
     output: *mut OwnedBufferArrayV1,
     error: *mut OwnedBufferV1,
 ) -> i32;
+pub(super) type ProviderZrangeByScoreV1 = unsafe extern "C" fn(
+    provider: *mut c_void,
+    key: ByteSliceV1,
+    min: f64,
+    max: f64,
+    limit: u32,
+    output: *mut OwnedBufferArrayV1,
+    error: *mut OwnedBufferV1,
+) -> i32;
 pub(super) type ProviderZremV1 = unsafe extern "C" fn(
     provider: *mut c_void,
     key: ByteSliceV1,
@@ -346,6 +355,7 @@ pub(super) struct ProviderApiV1 {
     pub(super) zscan: Option<ProviderZscanV1>,
     pub(super) zrem: Option<ProviderZremV1>,
     pub(super) unlink: Option<ProviderUnlinkV1>,
+    pub(super) zrangebyscore: Option<ProviderZrangeByScoreV1>,
 }
 
 pub(super) type ProviderEntryV1 = unsafe extern "C" fn() -> *const ProviderApiV1;

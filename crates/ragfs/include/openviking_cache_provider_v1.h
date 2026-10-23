@@ -256,6 +256,15 @@ typedef int32_t (*OvCacheProviderZscanV1)(
     OvCacheOwnedBufferArrayV1 *output,
     OvCacheOwnedBufferV1 *error);
 
+typedef int32_t (*OvCacheProviderZrangeByScoreV1)(
+    void *provider,
+    OvCacheByteSliceV1 key,
+    double min,
+    double max,
+    uint32_t limit,
+    OvCacheOwnedBufferArrayV1 *output,
+    OvCacheOwnedBufferV1 *error);
+
 typedef int32_t (*OvCacheProviderZremV1)(
     void *provider,
     OvCacheByteSliceV1 key,
@@ -387,6 +396,7 @@ typedef struct {
     OvCacheProviderZscanV1 zscan;
     OvCacheProviderZremV1 zrem;
     OvCacheProviderUnlinkV1 unlink;
+    OvCacheProviderZrangeByScoreV1 zrangebyscore;
 } OvCacheProviderApiV1;
 
 /* The only symbol resolved by DynamicProvider. */

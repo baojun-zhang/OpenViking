@@ -232,6 +232,7 @@ impl DynamicState {
             CacheOperation::Scard => self.api.scard.is_some(),
             CacheOperation::Zadd => self.api.zadd.is_some(),
             CacheOperation::Zscan => self.api.zscan.is_some(),
+            CacheOperation::ZrangeByScore => self.api.zrangebyscore.is_some(),
             CacheOperation::Zrem => self.api.zrem.is_some(),
             CacheOperation::Lpush => self.api.lpush.is_some(),
             CacheOperation::Rpush => self.api.rpush.is_some(),
@@ -726,6 +727,57 @@ impl CacheProvider for DynamicProvider {
                         String::from_utf8(value.to_vec()).map_err(|error| {
                             CacheError::InvalidData(format!(
                                 "dynamic provider zscan returned non-UTF-8 member: {error}"
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .await
+    }
+
+    /// Return sorted-set members within one score range through the dynamic provider.
+    async fn zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: u32,
+    ) -> CacheResult<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let key = key.to_string();
+        self.call("zrangebyscore", move |state| {
+            state.with_call("zrangebyscore", |api, handle| {
+                let callback = required(api.zrangebyscore, CacheOperation::ZrangeByScore)?;
+                let mut output = OwnedBufferArrayV1::default();
+                let mut error = OwnedBufferV1::default();
+                let status = unsafe {
+                    callback(
+                        handle,
+                        ByteSliceV1::from_slice(key.as_bytes()),
+                        min,
+                        max,
+                        limit,
+                        &mut output,
+                        &mut error,
+                    )
+                };
+                let values = take_output(
+                    status,
+                    error,
+                    "zrangebyscore",
+                    output,
+                    take_buffer_array,
+                    discard_buffer_array,
+                )?;
+                values
+                    .into_iter()
+                    .map(|value| {
+                        String::from_utf8(value.to_vec()).map_err(|error| {
+                            CacheError::InvalidData(format!(
+                                "dynamic provider zrangebyscore returned non-UTF-8 member: {error}"
                             ))
                         })
                     })

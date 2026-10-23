@@ -185,6 +185,7 @@ pub async fn build_configured_stack(
                 CacheOperation::Expire,
                 CacheOperation::Zadd,
                 CacheOperation::Zscan,
+                CacheOperation::ZrangeByScore,
                 CacheOperation::Zrem,
                 CacheOperation::Unlink,
             ])
