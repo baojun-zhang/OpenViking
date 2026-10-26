@@ -1259,6 +1259,7 @@ mod tests {
                 namespace: "default".to_string(),
                 initial_partitions: 16,
                 checkpoint_interval_secs: 86_400,
+                reconcile_existing_data: false,
                 provider: "filesystem".to_string(),
                 items: vec![BackendItemConfig {
                     name: "backup1".to_string(),
